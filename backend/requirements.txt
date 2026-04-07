@@ -1,0 +1,46 @@
+# FastAPI & Server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+
+# Database
+sqlalchemy[asyncio]>=2.0.35
+asyncpg>=0.30.0
+psycopg2-binary>=2.9.0
+alembic>=1.14.0
+
+# Redis
+redis[hiredis]>=5.2.0
+
+# Auth
+PyJWT>=2.9.0
+bcrypt>=4.2.0
+
+# Validation
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+
+# HTTP
+httpx>=0.27.0
+aiohttp>=3.9.0
+
+# Engine dependencies (shared with engine/)
+pyyaml>=6.0
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+feedparser>=6.0.0
+openai>=1.30.0
+zai-sdk>=0.2.2
+trafilatura>=1.6.0
+chardet>=5.0.0
+aiosqlite>=0.19.0
+duckduckgo-search>=6.0.0
+tiktoken>=0.7.0
+playwright==1.49.1
+python-dateutil>=2.8.0
+clickhouse-connect>=0.7.0
+structlog>=24.0.0
+
+# Stock data
+akshare>=1.14.0
+pandas>=2.0.0

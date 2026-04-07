@@ -1,0 +1,916 @@
+# ============================================================
+# Trading Agent - Source Definitions
+# ============================================================
+# To add a new source: copy an existing entry and modify.
+# Types: "rss", "web_scraper", "api"
+# Priority: "p0" (1min), "p1" (5min), "p2" (10min), "p3" (30min)
+# Category: used for UI grouping and user subscription filtering
+#
+# Categories:
+#   ai_technology       — AI companies, tech blogs, AI research
+#   semiconductors      — Chip companies, foundries, EDA
+#   financial_news      — Wire services, financial media, market news
+#   central_banks       — Federal Reserve, ECB, BOE, BOJ, RBA
+#   macro_economics     — Jobs data, GDP, CPI, economic indicators
+#   commodities_energy  — Oil, gold, metals, agriculture, energy
+#   regulatory          — Government policy, trade, export controls
+#   pharma_healthcare   — FDA, drug approvals, biotech
+#   china_news          — Chinese trending/hot news aggregators
+#   exchanges           — Stock/futures exchanges, CME, LME
+#   geopolitics         — International relations, sanctions, trade wars
+#
+# For web_scraper type:
+#   - css_selector: CSS selector for the announcement list container
+#   - item_selector: CSS selector for individual items within the container
+#   - title_selector: CSS selector for the title within each item
+#   - link_selector: CSS selector for the link within each item
+#   - date_selector: (optional) CSS selector for date within each item
+#
+# For rss type:
+#   - url: RSS/Atom feed URL
+#
+# For api type:
+#   - api_type: specific API handler ("sec_edgar", "federal_register", "sse", "szse", "hotnews")
+# ============================================================
+
+sources:
+
+  # ========================================
+  # CHINA — Stock Exchange Disclosures (P0)
+  # ========================================
+
+  # - name: "SSE Announcements (上交所公告)"
+  #   type: "api"
+  #   api_type: "sse"
+  #   url: "http://query.sse.com.cn/security/stock/queryCompanyBulletin.do"
+  #   priority: "p0"
+  #   enabled: true
+  #   market: "china"
+  #   category: "regulatory"
+  #   description: "Shanghai Stock Exchange company announcements"
+
+  # - name: "SZSE Announcements (深交所公告)"
+  #   type: "api"
+  #   api_type: "szse"
+  #   url: "http://www.szse.cn/api/disc/announcement/getList"
+  #   priority: "p0"
+  #   enabled: true
+  #   market: "china"
+  #   category: "regulatory"
+  #   description: "Shenzhen Stock Exchange company announcements"
+
+  # ========================================
+  # US — SEC Filings (P0)
+  # ========================================
+
+  # - name: "SEC EDGAR Latest Filings"
+  #   type: "rss"
+  #   url: "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&dateb=&owner=include&count=40&output=atom"
+  #   priority: "p0"
+  #   enabled: true
+  #   market: "us"
+  #   category: "regulatory"
+  #   description: "SEC EDGAR latest 8-K filings (material events)"
+
+  # - name: "SEC EDGAR Full-Text Search (AI)"
+  #   type: "api"
+  #   api_type: "sec_edgar"
+  #   url: "https://efts.sec.gov/LATEST/search-index"
+  #   priority: "p0"
+  #   enabled: true
+  #   market: "us"
+  #   category: "regulatory"
+  #   description: "SEC EDGAR full-text search for AI-related filings"
+
+  # ========================================
+  # AI COMPANIES — Official Blogs/News (P1)
+  # ========================================
+
+  - name: "OpenAI Blog"
+    type: "web_scraper"
+    url: "https://openai.com/blog"
+    priority: "p1"
+    enabled: true
+    market: "global"
+    category: "ai_technology"
+    requires_browser: true
+    css_selector: "main, body"
+    item_selector: "a[href*='/blog/'], a[href*='/index/']"
+    title_selector: "h3, h2, span"
+    link_selector: "self"
+    description: "OpenAI official news (uses Playwright headless browser)"
+
+  - name: "Anthropic News"
+    type: "web_scraper"
+    url: "https://www.anthropic.com/news"
+    priority: "p1"
+    enabled: true
+    market: "global"
+    category: "ai_technology"
+    css_selector: "main"
+    item_selector: "a[href*='/news/']"
+    title_selector: "h4, h3, h2"
+    link_selector: "self"
+    description: "Anthropic (Claude) official news (titles in h4 elements)"
+
+  - name: "Google AI Blog"
+    type: "web_scraper"
+    url: "https://blog.google/technology/ai/"
+    priority: "p1"
+    enabled: false
+    market: "us"
+    category: "ai_technology"
+    css_selector: "main"
+    item_selector: "article a, .uni-blog-article a"
+    title_selector: "h3, h2"
+    link_selector: "self"
+    description: "Google AI official blog (disabled: GFW blocked from CN)"
+
+  - name: "NVIDIA Newsroom"
+    type: "web_scraper"
+    url: "https://nvidianews.nvidia.com/news/latest"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "ai_technology"
+    css_selector: "main, body, .content"
+    item_selector: "a[href*='/news/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "NVIDIA official newsroom"
+
+  # ========================================
+  # US — Wire Services & Tech Media (P1)
+  # ========================================
+
+  - name: "Reuters Technology"
+    type: "rss"
+    url: "https://www.rss.reuters.com/rssFeed/technologyNews"
+    priority: "p1"
+    enabled: false
+    market: "us"
+    category: "financial_news"
+    description: "Reuters wire service — technology news (disabled: GFW blocked from CN)"
+
+  - name: "TechCrunch AI"
+    type: "rss"
+    url: "https://techcrunch.com/category/artificial-intelligence/feed/"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "ai_technology"
+    description: "TechCrunch AI — funding rounds, product launches"
+
+  - name: "VentureBeat AI"
+    type: "rss"
+    url: "https://venturebeat.com/category/ai/feed/"
+    priority: "p1"
+    enabled: false  # RSS feed stale since 2026-01-22, only 7 entries, disabled 2026-03-23
+    market: "us"
+    category: "ai_technology"
+    description: "VentureBeat AI — enterprise AI news (feed stopped updating)"
+
+  - name: "Semiconductor Engineering"
+    type: "rss"
+    url: "https://semiengineering.com/feed/"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "semiconductors"
+    description: "Semiconductor Engineering — chip industry deep-dives"
+
+  - name: "The Information (AI)"
+    type: "web_scraper"
+    url: "https://www.theinformation.com/technology"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "ai_technology"
+    requires_browser: true
+    css_selector: "main, body"
+    item_selector: "article a, a[href*='/articles/']"
+    title_selector: "h3, h2, span"
+    link_selector: "self"
+    description: "The Information — original scoops on AI companies"
+
+  - name: "PR Newswire Technology"
+    type: "web_scraper"
+    url: "https://www.prnewswire.com/news-releases/news-releases-list/?page=1&pagesize=25&tag=technology"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "financial_news"
+    css_selector: "main, .card-list, body"
+    item_selector: "a[href*='/news-releases/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "PR Newswire — official tech press releases (web scraper)"
+
+  - name: "Business Wire Technology"
+    type: "rss"
+    url: "https://feed.businesswire.com/rss/home/?rss=G1QFDERJXkJeEFpRWQ=="
+    priority: "p1"
+    enabled: false  # RSS feed returns 0 entries, disabled 2026-03-23
+    market: "us"
+    category: "financial_news"
+    description: "Business Wire — official tech press releases (broken feed)"
+
+  # ========================================
+  # US — Semiconductor Company Newsrooms (P1)
+  # ========================================
+
+  - name: "AMD Newsroom"
+    type: "web_scraper"
+    url: "https://www.amd.com/en/newsroom.html"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "semiconductors"
+    requires_browser: true
+    css_selector: "main, body, .content"
+    item_selector: "a[href*='/newsroom/'], a[href*='/press-releases/'], a[href*='/news/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "AMD official newsroom"
+
+  - name: "TSMC Press Releases"
+    type: "web_scraper"
+    url: "https://pr.tsmc.com/english/news/releaseByFilter"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "semiconductors"
+    requires_browser: true
+    browser_timeout_ms: 45000
+    css_selector: "main, body, .content"
+    item_selector: "a[href*='/news/'], a[href*='release']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "TSMC official press releases (Cloudflare, needs browser + proxy)"
+
+  - name: "Broadcom News"
+    type: "web_scraper"
+    url: "https://www.broadcom.com/company/news"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "semiconductors"
+    requires_browser: true
+    css_selector: "main, body, .content"
+    item_selector: "a[href*='/news/'], a[href*='/press-release/'], a[href*='/blog/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "Broadcom official company news"
+
+  # ========================================
+  # CHINA — Hot News API (via newsnow)
+  # ========================================
+
+  - name: "华尔街见闻热点"
+    type: "api"
+    api_type: "hotnews"
+    api_source_id: "wallstreetcn"
+    priority: "p3"
+    enabled: true
+    market: "china"
+    category: "china_news"
+    description: "Wall Street CN hot news (华尔街见闻, ~30 items per fetch, 30min interval)"
+
+  - name: "财联社热点"
+    type: "api"
+    api_type: "hotnews"
+    api_source_id: "cls-hot"
+    priority: "p3"
+    enabled: true
+    market: "china"
+    category: "china_news"
+    description: "CLS hot news (财联社, ~13 items per fetch, 30min interval)"
+
+  - name: "雪球热榜"
+    type: "api"
+    api_type: "hotnews"
+    api_source_id: "xueqiu"
+    priority: "p3"
+    enabled: true
+    market: "china"
+    category: "china_news"
+    description: "Xueqiu hot list (雪球, ~30 items per fetch, 30min interval)"
+
+  - name: "微博热搜"
+    type: "api"
+    api_type: "hotnews"
+    api_source_id: "weibo"
+    priority: "p3"
+    enabled: true
+    market: "china"
+    category: "china_news"
+    description: "Weibo trending topics (微博热搜, social sentiment signal, 30min interval)"
+
+  # ========================================
+  # US — Government / Regulatory (P2)
+  # ========================================
+
+  - name: "USCC Press Releases"
+    type: "web_scraper"
+    url: "https://www.uscc.gov/press-releases"
+    priority: "p2"
+    enabled: true
+    market: "us"
+    category: "geopolitics"
+    css_selector: "main, .view-content, body"
+    item_selector: "a[href*='/press-releases/'], .views-row a"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "US-China Economic and Security Review Commission — China tech policy"
+
+  - name: "USTR Trade Policy"
+    type: "web_scraper"
+    url: "https://ustr.gov/about-us/policy-offices/press-office/press-releases"
+    priority: "p2"
+    enabled: true
+    market: "us"
+    category: "geopolitics"
+    css_selector: "main, .view-content, body"
+    item_selector: "a[href*='/press-releases/'], .views-row a"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "US Trade Representative — tariffs and trade policy"
+
+  # ========================================
+  # CHINA — Government / Regulatory (P2)
+  # ========================================
+
+  # - name: "CSRC (证监会)"
+  #   type: "web_scraper"
+  #   url: "http://www.csrc.gov.cn/csrc/c100028/common_list.shtml"
+  #   priority: "p2"
+  #   enabled: true
+  #   market: "china"
+  #   category: "regulatory"
+  #   css_selector: ".commonlist, .list_content, main"
+  #   item_selector: "li a, .row a"
+  #   title_selector: "self"
+  #   link_selector: "self"
+  #   description: "China Securities Regulatory Commission announcements"
+
+  # - name: "MIIT (工信部)"
+  #   type: "web_scraper"
+  #   url: "https://www.miit.gov.cn/zwgk/zcwj/wjfb/index.html"
+  #   priority: "p2"
+  #   enabled: true
+  #   market: "china"
+  #   category: "regulatory"
+  #   css_selector: ".list, .xxgk-list, main"
+  #   item_selector: "li a, .item a"
+  #   title_selector: "self"
+  #   link_selector: "self"
+  #   description: "Ministry of Industry and Information Technology policies"
+
+  - name: "Federal Register (AI Policies)"
+    type: "api"
+    api_type: "federal_register"
+    url: "https://www.federalregister.gov/api/v1/documents.json"
+    priority: "p2"
+    enabled: true
+    market: "us"
+    category: "regulatory"
+    description: "US Federal Register — executive orders, rules on AI"
+
+  - name: "BIS Export Controls"
+    type: "web_scraper"
+    url: "https://www.bis.doc.gov/index.php/policy-guidance/lists-of-parties-of-concern"
+    priority: "p2"
+    enabled: true
+    market: "us"
+    category: "regulatory"
+    css_selector: "main, .item-page, #content"
+    item_selector: "a[href*='federal-register'], li a"
+    title_selector: "self"
+    link_selector: "self"
+    description: "Bureau of Industry & Security — semiconductor export controls"
+
+  # - name: "White House Presidential Actions"
+  #   type: "web_scraper"
+  #   url: "https://www.whitehouse.gov/briefing-room/presidential-actions/"
+  #   priority: "p2"
+  #   enabled: true
+  #   market: "us"
+  #   category: "regulatory"
+  #   css_selector: "main, .body-content"
+  #   item_selector: "article a, .news-item a, li a"
+  #   title_selector: "h2, h3, self"
+  #   link_selector: "self"
+  #   description: "White House presidential actions and executive orders"
+
+  # ========================================
+  # CENTRAL BANKS — Monetary Policy (P1)
+  # ========================================
+
+  - name: "Federal Reserve Press Releases"
+    type: "rss"
+    url: "https://www.federalreserve.gov/feeds/press_all.xml"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "central_banks"
+    description: "US Federal Reserve — FOMC statements, rate decisions, monetary policy"
+
+  - name: "ECB Press Releases"
+    type: "web_scraper"
+    url: "https://www.ecb.europa.eu/press/pr/html/index.en.html"
+    priority: "p1"
+    enabled: true
+    market: "global"
+    category: "central_banks"
+    css_selector: "main, .content-box, body"
+    item_selector: "a[href*='/press/pr/'], a[href*='/press/key/']"
+    title_selector: "self"
+    link_selector: "self"
+    description: "European Central Bank — rate decisions, monetary policy statements"
+
+  - name: "Bank of England News"
+    type: "web_scraper"
+    url: "https://www.bankofengland.co.uk/news"
+    priority: "p1"
+    enabled: true
+    market: "global"
+    category: "central_banks"
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/news/'], a[href*='/monetary-policy-summary/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "Bank of England — interest rate decisions, financial stability reports"
+
+  - name: "Bank of Japan Announcements"
+    type: "web_scraper"
+    url: "https://www.boj.or.jp/en/mopo/mpmdeci/index.htm"
+    priority: "p1"
+    enabled: true
+    market: "global"
+    category: "central_banks"
+    css_selector: "main, #contents, body"
+    item_selector: "a[href*='/en/']"
+    title_selector: "self"
+    link_selector: "self"
+    description: "Bank of Japan — monetary policy decisions, yen intervention signals"
+
+  - name: "Reserve Bank of Australia"
+    type: "web_scraper"
+    url: "https://www.rba.gov.au/media-releases/"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "central_banks"
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/media-releases/']"
+    title_selector: "self"
+    link_selector: "self"
+    description: "Reserve Bank of Australia — rate decisions, commodity currency signals"
+
+  # ========================================
+  # FINANCIAL NEWS — Global Markets (P1)
+  # ========================================
+
+  - name: "CNBC Top News"
+    type: "rss"
+    url: "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "financial_news"
+    description: "CNBC — top financial news, earnings, market-moving events"
+
+  - name: "CNBC World News"
+    type: "rss"
+    url: "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "financial_news"
+    description: "CNBC World — international market news, cross-border flows"
+
+  - name: "MarketWatch Top Stories"
+    type: "rss"
+    url: "https://feeds.marketwatch.com/marketwatch/topstories/"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "financial_news"
+    description: "MarketWatch — top market stories, earnings, economic data"
+
+  - name: "MarketWatch Commodities"
+    type: "rss"
+    url: "https://feeds.marketwatch.com/marketwatch/marketpulse/"
+    priority: "p2"
+    enabled: true
+    market: "us"
+    category: "financial_news"
+    description: "MarketWatch MarketPulse — commodities, futures, quick-take market moves"
+
+  - name: "WSJ Markets"
+    type: "rss"
+    url: "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "financial_news"
+    description: "Wall Street Journal Markets — authoritative US market and economy coverage (migrated from feeds.wsj.com)"
+
+  - name: "Financial Times Markets"
+    type: "web_scraper"
+    url: "https://www.ft.com/markets"
+    priority: "p1"
+    enabled: true
+    market: "global"
+    category: "financial_news"
+    requires_browser: true
+    css_selector: "main, body"
+    item_selector: "a[href*='/content/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "Financial Times Markets — global financial analysis and breaking news"
+
+  - name: "Nikkei Asia Business"
+    type: "web_scraper"
+    url: "https://asia.nikkei.com/Business"
+    priority: "p1"
+    enabled: true
+    market: "global"
+    category: "financial_news"
+    requires_browser: true
+    css_selector: "main, body"
+    item_selector: "a[href*='/Business/'], a[href*='/Economy/'], a[href*='/Spotlight/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "Nikkei Asia — Japan/Asia business news, supply chain signals, BOJ policy"
+
+  - name: "South China Morning Post Business"
+    type: "rss"
+    url: "https://www.scmp.com/rss/5/feed"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "financial_news"
+    description: "SCMP Business — Hong Kong/China business news from English-language perspective"
+
+  - name: "The Korea Herald Business"
+    type: "rss"
+    url: "https://www.koreaherald.com/rss/kh_Business"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "financial_news"
+    description: "Korea Herald — Korean economy, Samsung/SK Hynix/Hyundai corporate news (switched to RSS)"
+
+  - name: "Economic Times India"
+    type: "rss"
+    url: "https://economictimes.indiatimes.com/rssfeedstopstories.cms"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "financial_news"
+    description: "Economic Times India — Indian market news, IT services, pharma sector"
+
+  # ========================================
+  # MACRO ECONOMICS — Data Releases (P1)
+  # ========================================
+
+  - name: "BLS News Releases"
+    type: "rss"
+    url: "https://www.bls.gov/feed/bls_latest.rss"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "macro_economics"
+    description: "Bureau of Labor Statistics — jobs report, CPI, PPI, unemployment data (switched to RSS)"
+
+  - name: "BEA News Releases"
+    type: "web_scraper"
+    url: "https://www.bea.gov/news/current-releases"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "macro_economics"
+    css_selector: "main, .view-content, body"
+    item_selector: "a[href*='/news/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "Bureau of Economic Analysis — GDP, personal income, trade balance data"
+
+  - name: "Census Bureau Economic Indicators"
+    type: "web_scraper"
+    url: "https://www.census.gov/economic-indicators/"
+    priority: "p2"
+    enabled: true
+    market: "us"
+    category: "macro_economics"
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/indicator'], a[href*='/econ/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "US Census Bureau — retail sales, housing starts, durable goods orders"
+
+  - name: "Eurostat News"
+    type: "web_scraper"
+    url: "https://ec.europa.eu/eurostat/web/main/news/euro-indicators"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "macro_economics"
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/eurostat/']"
+    title_selector: "self"
+    link_selector: "self"
+    description: "Eurostat — EU GDP, inflation, unemployment, PMI-adjacent indicators"
+
+  - name: "IMF News"
+    type: "rss"
+    url: "https://mediacenter.imf.org/Rss"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "macro_economics"
+    description: "International Monetary Fund — global economic outlook, country assessments (switched to mediacenter RSS)"
+
+  # ========================================
+  # COMMODITIES & ENERGY (P1/P2)
+  # ========================================
+
+  - name: "EIA Today in Energy"
+    type: "rss"
+    url: "https://www.eia.gov/rss/todayinenergy.xml"
+    priority: "p1"
+    enabled: true
+    market: "us"
+    category: "commodities_energy"
+    description: "US Energy Information Administration — oil inventory, gas prices, energy outlook"
+
+  - name: "OPEC Press Releases"
+    type: "rss"
+    url: "https://www.opec.org/opec_web/en/pressreleases.rss"
+    priority: "p1"
+    enabled: false  # Cloudflare blocks all automated access including RSS (2026-03-27)
+    market: "global"
+    category: "commodities_energy"
+    description: "OPEC — blocked by Cloudflare, disabled until alternative found"
+
+  - name: "IEA News"
+    type: "web_scraper"
+    url: "https://www.iea.org/news"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "commodities_energy"
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/news/'], a[href*='/reports/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "International Energy Agency — oil market report, energy transitions, demand forecasts"
+
+  - name: "World Gold Council"
+    type: "web_scraper"
+    url: "https://www.gold.org/goldhub/gold-focus"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "commodities_energy"
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/goldhub/'], a[href*='/gold-focus/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "World Gold Council — gold demand trends, central bank buying, safe-haven flows"
+
+  - name: "LME News"
+    type: "web_scraper"
+    url: "https://www.lme.com/en/news"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "commodities_energy"
+    requires_browser: true
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/news/'], a[href*='/en/News/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "London Metal Exchange — copper, aluminium, nickel, zinc prices and warehouse data"
+
+  # ========================================
+  # REGULATORY & GEOPOLITICS (P2)
+  # ========================================
+
+  - name: "EU Commission Press"
+    type: "web_scraper"
+    url: "https://ec.europa.eu/commission/presscorner/home/en"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "geopolitics"
+    requires_browser: true
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/presscorner/detail/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "European Commission — trade policy, tech regulation, sanctions, subsidy rules"
+
+  - name: "WTO News"
+    type: "rss"
+    url: "https://www.wto.org/library/rss/latest_news_e.xml"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "geopolitics"
+    description: "World Trade Organization — trade disputes, tariff rulings, global trade outlook (switched to RSS)"
+
+  - name: "US Treasury Press Releases"
+    type: "web_scraper"
+    url: "https://home.treasury.gov/news/press-releases"
+    priority: "p2"
+    enabled: true
+    market: "us"
+    category: "regulatory"
+    css_selector: "main, .view-content, body"
+    item_selector: "a[href*='/press-releases/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "US Treasury — sanctions, debt ceiling, bond auction results, CFIUS decisions"
+
+  - name: "UK FCA News"
+    type: "web_scraper"
+    url: "https://www.fca.org.uk/news"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "regulatory"
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/news/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "UK Financial Conduct Authority — financial regulation, crypto rules, enforcement"
+
+  # ========================================
+  # PHARMA & HEALTHCARE (P2)
+  # ========================================
+
+  - name: "FDA Press Announcements"
+    type: "rss"
+    url: "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml"
+    priority: "p2"
+    enabled: true
+    market: "us"
+    category: "pharma_healthcare"
+    description: "US FDA — drug approvals, safety alerts, biotech catalysts (switched to RSS)"
+
+  - name: "EMA Press Releases"
+    type: "rss"
+    url: "https://www.ema.europa.eu/en/news.xml"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "pharma_healthcare"
+    description: "European Medicines Agency — EU drug approvals, safety reviews (switched to RSS)"
+
+  - name: "WHO News"
+    type: "rss"
+    url: "https://www.who.int/rss-feeds/news-english.xml"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "pharma_healthcare"
+    description: "World Health Organization — pandemic alerts, health emergencies, pharma policy"
+
+  # ========================================
+  # EXCHANGES & FUTURES MARKETS (P2)
+  # ========================================
+
+  - name: "CME Group Press Releases"
+    type: "web_scraper"
+    url: "https://www.cmegroup.com/media-room/press-releases.html"
+    priority: "p2"
+    enabled: true
+    market: "us"
+    category: "exchanges"
+    requires_browser: true
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/media-room/press-releases/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "CME Group — futures/options product launches, volume records, margin changes"
+
+  - name: "ICE News"
+    type: "web_scraper"
+    url: "https://ir.theice.com/press/news-details"
+    priority: "p2"
+    enabled: true
+    market: "us"
+    category: "exchanges"
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/press/'], a[href*='/news-details/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "Intercontinental Exchange — Brent crude benchmark, NYSE, energy futures"
+
+  - name: "Japan Exchange Group News"
+    type: "web_scraper"
+    url: "https://www.jpx.co.jp/english/corporate/news/news-releases/index.html"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "exchanges"
+    css_selector: "main, .component-news, body"
+    item_selector: "a[href*='/news-releases/']"
+    title_selector: "self"
+    link_selector: "self"
+    description: "JPX (Tokyo/Osaka Exchange) — Japanese equity/derivatives market updates"
+
+  - name: "SGX News"
+    type: "web_scraper"
+    url: "https://www.sgx.com/media-centre"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "exchanges"
+    requires_browser: true
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/media-centre/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "Singapore Exchange — Asia derivatives, iron ore futures, MSCI index products"
+
+  - name: "ASX Announcements"
+    type: "web_scraper"
+    url: "https://www2.asx.com.au/markets/trade-our-cash-market/announcements"
+    priority: "p2"
+    enabled: true
+    market: "global"
+    category: "exchanges"
+    requires_browser: true
+    css_selector: "main, .content, body"
+    item_selector: "a[href*='/announcements/']"
+    title_selector: "h3, h2, span, self"
+    link_selector: "self"
+    description: "Australian Securities Exchange — mining/resources announcements, commodities"
+
+# ========================================
+# AI Industry Companies — Tickers Mapping
+# ========================================
+# Used for LLM analysis and Uqer API queries
+
+companies:
+  # --- US-Listed AI Companies ---
+  us:
+    - { name: "NVIDIA", ticker: "NVDA", cik: "0001045810" }
+    - { name: "Microsoft", ticker: "MSFT", cik: "0000789019" }
+    - { name: "Alphabet/Google", ticker: "GOOGL", cik: "0001652044" }
+    - { name: "Meta Platforms", ticker: "META", cik: "0001326801" }
+    - { name: "AMD", ticker: "AMD", cik: "0000002488" }
+    - { name: "TSMC", ticker: "TSM", cik: "0001046179" }
+    - { name: "Broadcom", ticker: "AVGO", cik: "0001649338" }
+    - { name: "Amazon (AWS AI)", ticker: "AMZN", cik: "0001018724" }
+    - { name: "Tesla (AI/FSD)", ticker: "TSLA", cik: "0001318605" }
+    - { name: "Palantir", ticker: "PLTR", cik: "0001321655" }
+    - { name: "Arm Holdings", ticker: "ARM", cik: "0001973239" }
+    - { name: "Apple", ticker: "AAPL", cik: "0000320193" }
+    - { name: "Intel", ticker: "INTC", cik: "0000050863" }
+    - { name: "ASML", ticker: "ASML", cik: "0000937966" }
+    - { name: "Applied Materials", ticker: "AMAT", cik: "0000006951" }
+    - { name: "Marvell Technology", ticker: "MRVL", cik: "0001058290" }
+    - { name: "C3.ai", ticker: "AI", cik: "0001577526" }
+    - { name: "SoundHound AI", ticker: "SOUN", cik: "0001840856" }
+    - { name: "Super Micro Computer", ticker: "SMCI", cik: "0001375365" }
+    - { name: "Micron Technology", ticker: "MU", cik: "0000723125" }
+
+  # --- China A-Share AI Companies ---
+  china:
+    - { name: "寒武纪 (Cambricon)", ticker: "688256", exchange: "SSE" }
+    - { name: "科大讯飞 (iFlytek)", ticker: "002230", exchange: "SZSE" }
+    - { name: "海光信息 (Hygon)", ticker: "688041", exchange: "SSE" }
+    - { name: "中科曙光 (Sugon)", ticker: "603019", exchange: "SSE" }
+    - { name: "金山办公 (Kingsoft Office)", ticker: "688111", exchange: "SSE" }
+    - { name: "昆仑万维 (Kunlun Tech)", ticker: "300418", exchange: "SZSE" }
+    - { name: "三六零 (360 Security)", ticker: "601360", exchange: "SSE" }
+    - { name: "浪潮信息 (Inspur)", ticker: "000977", exchange: "SZSE" }
+    - { name: "中际旭创 (Innolight)", ticker: "300308", exchange: "SZSE" }
+    - { name: "工业富联 (Foxconn Industrial)", ticker: "601138", exchange: "SSE" }
+    - { name: "紫光股份 (Unigroup)", ticker: "000938", exchange: "SZSE" }
+    - { name: "拓维信息 (Talkweb)", ticker: "002261", exchange: "SZSE" }
+    - { name: "同花顺 (Hithink)", ticker: "300033", exchange: "SZSE" }
+
+  # --- HK-Listed / Dual-Listed Chinese Tech ---
+  hk:
+    - { name: "百度 (Baidu)", ticker_hk: "9888.HK", ticker_us: "BIDU" }
+    - { name: "阿里巴巴 (Alibaba)", ticker_hk: "9988.HK", ticker_us: "BABA" }
+    - { name: "腾讯 (Tencent)", ticker_hk: "0700.HK" }
+    - { name: "商汤科技 (SenseTime)", ticker_hk: "0020.HK" }
+    - { name: "小米 (Xiaomi)", ticker_hk: "1810.HK" }
+
+  # --- Private AI Companies (monitor news only) ---
+  private:
+    - { name: "OpenAI" }
+    - { name: "Anthropic (Claude)" }
+    - { name: "DeepSeek" }
+    - { name: "字节跳动 (ByteDance)" }
+    - { name: "月之暗面 (Moonshot AI)" }
+    - { name: "智谱AI (Zhipu AI)" }
+    - { name: "百川智能 (Baichuan)" }
+    - { name: "xAI" }
+    - { name: "Mistral AI" }

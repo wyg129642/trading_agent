@@ -1,0 +1,30 @@
+# 敏感文件 — 绝对不能提交到 Git
+.env
+config/settings.yaml
+config/portfolio_sources.yaml
+
+# 保留示例文件供参考
+# .env.example 可以提交（里面不含真实密钥）
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# 日志和数据
+logs/
+data/
+*.log
+reprocess.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

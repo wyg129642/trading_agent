@@ -1,0 +1,40 @@
+version: "3.8"
+
+# Development overrides: only PostgreSQL + Redis (backend/frontend run locally)
+# Usage: docker compose -f docker-compose.dev.yml up -d
+
+services:
+  postgres:
+    image: docker.1ms.run/library/postgres:16-alpine
+    container_name: ta-postgres-dev
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-trading_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-trading_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_pg_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-trading_agent}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: docker.1ms.run/library/redis:7-alpine
+    container_name: ta-redis-dev
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_dev_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_dev_data:
+  redis_dev_data:
