@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:staging": "VITE_DEV_PROXY_TARGET=http://localhost:20301 vite",
+    "dev:prod": "VITE_DEV_PROXY_TARGET=http://localhost:8000 vite",
     "build": "tsc -b && vite build",
     "build:staging": "tsc -b && vite build --mode staging",
     "preview": "vite preview"

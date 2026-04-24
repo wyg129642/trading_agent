@@ -30,11 +30,43 @@ This project runs as **two simultaneous deployments** on this host:
    Helpers live in `backend/app/config.py` (`_suffixed`, `_prefixed`, `effective_*`).
 5. **Promotion is a one-liner.** When staging is green, `cd /home/ygwang/trading_agent_staging &&
    ./scripts/promote.sh` fast-forwards `main`, tags the commit, and hands off — operator still runs
-   `./start_web.sh deploy` in the prod worktree.
+   `./start_web.sh deploy` in the prod worktree. **The new `promote.sh` runs `scripts/smoke.sh` against
+   staging on `:20301` FIRST and refuses to proceed if any probe fails.** Bypass with `SKIP_SMOKE=1`.
 6. **Migrations are forward-compatible.** Never drop/rename columns in a single release; additive-only
    migrations are the default. See `DEPLOYMENT.md` § "Migration discipline" for the full rules.
+7. **Frontend dev loop = `npm run dev:staging`, not `npm run build:staging`.** `dev:staging` starts
+   Vite on `:5173` with HMR and proxies `/api` + `/ws` to the running staging backend on `:20301`, so
+   code changes show up instantly. Only run `npm run build:staging` when you need a bundled artifact
+   for `http://39.105.42.197:20301` (i.e. when you want someone else to see the UI without running the
+   dev server). `dev:prod` is the same but targets `:8000` for hotfix verification.
+8. **`start_web.sh deploy` is now transactional.** It runs via `scripts/deploy_with_rollback.sh`:
+   build → record alembic rev + git HEAD → migrate → restart → smoke. Any failure after the migrate
+   step auto-rolls back code + schema and restarts the prior version. Set `LEGACY_DEPLOY=1` to opt
+   back into the linear path (not recommended outside cold-machine bootstrap).
+9. **CI runs on every push to `staging` and on PRs into `main`.** See `.github/workflows/ci.yml` —
+   it runs `pytest backend/tests`, the frontend prod + staging builds, and an Alembic linear-history
+   check. A failing CI run does not auto-block `promote.sh` (no GitHub enforcement set up on the
+   server side yet), but the smoke gate inside `promote.sh` is your live backstop.
 
 Full layout + rationale: **`DEPLOYMENT.md`** at the repo root.
+
+## Iteration + Deploy Safety Nets
+
+Added 2026-04-24 to harden the staging → prod pipeline. Every future session
+should respect these layers rather than bypassing them:
+
+| Layer | File | Runs when | What it checks |
+|---|---|---|---|
+| CI | `.github/workflows/ci.yml` | Push to `staging`; PR into `main` | `pytest backend/tests` (unit slice), `npm run build` + `build:staging`, Alembic single-head check |
+| Smoke | `scripts/smoke.sh` | Invoked by `promote.sh` + `deploy_with_rollback.sh` | `/api/health`, `/openapi.json`, `/api/news`, `/api/sources/health`, `/api/analytics/system`, SPA root |
+| Promote gate | `scripts/promote.sh` | Operator runs to fast-forward `main` | Runs `smoke.sh` against `:20301` first; refuses if staging is red. Bypass: `SKIP_SMOKE=1` (don't) |
+| Rollback deploy | `scripts/deploy_with_rollback.sh` | Called by `./start_web.sh deploy` | build → record alembic+git → migrate → restart → smoke. Rolls back schema + code on any failure after step 2. Opt out: `LEGACY_DEPLOY=1` |
+
+**Rules for Claude sessions:**
+- **Never push directly to `main`.** Always commit on `staging`, let `promote.sh` fast-forward.
+- **Never bypass smoke with `SKIP_SMOKE=1` casually.** If smoke fails, fix the underlying issue.
+- **When adding a new critical endpoint** (e.g. a new API surface employees depend on), add a probe line to `scripts/smoke.sh` so regressions catch it.
+- **When adding a new Python test** that needs external services (Milvus/Mongo/LLM keys), add it to the `--ignore=` list in `.github/workflows/ci.yml` so CI stays deterministic.
 
 ## Project Overview
 
@@ -477,9 +509,24 @@ Stack: React 18 + TypeScript + Vite, Ant Design UI, **Zustand** for state (auth 
 
 ### Build & deployment
 
-**Development** — `./start_web.sh start` brings up Postgres + Redis (`docker-compose.dev.yml`), the ASR tunnel, uvicorn (`backend.app.main:app` on `APP_PORT`, single worker), and (prod only) the crawler monitor + watchers. Port defaults: prod=8000, staging=20301 — read from each worktree's `.env`. Frontend dev server is separate: `cd frontend && npm run dev` (:5173); Vite proxies `/api` → `:8000` by default, override with `VITE_DEV_PROXY_TARGET=http://localhost:20301 npm run dev` to hit a running staging backend.
+**Development** — `./start_web.sh start` brings up Postgres + Redis (`docker-compose.dev.yml`), the ASR tunnel, uvicorn (`backend.app.main:app` on `APP_PORT`, single worker), and (prod only) the crawler monitor + watchers. Port defaults: prod=8000, staging=20301 — read from each worktree's `.env`.
 
-Staging-only bundle: `cd frontend && npm run build:staging` writes to `frontend/dist-staging/`; the staging backend auto-serves from there when `APP_ENV=staging` (see `_resolve_frontend_dist` in `backend/app/main.py`). Prod bundle stays in `frontend/dist/`.
+**Frontend dev loop (the recommended iteration path):**
+
+```bash
+cd /home/ygwang/trading_agent_staging/frontend
+npm run dev:staging   # Vite on :5173 with HMR, proxies /api + /ws → :20301
+# Open http://localhost:5173 — code changes are live in <1s.
+```
+
+- `npm run dev:staging` → staging backend (`:20301`). **Default for iteration.**
+- `npm run dev:prod` → prod backend (`:8000`). Use only to verify a hotfix.
+- `npm run dev` → legacy shorthand, same as `dev:prod` (kept for muscle memory).
+
+Bundled builds:
+
+- `npm run build:staging` → `frontend/dist-staging/`, served at `http://39.105.42.197:20301`. Only needed when someone else needs to see the UI through the staging backend without running the dev server.
+- `npm run build` → `frontend/dist/`, served by prod. Run via `./start_web.sh deploy` after promotion, not by hand.
 
 The Milvus vector stack is started separately (kept out of the default dev flow because it's heavy):
 

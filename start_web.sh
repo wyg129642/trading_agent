@@ -1069,8 +1069,39 @@ build_frontend() {
 }
 
 full_deploy() {
+    # Transactional deploy with rollback: build → migrate → restart → smoke.
+    # If any step fails after migration, the script auto-rolls back code + schema
+    # and restarts the prior version. See scripts/deploy_with_rollback.sh.
+    #
+    # The legacy linear path is still available via LEGACY_DEPLOY=1 for edge
+    # cases (e.g. cold machine with no prior HEAD to roll back to).
+    if [ "${LEGACY_DEPLOY:-0}" = "1" ]; then
+        warn "LEGACY_DEPLOY=1 — using naive linear deploy (no rollback)"
+        echo "============================================"
+        echo "  Full Deployment (legacy)"
+        echo "============================================"
+        build_frontend || exit 1
+        echo ""
+        run_migrations
+        echo ""
+        stop_web_group
+        sleep 2
+        start_web_group
+        show_banner
+        return
+    fi
+
+    if [ -x "$PROJECT_DIR/scripts/deploy_with_rollback.sh" ]; then
+        "$PROJECT_DIR/scripts/deploy_with_rollback.sh"
+        local rc=$?
+        if [ $rc -eq 0 ]; then show_banner; fi
+        return $rc
+    fi
+
+    # Fallback if the rollback script has been removed/moved — linear deploy.
+    warn "scripts/deploy_with_rollback.sh not found — falling back to linear deploy"
     echo "============================================"
-    echo "  Full Deployment"
+    echo "  Full Deployment (fallback)"
     echo "============================================"
     build_frontend || exit 1
     echo ""

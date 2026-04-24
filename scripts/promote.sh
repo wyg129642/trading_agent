@@ -68,6 +68,22 @@ if ! git -C "$HERE" diff --quiet || ! git -C "$HERE" diff --cached --quiet; then
     exit 1
 fi
 
+# ---- Smoke gate (staging must be healthy) ----
+# Run scripts/smoke.sh against the staging backend BEFORE touching git refs.
+# If staging itself is red right now we have no business fast-forwarding main
+# onto it. Skippable with SKIP_SMOKE=1 for cold-machine edge cases.
+if [ "${SKIP_SMOKE:-0}" = "1" ]; then
+    warn "SKIP_SMOKE=1 set — bypassing pre-promotion smoke check."
+else
+    STAGING_PORT="${STAGING_PORT:-20301}"
+    info "Running smoke check against staging on :${STAGING_PORT}..."
+    if ! "$HERE/scripts/smoke.sh" "$STAGING_PORT"; then
+        err "Smoke check failed. Refusing to promote a broken staging to prod."
+        err "  Fix staging first, or set SKIP_SMOKE=1 to override (not recommended)."
+        exit 1
+    fi
+fi
+
 # ---- Fetch ----
 info "Fetching latest refs from origin..."
 git -C "$HERE" fetch --tags --prune origin >/dev/null
