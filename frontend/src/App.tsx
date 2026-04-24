@@ -32,6 +32,7 @@ import GangtiseDB from './pages/GangtiseDB'
 import AceCampDB from './pages/AceCampDB'
 import AceCampPlatformInfo from './pages/AceCampPlatformInfo'
 import AlphaEngineDB from './pages/AlphaEngineDB'
+import SemiAnalysisDB from './pages/SemiAnalysisDB'
 import JiuqianForum from './pages/JiuqianForum'
 import JiuqianMinutes from './pages/JiuqianMinutes'
 import JiuqianWechat from './pages/JiuqianWechat'
@@ -148,6 +149,7 @@ export default function App() {
           <Route path="acecamp/platform-info" element={<AceCampPlatformInfo />} />
           <Route path="acecamp/:category" element={<AceCampDB />} />
           <Route path="alphaengine/:category" element={<AlphaEngineDB />} />
+          <Route path="semianalysis" element={<SemiAnalysisDB />} />
           <Route path="jiuqian/forum" element={<JiuqianForum />} />
           <Route path="jiuqian/minutes" element={<JiuqianMinutes />} />
           <Route path="jiuqian/wechat" element={<JiuqianWechat />} />

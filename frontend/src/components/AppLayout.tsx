@@ -28,6 +28,7 @@ import {
   AudioOutlined,
   GlobalOutlined,
   FundProjectionScreenOutlined,
+  ExperimentOutlined,
 } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../store/auth'
@@ -246,6 +247,11 @@ export default function AppLayout() {
             { key: '/alphaengine/foreign-report', label: t('nav.alphaengineForeignReport') },
             { key: '/alphaengine/news', label: t('nav.alphaengineNews') },
           ],
+        },
+        {
+          key: '/semianalysis',
+          icon: <ExperimentOutlined />,
+          label: t('nav.semianalysis'),
         },
       ],
     },

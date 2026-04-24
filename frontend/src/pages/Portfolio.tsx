@@ -41,6 +41,9 @@ interface BreakingNewsItem {
   new_developments: string[]
   novelty_status: string
   earliest_report_time: string | null
+  event_age_hours: number | null
+  is_stale_event: boolean
+  rejection_reason?: string | null
   deep_research_performed: boolean
   research_iterations: number
   key_findings: string[]
@@ -142,6 +145,16 @@ function timeAgo(isoStr: string): string {
   return `${days}天前`
 }
 
+function hoursAgo(hours: number | null | undefined): string {
+  if (hours == null) return '—'
+  const safe = Math.max(0, hours)
+  if (safe < 1) return `${Math.floor(safe * 60)}分钟前`
+  if (safe < 24) return `${Math.floor(safe)}小时前`
+  return `${Math.floor(safe / 24)}天前`
+}
+
+const STALE_EVENT_AGE_HOURS = 48
+
 function formatReturn(val: number | undefined | null): React.ReactNode {
   if (val == null) return <Text type="secondary">—</Text>
   const pct = (val * 100).toFixed(1)
@@ -154,6 +167,15 @@ function formatReturn(val: number | undefined | null): React.ReactNode {
 function BreakingNewsCard({ item }: { item: BreakingNewsItem }) {
   const matCfg = MATERIALITY_CONFIG[item.news_materiality] || MATERIALITY_CONFIG.none
   const sentCfg = SENTIMENT_CONFIG[item.sentiment] || SENTIMENT_CONFIG.neutral
+
+  // Event age is the timestamp the industry actually cares about: when the
+  // market first learned of the event. scan_time only tells us when our LLM
+  // happened to run, which is nearly useless for alpha decay.
+  const eventAgeHours = item.event_age_hours
+  const isStale =
+    item.is_stale_event ||
+    item.rejection_reason === 'event_too_old' ||
+    (eventAgeHours != null && eventAgeHours >= STALE_EVENT_AGE_HOURS)
 
   const collapseItems = []
 
@@ -235,8 +257,10 @@ function BreakingNewsCard({ item }: { item: BreakingNewsItem }) {
       size="small"
       style={{
         borderRadius: 10,
-        borderLeft: `4px solid ${matCfg.color}`,
+        borderLeft: `4px solid ${isStale ? '#8c8c8c' : matCfg.color}`,
         marginBottom: 0,
+        opacity: isStale ? 0.7 : 1,
+        background: isStale ? '#fafafa' : undefined,
       }}
       styles={{ body: { padding: '12px 16px' } }}
     >
@@ -258,11 +282,37 @@ function BreakingNewsCard({ item }: { item: BreakingNewsItem }) {
                 深度研究 x{item.research_iterations}
               </Tag>
             )}
+            {isStale && (
+              <Tooltip title={
+                item.rejection_reason === 'event_too_old'
+                  ? '新鲜度闸门判定为旧闻：事件发生时间过早且无近期新增来源，信号可能已被市场消化。'
+                  : '该事件首报时间已超过 48 小时，很可能已被市场消化，请谨慎参考。'
+              }>
+                <Tag color="red" style={{ margin: 0, fontSize: 11, lineHeight: '20px' }}>
+                  ⚠️ 旧闻
+                </Tag>
+              </Tooltip>
+            )}
           </Space>
         </div>
-        <Text type="secondary" style={{ fontSize: 11, whiteSpace: 'nowrap', marginLeft: 8 }}>
-          {timeAgo(item.scan_time)}
-        </Text>
+        <div style={{ textAlign: 'right', marginLeft: 8, lineHeight: '14px' }}>
+          <Tooltip title="事件首次被报道距今 | 本次分析生成距今">
+            <Text
+              type="secondary"
+              style={{
+                fontSize: 11,
+                whiteSpace: 'nowrap',
+                color: isStale ? '#cf1322' : undefined,
+                fontWeight: isStale ? 600 : undefined,
+              }}
+            >
+              事件 {hoursAgo(eventAgeHours)}
+            </Text>
+            <div style={{ fontSize: 10, color: '#bfbfbf', whiteSpace: 'nowrap', marginTop: 2 }}>
+              分析 {timeAgo(item.scan_time)}
+            </div>
+          </Tooltip>
+        </div>
       </div>
 
       {/* Summary */}
