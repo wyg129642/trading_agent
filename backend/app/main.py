@@ -559,6 +559,7 @@ def create_app() -> FastAPI:
     from backend.app.api.alphaengine_db import router as alphaengine_db_router
     from backend.app.api.semianalysis_db import router as semianalysis_db_router
     from backend.app.api.unified import router as unified_router
+    from backend.app.api.stock_hub import router as stock_hub_router
     from backend.app.api.jiuqian import router as jiuqian_router
     from backend.app.api.engine import router as engine_router
     from backend.app.api.favorites import router as favorites_router
@@ -605,6 +606,7 @@ def create_app() -> FastAPI:
     app.include_router(alphaengine_db_router, prefix="/api/alphaengine-db", tags=["AlphaEngine DB"])
     app.include_router(semianalysis_db_router, prefix="/api/semianalysis-db", tags=["SemiAnalysis DB"])
     app.include_router(unified_router, prefix="/api/unified", tags=["Unified (cross-platform)"])
+    app.include_router(stock_hub_router, prefix="/api/stock-hub", tags=["Stock Hub (per-stock aggregator)"])
     app.include_router(jiuqian_router, prefix="/api/jiuqian", tags=["Jiuqian"])
     app.include_router(engine_router, prefix="/api/engine", tags=["Engine"])
     app.include_router(favorites_router, prefix="/api/favorites", tags=["Favorites"])

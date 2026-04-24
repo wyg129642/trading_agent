@@ -95,7 +95,8 @@ _probe "/openapi.json" 200
 for path in \
     "/api/news?limit=1" \
     "/api/sources/health" \
-    "/api/analytics/system" ; do
+    "/api/analytics/system" \
+    "/api/stock-hub/AAPL.US?limit=1" ; do
     # Accept 200 OR 401 (both mean the router loaded; auth is a separate
     # concern). Anything else = broken.
     status=$(curl -sS -o /dev/null -w "%{http_code}" \

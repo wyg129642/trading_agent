@@ -32,12 +32,14 @@ import GangtiseDB from './pages/GangtiseDB'
 import AceCampDB from './pages/AceCampDB'
 import AceCampPlatformInfo from './pages/AceCampPlatformInfo'
 import AlphaEngineDB from './pages/AlphaEngineDB'
-import SemiAnalysisDB from './pages/SemiAnalysisDB'
+// SemiAnalysis page disabled — feature wired but hidden from users pending launch.
+// import SemiAnalysisDB from './pages/SemiAnalysisDB'
 import JiuqianForum from './pages/JiuqianForum'
 import JiuqianMinutes from './pages/JiuqianMinutes'
 import JiuqianWechat from './pages/JiuqianWechat'
 import Favorites from './pages/Favorites'
 import StockSearch from './pages/StockSearch'
+import StockHub from './pages/StockHub'
 import Leaderboard from './pages/Leaderboard'
 import AnalystRating from './pages/AnalystRating'
 import AIChat from './pages/AIChat'
@@ -114,6 +116,7 @@ export default function App() {
           <Route path="watchlists" element={<Watchlist />} />
           <Route path="favorites" element={<Favorites />} />
           <Route path="stock-search" element={<StockSearch />} />
+          <Route path="stock/:canonicalId" element={<StockHub />} />
           <Route path="sources" element={<Sources />} />
           <Route path="leaderboard" element={<Leaderboard />} />
           <Route path="analyst-rating" element={<AnalystRating />} />
@@ -149,7 +152,7 @@ export default function App() {
           <Route path="acecamp/platform-info" element={<AceCampPlatformInfo />} />
           <Route path="acecamp/:category" element={<AceCampDB />} />
           <Route path="alphaengine/:category" element={<AlphaEngineDB />} />
-          <Route path="semianalysis" element={<SemiAnalysisDB />} />
+          {/* <Route path="semianalysis" element={<SemiAnalysisDB />} /> */}
           <Route path="jiuqian/forum" element={<JiuqianForum />} />
           <Route path="jiuqian/minutes" element={<JiuqianMinutes />} />
           <Route path="jiuqian/wechat" element={<JiuqianWechat />} />

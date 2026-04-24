@@ -498,8 +498,13 @@ def extract_from_alphapai(doc: dict, collection: str) -> Any:
     if collection in ("comments", "wechat_articles"):
         return (doc.get("list_item") or {}).get("stock")
     if collection == "reports":
-        # reports have no stock field; return nothing
-        return None
+        # Reports carry the covered companies under list_item.stock (same shape
+        # as comments/wechat_articles). Prefer list_item because detail can be
+        # {_err: ...} when the PDF-only doc couldn't be expanded.
+        li = (doc.get("list_item") or {}).get("stock")
+        if li:
+            return li
+        return (doc.get("detail") or {}).get("stock")
     return None
 
 
