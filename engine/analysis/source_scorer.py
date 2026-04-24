@@ -30,6 +30,18 @@ MARKET_TZ_OFFSETS = {
     "jp":    9,      # Asia/Tokyo
 }
 
+# Local market close hour — signals received after this hour are attributed
+# to the NEXT trading day, since the day's price action already happened.
+# Using 24 means "never treat as post-close" (i.e. use the same-day date).
+MARKET_CLOSE_HOUR = {
+    "china": 15,
+    "us":    16,
+    "hk":    16,
+    "jp":    15,
+    "kr":    15,
+    "global": 24,
+}
+
 # Horizons: name → number of trading days
 HORIZONS = {"t0": 0, "t1": 1, "t5": 5, "t20": 20}
 
@@ -77,31 +89,94 @@ class SourceLeaderboardEntry(NamedTuple):
 
 # ─── Price data fetchers ────────────────────────────────────────────
 
+import re as _re
+
+# Extract the CODE from a "Name(CODE)" format used by the LLM tagger.
+# Accepts half- or full-width parentheses.
+_PAREN_CODE_RE = _re.compile(r"[（(]([A-Za-z0-9.]+)[）)]")
+
+
+def _extract_raw_code(ticker: str) -> str:
+    """Strip any leading Chinese/English name from a ticker string.
+
+    Examples: '中国石油(601857.SH)' → '601857.SH'; 'Whitestone REIT(WSR)' → 'WSR';
+    '600519' → '600519'; '600519.SH' → '600519.SH'.
+    """
+    s = (ticker or "").strip()
+    m = _PAREN_CODE_RE.search(s)
+    if m:
+        return m.group(1).strip()
+    return s
+
+
+def infer_market_from_ticker(ticker: str, fallback: str = "global") -> str:
+    """Deduce the market from a raw ticker code.
+
+    Rules:
+      * ``.HK``     → hk
+      * ``.SH``/``.SZ``/``.SS``  → china
+      * 6-digit numeric → china (A-share)
+      * 5-digit numeric → hk (legacy formatting)
+      * 1–5 ASCII letters, optionally with a single dot (e.g. ``BRK.B``) → us
+    """
+    code = _extract_raw_code(ticker).upper()
+    if code.endswith(".HK"):
+        return "hk"
+    if code.endswith(".SH") or code.endswith(".SZ") or code.endswith(".SS"):
+        return "china"
+    if code.isdigit():
+        if len(code) == 6:
+            return "china"
+        if len(code) <= 5:
+            return "hk"
+    if _re.fullmatch(r"[A-Z]{1,5}(?:\.[A-Z])?", code):
+        return "us"
+    return fallback
+
+
 def _normalize_ticker_cn(ticker: str) -> str:
     """Normalize A-share ticker to 6-digit string."""
-    t = ticker.strip().replace(".SZ", "").replace(".SS", "").replace(".SH", "")
+    t = _extract_raw_code(ticker)
+    t = t.replace(".SZ", "").replace(".SS", "").replace(".SH", "")
+    t = t.replace(".sz", "").replace(".ss", "").replace(".sh", "")
     return t.zfill(6) if t.isdigit() else t
 
 
 def _normalize_ticker_hk(ticker: str) -> str:
     """Normalize HK ticker: 06869.HK → 06869."""
-    t = ticker.strip().replace(".HK", "").replace(".hk", "")
+    t = _extract_raw_code(ticker).replace(".HK", "").replace(".hk", "")
     return t.zfill(5) if t.isdigit() else t
 
 
-def _unproxy_context():
-    """Context manager to temporarily remove HTTP proxy env vars.
+def _normalize_ticker_us(ticker: str) -> str:
+    """Normalize US ticker: 'Apple Inc.(AAPL)' → 'AAPL'."""
+    return _extract_raw_code(ticker).upper()
 
-    akshare uses requests which picks up HTTP_PROXY. For China-domestic
-    endpoints (eastmoney.com), we need direct access without proxy.
+
+def _unproxy_context():
+    """Context manager to temporarily remove proxy env vars.
+
+    akshare uses requests which picks up HTTP_PROXY / ALL_PROXY. When these
+    are set to a SOCKS URL and requests[socks] isn't installed, every
+    request raises "Missing dependencies for SOCKS support". For the
+    China-domestic endpoints we hit (eastmoney.com, yahoo-mirror, etc.) we
+    need direct access anyway, so clear everything for the duration.
     """
     import os
     from contextlib import contextmanager
 
+    PROXY_KEYS = (
+        "HTTP_PROXY", "http_proxy",
+        "HTTPS_PROXY", "https_proxy",
+        "ALL_PROXY", "all_proxy",
+        "SOCKS_PROXY", "socks_proxy",
+        "NO_PROXY", "no_proxy",
+    )
+
     @contextmanager
     def _ctx():
         saved = {}
-        for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+        for key in PROXY_KEYS:
             if key in os.environ:
                 saved[key] = os.environ.pop(key)
         try:
@@ -139,7 +214,8 @@ def fetch_price_series(
             return df[["date", "open", "close"]].sort_values("date").reset_index(drop=True)
 
         elif market == "us":
-            df = ak.stock_us_daily(symbol=ticker.upper(), adjust="qfq")
+            with _unproxy_context():
+                df = ak.stock_us_daily(symbol=_normalize_ticker_us(ticker), adjust="qfq")
             if df is None or df.empty:
                 return None
             df["date"] = pd.to_datetime(df["date"])
@@ -150,7 +226,8 @@ def fetch_price_series(
 
         elif market in ("hk",):
             sym = _normalize_ticker_hk(ticker)
-            df = ak.stock_hk_daily(symbol=sym, adjust="qfq")
+            with _unproxy_context():
+                df = ak.stock_hk_daily(symbol=sym, adjust="qfq")
             if df is None or df.empty:
                 return None
             df["date"] = pd.to_datetime(df["date"])
@@ -171,10 +248,20 @@ def fetch_price_series(
 # ─── Signal evaluation logic ────────────────────────────────────────
 
 def _signal_utc_to_trading_date(signal_utc: datetime, market: str) -> datetime:
-    """Convert a UTC signal timestamp to the local trading date."""
+    """Convert a UTC signal timestamp to the LOCAL trading date.
+
+    If the signal arrives after market close, attribute it to the next
+    calendar day — ``_find_trading_day_index`` will then jump to the next
+    actual trading day. Without this adjustment, post-close signals get
+    scored against price movements that happened BEFORE the news arrived.
+    """
     offset_hours = MARKET_TZ_OFFSETS.get(market, 0)
     local_time = signal_utc + timedelta(hours=offset_hours)
-    return local_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    local_date = local_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    close_hour = MARKET_CLOSE_HOUR.get(market, 24)
+    if local_time.hour >= close_hour:
+        local_date += timedelta(days=1)
+    return local_date
 
 
 def _find_trading_day_index(prices: pd.DataFrame, target_date: datetime) -> int | None:
@@ -206,6 +293,13 @@ def evaluate_signal(
     direction = SENTIMENT_DIRECTION.get(predicted_sentiment, 0)
     if direction == 0:
         return result  # neutral — skip
+
+    # The news-level ``market`` can be wrong when a China/global news item
+    # discusses an HK- or US-listed name. Prefer the market inferred from
+    # the ticker suffix whenever it disagrees with the caller's market.
+    inferred = infer_market_from_ticker(ticker, fallback=market)
+    if inferred in ("china", "us", "hk") and inferred != market:
+        market = inferred
 
     # Determine the trading date of the signal in market local time
     trading_date = _signal_utc_to_trading_date(signal_time, market)
@@ -396,6 +490,8 @@ def compute_source_ic(evaluations: list) -> dict[str, dict]:
     Returns:
         {source_name: {ic_t1, ic_t5, ic_t20, icir, avg_confidence, calibration_score}}
     """
+    import warnings
+
     from scipy import stats
     import numpy as np
     from collections import defaultdict
@@ -414,9 +510,9 @@ def compute_source_ic(evaluations: list) -> dict[str, dict]:
             ("t5", "sentiment_score_t5", "return_t5", "confidence_t5"),
             ("t20", "sentiment_score_t20", "return_t20", "confidence_t20"),
         ]:
-            scores = []
-            returns = []
-            confs = []
+            scores: list[float] = []
+            returns: list[float] = []
+            confs: list[float] = []
             for ev in evs:
                 s = ev.get(score_key)
                 r = ev.get(return_key)
@@ -424,44 +520,66 @@ def compute_source_ic(evaluations: list) -> dict[str, dict]:
                 if s is not None and r is not None:
                     scores.append(float(s))
                     returns.append(float(r))
-                    confs.append(float(c) if c is not None else 1.0)
+                    if c is not None:
+                        confs.append(float(c))
 
             if len(scores) >= 5:
-                corr, _ = stats.spearmanr(scores, returns)
-                ic_per_horizon[f"ic_{horizon}"] = round(float(corr), 4) if not np.isnan(corr) else None
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        corr, _ = stats.spearmanr(scores, returns)
+                    ic_per_horizon[f"ic_{horizon}"] = (
+                        round(float(corr), 4) if not np.isnan(corr) else None
+                    )
+                except Exception:
+                    ic_per_horizon[f"ic_{horizon}"] = None
             else:
                 ic_per_horizon[f"ic_{horizon}"] = None
 
-            # Average confidence
             if confs:
-                ic_per_horizon[f"avg_conf_{horizon}"] = round(np.mean(confs), 3)
+                ic_per_horizon[f"avg_conf_{horizon}"] = round(float(np.mean(confs)), 3)
 
         # ICIR: compute weekly IC for short-term, then mean/std
-        weekly_ics = []
-        by_week = defaultdict(lambda: ([], []))
+        weekly_ics: list[float] = []
+        by_week: dict = defaultdict(lambda: ([], []))
         for ev in evs:
             s = ev.get("sentiment_score_t1")
             r = ev.get("return_t1")
             if s is not None and r is not None:
-                week_key = ev["signal_time"].isocalendar()[:2] if hasattr(ev["signal_time"], "isocalendar") else str(ev["signal_time"])[:10]
+                sig_t = ev["signal_time"]
+                if hasattr(sig_t, "isocalendar"):
+                    week_key = sig_t.isocalendar()[:2]
+                else:
+                    week_key = str(sig_t)[:10]
                 by_week[week_key][0].append(float(s))
                 by_week[week_key][1].append(float(r))
 
-        for week_key, (scores, returns) in by_week.items():
-            if len(scores) >= 3:
-                corr, _ = stats.spearmanr(scores, returns)
-                if not np.isnan(corr):
-                    weekly_ics.append(corr)
+        for (wk_scores, wk_returns) in by_week.values():
+            if len(wk_scores) >= 3:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        corr, _ = stats.spearmanr(wk_scores, wk_returns)
+                    if not np.isnan(corr):
+                        weekly_ics.append(float(corr))
+                except Exception:
+                    pass
 
         if len(weekly_ics) >= 4:
-            icir = float(np.mean(weekly_ics)) / float(np.std(weekly_ics)) * np.sqrt(52) if np.std(weekly_ics) > 0 else 0.0
+            std = float(np.std(weekly_ics, ddof=1))
+            icir = float(np.mean(weekly_ics)) / std * np.sqrt(52) if std > 0 else 0.0
             icir = round(icir, 3)
         else:
             icir = None
 
-        # Overall avg confidence
-        all_confs = [float(ev.get("confidence_t1") or 1.0) for ev in evs if ev.get("sentiment_score_t1") is not None]
-        avg_confidence = round(np.mean(all_confs), 3) if all_confs else None
+        # Overall avg confidence — treat None as missing (don't fabricate 1.0)
+        all_confs = [
+            float(ev.get("confidence_t1"))
+            for ev in evs
+            if ev.get("confidence_t1") is not None
+            and ev.get("sentiment_score_t1") is not None
+        ]
+        avg_confidence = round(float(np.mean(all_confs)), 3) if all_confs else None
 
         results[source] = {
             **ic_per_horizon,

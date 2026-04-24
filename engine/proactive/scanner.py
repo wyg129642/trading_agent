@@ -184,6 +184,7 @@ class ProactiveScanner:
                     ticker=holding.ticker,
                     name_cn=holding.name_cn,
                     market=holding.market,
+                    name_en=holding.name_en,
                 )
                 logger.info("[Proactive] Initialized baseline for %s (%s)", holding.name_cn, holding.ticker)
 

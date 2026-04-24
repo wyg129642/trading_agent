@@ -16,12 +16,16 @@ import {
   Switch,
   Tabs,
   Empty,
+  Button,
+  message,
 } from 'antd'
 import {
   SearchOutlined,
   ThunderboltOutlined,
   ClockCircleOutlined,
   FilterOutlined,
+  StarOutlined,
+  PlusOutlined,
 } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../store/auth'
@@ -147,6 +151,20 @@ export default function NewsFeed() {
   )
   const [hours, setHours] = useState<number>(24)
   const [unfiltered, setUnfiltered] = useState(false)
+  const [watchlistOnly, setWatchlistOnly] = useState(false)
+  const [watchedTickers, setWatchedTickers] = useState<Set<string>>(new Set())
+
+  // Load watchlist tickers for quick-add badge display
+  const fetchWatchedTickers = useCallback(async () => {
+    try {
+      const res = await api.get('/watchlists/all-values')
+      setWatchedTickers(new Set(res.data.tickers?.map((t: any) => t.value) || []))
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    fetchWatchedTickers()
+  }, [fetchWatchedTickers])
 
   // Load categories on mount
   useEffect(() => {
@@ -159,7 +177,7 @@ export default function NewsFeed() {
   // Reset page when filters change
   useEffect(() => {
     setPage(1)
-  }, [searchQuery, category, sentiment, impact, hours, unfiltered])
+  }, [searchQuery, category, sentiment, impact, hours, unfiltered, watchlistOnly])
 
   const fetchNews = useCallback(async () => {
     setLoading(true)
@@ -175,6 +193,7 @@ export default function NewsFeed() {
         if (impact) params.impact = impact
         if (category) params.category = category
         if (unfiltered) params.unfiltered = true
+        if (watchlistOnly) params.watchlist_only = true
         res = await api.get<NewsResponse>('/news', { params })
       }
       setItems(res.data.items)
@@ -184,7 +203,7 @@ export default function NewsFeed() {
     } finally {
       setLoading(false)
     }
-  }, [page, sentiment, impact, hours, searchQuery, category, unfiltered])
+  }, [page, sentiment, impact, hours, searchQuery, category, unfiltered, watchlistOnly])
 
   useEffect(() => {
     fetchNews()
@@ -209,6 +228,29 @@ export default function NewsFeed() {
   ]
 
   const { favoriteIds, toggleFavorite } = useFavorites('news')
+
+  const handleQuickAddTicker = async (ticker: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (watchedTickers.has(ticker)) return
+    try {
+      // Extract pure ticker code (remove Chinese name in parentheses)
+      const pureCode = ticker.replace(/\(.*?\)/, '').trim()
+      const displayName = ticker !== pureCode ? ticker : undefined
+      await api.post('/watchlists/quick-add', {
+        item_type: 'ticker',
+        value: pureCode,
+        display_name: displayName,
+      })
+      message.success(`${ticker} ${t('watchlist.addSuccess')}`)
+      setWatchedTickers((prev) => new Set([...prev, pureCode]))
+    } catch (err: any) {
+      if (err.response?.status === 409) {
+        message.info(t('news.alreadyWatched'))
+      } else {
+        message.error(t('common.error'))
+      }
+    }
+  }
 
   const isAdmin = user?.role === 'admin'
 
@@ -271,6 +313,16 @@ export default function NewsFeed() {
               { value: 168, label: '7d' },
             ]}
           />
+          <Tooltip title={t('news.watchlistOnlyTip')}>
+            <Button
+              size="small"
+              type={watchlistOnly ? 'primary' : 'default'}
+              icon={<StarOutlined />}
+              onClick={() => setWatchlistOnly(!watchlistOnly)}
+            >
+              {t('news.watchlistOnly')}
+            </Button>
+          </Tooltip>
           {isAdmin && (
             <Space size={4}>
               <FilterOutlined />
@@ -353,6 +405,8 @@ export default function NewsFeed() {
                           const t5Label = t5.sentiment.includes('bullish') ? '↑' : t5.sentiment.includes('bearish') ? '↓' : '→'
                           const t1Color = SENTIMENT_COLORS[t1.sentiment] || '#94a3b8'
                           const t5Color = SENTIMENT_COLORS[t5.sentiment] || '#94a3b8'
+                          const tickerCode = ticker.replace(/\(.*?\)/, '').trim()
+                          const isWatched = watchedTickers.has(tickerCode)
                           return (
                             <Tooltip
                               key={ticker}
@@ -363,10 +417,20 @@ export default function NewsFeed() {
                                   <div>T+5 {t(`sentiment.${t5.sentiment}`)}: score {t5.sentiment_score > 0 ? '+' : ''}{t5.sentiment_score.toFixed(2)}, {t('news.confidence')} {(t5.confidence * 100).toFixed(0)}%</div>
                                   <div>T+20 {t(`sentiment.${data.long_term.sentiment}`)}: score {data.long_term.sentiment_score > 0 ? '+' : ''}{data.long_term.sentiment_score.toFixed(2)}, {t('news.confidence')} {(data.long_term.confidence * 100).toFixed(0)}%</div>
                                   {data.reason && <div style={{ marginTop: 4, opacity: 0.8, borderTop: '1px solid rgba(255,255,255,0.2)', paddingTop: 4 }}>{data.reason}</div>}
+                                  {!isWatched && <div style={{ marginTop: 4, color: '#fbbf24' }}>{t('news.clickToWatch')}</div>}
                                 </div>
                               }
                             >
-                              <Tag style={{ display: 'inline-flex', alignItems: 'center', gap: 2, padding: '0 6px' }}>
+                              <Tag style={{ display: 'inline-flex', alignItems: 'center', gap: 2, padding: '0 6px', cursor: isWatched ? 'default' : 'pointer' }}>
+                                {!isWatched && (
+                                  <PlusOutlined
+                                    style={{ fontSize: 10, color: '#1677ff', marginRight: 2 }}
+                                    onClick={(e) => handleQuickAddTicker(ticker, e)}
+                                  />
+                                )}
+                                {isWatched && (
+                                  <StarOutlined style={{ fontSize: 10, color: '#faad14', marginRight: 2 }} />
+                                )}
                                 <strong>{ticker}</strong>
                                 <span style={{ color: t1Color, fontWeight: 700, fontSize: 13 }}>{t1Label}</span>
                                 <span style={{ color: '#bbb', fontSize: 10 }}>T1</span>

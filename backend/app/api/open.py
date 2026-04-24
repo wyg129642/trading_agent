@@ -25,6 +25,14 @@ from backend.app.models.news import AnalysisResult, FilterResult, NewsItem, Rese
 from backend.app.schemas.open import (
     AnalysisBrief,
     DetailResponse,
+    KbCollectionInfo,
+    KbFacetsRequest,
+    KbFacetsResponse,
+    KbFetchRequest,
+    KbFetchResponse,
+    KbMetaResponse,
+    KbSearchRequest,
+    KbSearchResponse,
     ResearchBrief,
     ResolvedStock,
     SearchItem,
@@ -32,6 +40,7 @@ from backend.app.schemas.open import (
     StockSuggestion,
     SuggestResponse,
 )
+from backend.app.services import kb_service
 from backend.app.services.stock_verifier import get_stock_verifier
 
 logger = logging.getLogger(__name__)
@@ -878,3 +887,101 @@ async def _detail_jiuqian_wechat(item_id: str, db: AsyncSession) -> DetailRespon
             concept_tags=enr.get("concept_tags", []),
         ) if enr.get("summary") or row.summary else None,
     )
+
+
+# ── Knowledge Base endpoints ───────────────────────────────────────────
+#
+# These are thin wrappers around backend.app.services.kb_service. The same
+# service functions back the internal AI-chat tools (kb_search / kb_fetch_document
+# / kb_list_facets), so upgrading the KB upgrades both surfaces in lockstep.
+
+
+@router.get("/kb/meta", response_model=KbMetaResponse)
+async def kb_meta(_api_key=Depends(verify_api_key)):
+    """Introspect the KB: list all source platforms, doc_type enums, and collections.
+
+    Call this once when setting up an agent to build valid `doc_types` and
+    `sources` filter values.
+    """
+    collections = [
+        KbCollectionInfo(
+            source=s.db,
+            collection=s.collection,
+            doc_type=s.doc_type,
+            doc_type_cn=s.doc_type_cn,
+            has_pdf=s.has_pdf,
+        )
+        for s in kb_service.SPECS_LIST
+    ]
+    return KbMetaResponse(
+        sources=kb_service.ALL_SOURCES,
+        doc_types=kb_service.ALL_DOC_TYPES,
+        collections=collections,
+        notes=(
+            "Ticker format: CODE.MARKET (NVDA.US, 0700.HK, 600519.SH). "
+            "Bare codes like 'NVDA' or '0700' are auto-expanded. "
+            "HK codes are zero-padded to 5 digits internally."
+        ),
+    )
+
+
+@router.post("/kb/search", response_model=KbSearchResponse)
+async def kb_search(
+    req: KbSearchRequest,
+    _api_key=Depends(verify_api_key),
+):
+    """Hybrid filter + text-match search across all 16 KB collections.
+
+    Filter stack: tickers (canonical or bare), doc_types, sources, date_range.
+    Scoring: CJK bigram + Latin token match, title boost 3x, recency bonus.
+    Returns top_k hits with stable `doc_id` for the follow-up /kb/fetch call.
+    """
+    date_range = req.date_range.model_dump(exclude_none=True) if req.date_range else None
+    hits = await kb_service.search(
+        req.query or "",
+        tickers=req.tickers,
+        doc_types=req.doc_types,
+        sources=req.sources,
+        date_range=date_range,
+        top_k=req.top_k,
+    )
+    return KbSearchResponse(query=req.query or "", total=len(hits), hits=hits)
+
+
+@router.post("/kb/fetch", response_model=KbFetchResponse)
+async def kb_fetch(
+    req: KbFetchRequest,
+    _api_key=Depends(verify_api_key),
+):
+    """Fetch the full text of a KB document by `doc_id`.
+
+    The doc_id format is `<source>:<collection>:<_id>` — exactly the value
+    returned by /kb/search in each hit.
+    """
+    res = await kb_service.fetch_document(req.doc_id, max_chars=req.max_chars)
+    return KbFetchResponse(**res)
+
+
+@router.post("/kb/facets", response_model=KbFacetsResponse)
+async def kb_facets(
+    req: KbFacetsRequest,
+    _api_key=Depends(verify_api_key),
+):
+    """Count KB docs along a dimension subject to filters.
+
+    Dimensions: sources | doc_types | tickers | date_histogram.
+    Use this to scope a search before running kb_search — e.g. "how many
+    broker reports on NVDA in the last 3 months?".
+    """
+    filters_dict: dict = {}
+    if req.filters:
+        f = req.filters.model_dump(exclude_none=True)
+        if "date_range" in f and isinstance(f["date_range"], dict):
+            # already a dict, pass through
+            pass
+        filters_dict = f
+    try:
+        rows = await kb_service.list_facets(req.dimension, filters=filters_dict, top=req.top)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return KbFacetsResponse(dimension=req.dimension, rows=rows)

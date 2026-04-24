@@ -461,7 +461,7 @@ sg docker -c "docker exec ta-redis-dev redis-cli ping"
 | `BAIDU_API_KEY` | Baidu AI Search API key |
 | `UQER_TOKEN` | Uqer/DataYes market data API token |
 | `ALPHAPAI_APP_AGENT` | AlphaPai integration key |
-| `MINIMAX_API_KEY` | MiniMax LLM key (for AlphaPai enrichment) |
+| `LLM_ENRICHMENT_API_KEY` | OpenAI-compatible LLM key used by AlphaPai/Jiuqian enrichment + hot-news filter (currently Aliyun Bailian / DashScope) |
 
 ---
 

@@ -2,6 +2,12 @@
 .env
 config/settings.yaml
 config/portfolio_sources.yaml
+crawl/*/login_saved.json
+crawl/*/credentials.json.bak
+crawl/*/credentials.json
+crawl/*/playwright_data/
+crawl/sentimentrader/recon_output/
+crawl/sentimentrader/recon.py
 
 # 保留示例文件供参考
 # .env.example 可以提交（里面不含真实密钥）
@@ -28,3 +34,17 @@ reprocess.log
 # OS
 .DS_Store
 Thumbs.db
+.gstack/
+.env.secrets
+
+# jinmen oversea bulk downloader progress (regen-able, platform-specific)
+crawl/jinmen/_progress_oversea.json
+
+# Claude Code per-project local settings
+.claude/
+settings.local.json
+
+# Prod/staging env-specific env files (templates are .env.production.example,
+# .env.staging.example — those ARE committed)
+.env.production
+.env.staging

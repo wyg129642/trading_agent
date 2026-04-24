@@ -1,5 +1,41 @@
 # CLAUDE.md
 
+## 🛑 READ THIS FIRST — Prod vs Staging
+
+This project runs as **two simultaneous deployments** on this host:
+
+| | Production | Staging (default for iteration) |
+|---|---|---|
+| Working directory | `/home/ygwang/trading_agent`         | `/home/ygwang/trading_agent_staging` |
+| Git branch        | `main` (promoted from staging only)  | `staging` (where all iteration happens) |
+| Backend port      | `:8000`                              | `:20301` (`http://39.105.42.197:20301`) |
+| Role              | employees depend on this; stay stable | experiments, bug fixes, new features |
+
+### Rules for any Claude session working on this repo
+
+1. **Default to the staging worktree for code changes.** If the session's `cwd` is `/home/ygwang/trading_agent`
+   (the prod worktree) and the user asks you to modify code, first `cd /home/ygwang/trading_agent_staging` and
+   iterate there — never edit prod directly. The only time prod is the right target is when the user asks
+   for an emergency hotfix / rollback / deploy.
+2. **Restart = restart STAGING.** When the user says "重启 / restart / redeploy" without specifying an env,
+   it means staging. Run `./start_web.sh restart` inside `/home/ygwang/trading_agent_staging`. Prod should
+   only restart via `./scripts/promote.sh` + `./start_web.sh deploy` in the prod worktree.
+3. **Never run crawlers / engine / scanner / memory processor in staging.** They are gated by
+   `_prod_only_guard` in `start_web.sh` and will refuse. Use the prod worktree for anything that writes to
+   the shared crawler Mongo corpus or burns VIP daily quotas.
+4. **Environment scoping is automatic.** `APP_ENV=staging` in `/home/ygwang/trading_agent_staging/.env`
+   auto-suffixes Postgres DB (`trading_agent_staging`), Redis DB index (1), Milvus collections
+   (`kb_chunks_staging`, `user_kb_chunks_staging`), ClickHouse DB (`db_spider_staging`), and Mongo
+   collection names in shared databases (`stg_documents`, `stg_chunks`, `stg_fs.*`, `stg_research_sessions`).
+   Helpers live in `backend/app/config.py` (`_suffixed`, `_prefixed`, `effective_*`).
+5. **Promotion is a one-liner.** When staging is green, `cd /home/ygwang/trading_agent_staging &&
+   ./scripts/promote.sh` fast-forwards `main`, tags the commit, and hands off — operator still runs
+   `./start_web.sh deploy` in the prod worktree.
+6. **Migrations are forward-compatible.** Never drop/rename columns in a single release; additive-only
+   migrations are the default. See `DEPLOYMENT.md` § "Migration discipline" for the full rules.
+
+Full layout + rationale: **`DEPLOYMENT.md`** at the repo root.
+
 ## Project Overview
 
 Trading Intelligence Platform — a web-based AI research assistant for stock/investment analysis. FastAPI backend + React frontend, Postgres + Redis + MongoDB + Milvus + ClickHouse behind it, 8 upstream crawlers feeding a shared corpus, and a hybrid retrieval stack (BM25 + dense) the chat LLM can tool-call.
@@ -73,7 +109,9 @@ grep "REQUEST_SUMMARY" logs/chat_debug.log -A 10
 
 **Code:** `backend/app/services/chat_debug.py` — the `ChatTrace` class and `setup_chat_debug_logging()`. Trace emission is wired through `chat_llm.py`, `web_search_tool.py`, `alphapai_service.py`, `jinmen_service.py`, and the underlying `src/tools/web_search.py` engines.
 
-Parallel to the live debug log, every request is also persisted to MongoDB (`research_sessions` in DB `research-agent-interaction-process-all-accounts`) by `backend/app/services/research_interaction_log.py` and replayed by the admin-only `/admin/research-logs` page. Writes are best-effort; connection failures degrade to a no-op so the chat path never blocks on logging.
+Parallel to the live debug log, every request is also persisted to MongoDB as a `research_sessions` document by `backend/app/services/research_interaction_log.py` and replayed by the admin-only `/admin/research-logs` page. Target is the remote ops cluster `mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002` DB **`ti-user-knowledge-base`** collection **`research_sessions`** (co-hosted in the KB database because u_spider has no permission to create new DBs on the cluster; the collection is isolated from the KB's `documents`/`chunks`/`fs.*`). Writes are best-effort; connection failures degrade to a no-op so the chat path never blocks on logging.
+
+Staging writes to `stg_research_sessions` in the same DB instead (collection name comes from `Settings.research_sessions_collection` which is env-aware).
 
 ## Key Architecture
 
@@ -92,12 +130,26 @@ Parallel to the live debug log, every request is also persisted to MongoDB (`res
 
 ## Server Management
 
-`start_web.sh` manages four process groups:
+`start_web.sh` manages four process groups **per worktree**:
 
-- **infra** — docker: `ta-postgres-dev`, `ta-redis-dev`, `crawl_data` (MongoDB for crawlers)
-- **asr** — flock-guarded SSH tunnel `127.0.0.1:8760 → jumpbox:8760` (Qwen3-ASR); kept alive by a `* * * * *` crontab entry the `asr start` subcommand installs
-- **web** — uvicorn backend (auto-starts engine subprocess) + `run_proactive.py` (持仓突发监控 scanner)
-- **crawl** — `crawler_monitor.py --web --port 8080` + ~18 scraper watchers across 8 platforms (monitor auto-spawns them via its `/api/start-all`)
+- **infra** — docker: `ta-postgres-dev`, `ta-redis-dev`, `crawl_data` (MongoDB for crawlers). Containers
+  are **shared** across prod+staging; a staging `./start_web.sh infra stop` refuses to tear them down so
+  prod stays up.
+- **asr** — flock-guarded SSH tunnel `127.0.0.1:8760 → jumpbox:8760` (Qwen3-ASR); kept alive by a
+  `* * * * *` crontab entry the `asr start` subcommand installs. Also shared with prod; staging's
+  `asr stop` is a no-op.
+- **web** — uvicorn backend (auto-starts engine subprocess in prod) + `run_proactive.py` (持仓突发监控
+  scanner) + `run_chat_memory_processor.py` (chat feedback → long-term user memory). Staging starts
+  **only** the uvicorn backend; engine/scanner/memory processor refuse to start on staging (blocked by
+  `_prod_only_guard`).
+- **crawl** — `crawler_monitor.py --web --port 8080` + ~18 scraper watchers across 8 platforms (monitor
+  auto-spawns them via its `/api/start-all`). **Prod-only** — staging reads the same remote Mongo corpus
+  read-only so the crawler account, VIP quotas, and daily rate caps stay single-writer.
+
+**New subcommand for staging bootstrap:** `./start_web.sh init-staging` (idempotent) —
+`CREATE DATABASE trading_agent_staging` + run all Alembic migrations against it. Milvus
+`kb_chunks_staging` / `user_kb_chunks_staging` collections and Mongo `stg_*` collections are created
+lazily on first use.
 
 ```bash
 # Top-level
@@ -263,14 +315,14 @@ Five stores, each with a distinct role:
 
 1. **PostgreSQL 16** — primary operational store. All user/app state (auth, watchlists, chat, predictions, alerts, KB folder tree, enriched mirrors of AlphaPai/Jiuqian). Async SQLAlchemy via `asyncpg`, pool 20 + 10 overflow, `pool_pre_ping=True`. Config: `database_url` in `backend/app/config.py`.
 2. **Redis 7** — rate-limit counters for open-API keys, login session state (`login:{platform}:{session_id}`), OTP relay, scraper PIDs, quote cache, consensus cache. `localhost:6379`.
-3. **MongoDB** — crawler output (8 platforms) **+ `ti-user-knowledge-base` (personal KB)** all live on the shared remote cluster at `192.168.31.176:35002` (u_spider auth, DB scope listed in the crawler-migration memory). `research-agent-interaction-process-all-accounts` (chat session logs) is the only Mongo workload still on `localhost:27017`. Accessed by `*_db.py` routers and the KB / research-log services.
+3. **MongoDB** — crawler output (8 platforms), personal KB, and the AI research session log all live on the shared remote cluster at `192.168.31.176:35002` (u_spider auth, DB scope listed in the crawler-migration memory). The research session log (`research_sessions`) is co-hosted inside the `ti-user-knowledge-base` DB as a sibling collection to `documents`/`chunks`/`fs.*` — u_spider can't create new DBs on the cluster, so the recorder lives inside an existing writable DB. Accessed by `*_db.py` routers and the KB / research-log services.
 4. **Milvus 2.5** (docker-compose.vector.yml, standalone + etcd + MinIO, persisted to `/home/ygwang/crawl_data/milvus_data/`) — hybrid vector + BM25 retrieval for the shared KB (`kb_chunks`, Qwen3-Embedding-8B 4096-dim) and the personal KB (`user_kb_chunks`, OpenAI `text-embedding-3-small` 1536-dim).
 5. **ClickHouse** — optional OLAP / time-series (generic node disabled by default; `clickhouse_enabled=False`). Used by engine for backtesting + ticker sentiment aggregation. A **second** ClickHouse node at `192.168.31.137:38123` holds A-share klines (`db_market.t_realtime_kline_1m`, `t_adj_daily_data`) and is queried live by the portfolio dashboard when Futu is down.
 
 Plus two external MySQL/Mongo dependencies the backend reads from:
 
 - **Wind MySQL** at `192.168.31.176:3306` — `wind.ASHARECONSENSUS*` + `ASHARESTOCKRATINGCONSUSHIS` for A-share 一致预期. No indexes → 15s cold query, 30-min Redis cache, pre-warmed every 25 min.
-- **Remote Mongo** at `192.168.31.176:35002` — `u_spider:prod_X5BKVbAc?authSource=admin` — primary store for all crawler DBs and the personal KB (`ti-user-knowledge-base`). `research_log_mongo_uri` still points at local Mongo until the admin grants write access on a research-log DB there.
+- **Remote Mongo** at `192.168.31.176:35002` — `u_spider:prod_X5BKVbAc?authSource=admin` — primary store for all crawler DBs, the personal KB (`ti-user-knowledge-base`), and the AI research session log (`ti-user-knowledge-base.research_sessions`, co-hosted in the same DB because u_spider can't create new DBs).
 
 **PostgreSQL models** (`backend/app/models/`, one module per domain):
 
@@ -471,7 +523,9 @@ Stack: React 18 + TypeScript + Vite, Ant Design UI, **Zustand** for state (auth 
 
 ### Build & deployment
 
-**Development** — `./start_web.sh start` brings up Postgres + Redis (`docker-compose.dev.yml`), the ASR tunnel, uvicorn (`backend.app.main:app` on :8000, single worker), and the crawler monitor + watchers. Frontend dev server is separate: `cd frontend && npm run dev` (:5173). Vite proxies `/api` → `:8000` and `/ws` → `:8000` (`frontend/vite.config.ts`).
+**Development** — `./start_web.sh start` brings up Postgres + Redis (`docker-compose.dev.yml`), the ASR tunnel, uvicorn (`backend.app.main:app` on `APP_PORT`, single worker), and (prod only) the crawler monitor + watchers. Port defaults: prod=8000, staging=20301 — read from each worktree's `.env`. Frontend dev server is separate: `cd frontend && npm run dev` (:5173); Vite proxies `/api` → `:8000` by default, override with `VITE_DEV_PROXY_TARGET=http://localhost:20301 npm run dev` to hit a running staging backend.
+
+Staging-only bundle: `cd frontend && npm run build:staging` writes to `frontend/dist-staging/`; the staging backend auto-serves from there when `APP_ENV=staging` (see `_resolve_frontend_dist` in `backend/app/main.py`). Prod bundle stays in `frontend/dist/`.
 
 The Milvus vector stack is started separately (kept out of the default dev flow because it's heavy):
 

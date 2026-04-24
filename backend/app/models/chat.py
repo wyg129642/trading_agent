@@ -67,6 +67,11 @@ class ChatMessage(Base):
     content: Mapped[str] = mapped_column(Text, default="")
     attachments: Mapped[dict | None] = mapped_column(JSONB, default=list)
     is_debate: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # Set by the chat-memory background daemon after passive conversation
+    # scan. NULL = not yet processed; non-NULL = skip on next tick.
+    memory_processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, server_default=text("now()"),
     )
@@ -81,6 +86,7 @@ class ChatMessage(Base):
 
     __table_args__ = (
         Index("ix_chat_msg_conv", "conversation_id"),
+        Index("ix_chat_msg_memory_processed", "memory_processed_at"),
     )
 
 
@@ -104,6 +110,7 @@ class ChatModelResponse(Base):
     rating: Mapped[int | None] = mapped_column(Integer, nullable=True)
     rating_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sources: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     debate_round: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, server_default=text("now()"),
@@ -216,4 +223,28 @@ class ChatTrackingAlert(Base):
     __table_args__ = (
         Index("ix_tracking_alert_topic", "topic_id"),
         Index("ix_tracking_alert_unread", "is_read"),
+    )
+
+
+class ChatRecommendedQuestion(Base):
+    """Per-user LLM-generated quick-start question suggestions, refreshed daily."""
+    __tablename__ = "chat_recommended_questions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, unique=True,
+    )
+    questions: Mapped[list] = mapped_column(JSONB, default=list, server_default="[]")
+    source_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, server_default=text("now()"),
+    )
+
+    __table_args__ = (
+        Index("ix_chat_rec_q_user", "user_id"),
+        Index("ix_chat_rec_q_generated", "generated_at"),
     )

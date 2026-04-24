@@ -14,6 +14,8 @@ import relativeTime from 'dayjs/plugin/relativeTime'
 
 dayjs.extend(relativeTime)
 
+import MarkdownRenderer from '../components/MarkdownRenderer'
+
 const { Text, Paragraph } = Typography
 
 interface MinutesItem {
@@ -233,8 +235,8 @@ export default function JiuqianMinutes() {
             )}
             <Divider />
             <h4>完整内容</h4>
-            <div style={{ maxHeight: 600, overflow: 'auto', whiteSpace: 'pre-wrap', fontSize: 13, lineHeight: 1.8 }}>
-              {drawerItem.content}
+            <div style={{ maxHeight: 600, overflow: 'auto', fontSize: 13, lineHeight: 1.8 }}>
+              <MarkdownRenderer content={drawerItem.content} />
             </div>
           </div>
         )}

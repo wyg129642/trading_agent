@@ -1,338 +1,431 @@
 /**
- * WeChat Articles page — shows filtered, enriched WeChat public account articles
- * with stock/sector tags, sentiment, AI summaries, and market impact scores.
+ * AlphaPai · 微信公众号 (Wechat Articles)
+ *
+ * 基于 MongoDB (`alphapai.wechat_articles`) 的视图。
+ * 每条为券商 / 自媒体 公众号文章。
  */
-import { useEffect, useState, useCallback } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
+  Alert,
+  Avatar,
   Card,
+  Drawer,
+  Empty,
+  Input,
   List,
-  Tag,
   Select,
   Space,
-  Input,
+  Spin,
+  Statistic,
+  Tag,
   Typography,
-  Tooltip,
-  Empty,
-  Slider,
 } from 'antd'
 import {
-  ClockCircleOutlined,
+  ReloadOutlined,
   LinkOutlined,
-  RiseOutlined,
-  FallOutlined,
-  SearchOutlined,
-  ThunderboltOutlined,
+  ClockCircleOutlined,
+  WechatOutlined,
+  TagOutlined,
+  FileTextOutlined,
 } from '@ant-design/icons'
-import { useTranslation } from 'react-i18next'
-import api from '../services/api'
-import { useFavorites } from '../hooks/useFavorites'
-import FavoriteButton from '../components/FavoriteButton'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
+import api from '../services/api'
+import MarkdownRenderer from '../components/MarkdownRenderer'
 
 dayjs.extend(relativeTime)
 
-const { Text } = Typography
+const { Text, Title, Paragraph } = Typography
 
-interface ArticleItem {
-  arc_code: string
-  arc_name: string
-  author: string | null
+interface Item {
+  id: string
+  category: string
+  title: string
   publish_time: string | null
-  text_count: number
-  url: string
-  enrichment: {
-    summary?: string
-    relevance_score?: number
-    market_impact_score?: number
-    tickers?: string[]
-    sectors?: string[]
-    tags?: string[]
-    sentiment?: string
-    skipped?: boolean
-  }
-  is_enriched: boolean
+  web_url: string | null
+  institution: string | null
+  stocks: { code: string | null; name: string | null }[]
+  industries: string[]
+  analysts: string[]
+  content_preview: string
+  content_length: number
+  has_pdf: boolean
+  account_name: string | null
+  source_url: string | null
+  crawled_at: string | null
 }
 
-interface ArticleResponse {
-  items: ArticleItem[]
+interface ListResponse {
+  items: Item[]
   total: number
   page: number
   page_size: number
   has_next: boolean
 }
 
-const SENTIMENT_MAP: Record<string, { color: string; label: string; icon: any }> = {
-  bullish: { color: '#52c41a', label: '看多', icon: <RiseOutlined /> },
-  bearish: { color: '#ff4d4f', label: '看空', icon: <FallOutlined /> },
-  neutral: { color: '#d9d9d9', label: '中性', icon: null },
+interface StatsResponse {
+  total: number
+  per_category: Record<string, number>
+  today: Record<string, number>
+  last_7_days: {
+    date: string
+    roadshow: number
+    report: number
+    comment: number
+    wechat: number
+  }[]
+  recent_publishers: Record<string, { name: string; count: number }[]>
+  latest_per_category: Record<string, string | null>
 }
 
-const HOURS_OPTIONS = [
-  { value: 24, label: '24小时' },
-  { value: 48, label: '48小时' },
-  { value: 168, label: '7天' },
-]
-
-const SORT_OPTIONS = [
-  { value: 'impact', label: '按影响力' },
-  { value: 'time', label: '按时间' },
-  { value: 'relevance', label: '按相关性' },
-]
-
-const IMPACT_COLORS: Record<string, string> = {
-  high: '#ef4444',
-  medium: '#f59e0b',
-  low: '#94a3b8',
+interface DetailResponse extends Item {
+  content: string
+  raw_id: string | null
 }
 
-function getImpactLevel(score: number | undefined): { color: string; label: string } {
-  if (score == null) return { color: '#d9d9d9', label: '' }
-  if (score >= 8) return { color: '#ef4444', label: '高影响' }
-  if (score >= 6) return { color: '#f59e0b', label: '中影响' }
-  if (score >= 4) return { color: '#2563eb', label: '低影响' }
-  return { color: '#94a3b8', label: '微影响' }
+// Soft deterministic avatar color from account name
+function avatarColor(name: string): string {
+  const palette = [
+    '#16a34a',
+    '#0284c7',
+    '#8b5cf6',
+    '#f59e0b',
+    '#ec4899',
+    '#10b981',
+    '#2563eb',
+    '#d946ef',
+  ]
+  let hash = 0
+  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0
+  return palette[hash % palette.length]
 }
 
 export default function AlphaPaiFeed() {
-  const { t } = useTranslation()
+  const [stats, setStats] = useState<StatsResponse | null>(null)
+  const [statsLoading, setStatsLoading] = useState(true)
+  const [statsError, setStatsError] = useState<string | null>(null)
 
-  const { favoriteIds, toggleFavorite } = useFavorites('wechat')
-
-  const [items, setItems] = useState<ArticleItem[]>([])
-  const [total, setTotal] = useState(0)
+  const [items, setItems] = useState<Item[]>([])
+  const [itemsLoading, setItemsLoading] = useState(false)
   const [page, setPage] = useState(1)
-  const [loading, setLoading] = useState(true)
-  const [hours, setHours] = useState<number>(48)
-  const [searchAuthor, setSearchAuthor] = useState('')
-  const [sortBy, setSortBy] = useState<string>('impact')
-  const [minImpact, setMinImpact] = useState<number>(5)
+  const [total, setTotal] = useState(0)
 
-  const fetchArticles = useCallback(async () => {
-    setLoading(true)
+  const [query, setQuery] = useState('')
+  const [accountFilter, setAccountFilter] = useState<string | undefined>()
+
+  const [detailOpen, setDetailOpen] = useState(false)
+  const [detail, setDetail] = useState<DetailResponse | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+
+  const loadStats = useCallback(async () => {
+    setStatsLoading(true)
+    setStatsError(null)
     try {
-      const params: Record<string, any> = {
-        page,
-        page_size: 20,
-        hours,
-        min_relevance: 0.55,
-        min_impact: minImpact,
-        sort_by: sortBy,
-      }
-      if (searchAuthor) params.author = searchAuthor
+      const res = await api.get<StatsResponse>('/alphapai-db/stats')
+      setStats(res.data)
+    } catch (err: any) {
+      setStatsError(err?.response?.data?.detail || err?.message || '加载失败')
+    } finally {
+      setStatsLoading(false)
+    }
+  }, [])
 
-      const res = await api.get<ArticleResponse>('/alphapai/wechat', { params })
+  const loadItems = useCallback(async () => {
+    setItemsLoading(true)
+    try {
+      const res = await api.get<ListResponse>('/alphapai-db/items', {
+        params: {
+          category: 'wechat',
+          page,
+          page_size: 20,
+          q: query || undefined,
+          institution: accountFilter || undefined,
+        },
+      })
       setItems(res.data.items)
       setTotal(res.data.total)
-    } catch (e) {
-      console.error(e)
+    } catch {
+      setItems([])
+      setTotal(0)
     } finally {
-      setLoading(false)
+      setItemsLoading(false)
     }
-  }, [page, hours, searchAuthor, sortBy, minImpact])
+  }, [page, query, accountFilter])
 
   useEffect(() => {
-    fetchArticles()
-  }, [fetchArticles])
+    loadStats()
+  }, [loadStats])
 
   useEffect(() => {
-    setPage(1)
-  }, [hours, searchAuthor, sortBy, minImpact])
+    loadItems()
+  }, [loadItems])
+
+  const openDetail = useCallback(async (item: Item) => {
+    setDetailOpen(true)
+    setDetailLoading(true)
+    setDetail(null)
+    try {
+      const res = await api.get<DetailResponse>(
+        `/alphapai-db/items/wechat/${encodeURIComponent(item.id)}`,
+      )
+      setDetail(res.data)
+    } catch {
+      setDetail(null)
+    } finally {
+      setDetailLoading(false)
+    }
+  }, [])
 
   return (
-    <div>
-      {/* Filters */}
-      <Card size="small" style={{ marginBottom: 16 }}>
-        <Space wrap size="middle">
-          <Input
-            prefix={<SearchOutlined />}
-            placeholder="搜索公众号作者..."
-            value={searchAuthor}
-            onChange={(e) => setSearchAuthor(e.target.value)}
-            onPressEnter={() => fetchArticles()}
-            allowClear
-            style={{ width: 200 }}
-          />
-          <Select
-            value={hours}
-            onChange={setHours}
-            style={{ width: 120 }}
-            options={HOURS_OPTIONS}
-          />
-          <Select
-            value={sortBy}
-            onChange={setSortBy}
-            style={{ width: 120 }}
-            options={SORT_OPTIONS}
-          />
-          <Tooltip title="最低市场影响力评分 (0-10)">
-            <Space size={4}>
-              <ThunderboltOutlined style={{ color: '#f59e0b' }} />
-              <Slider
-                min={0}
-                max={9}
-                value={minImpact}
-                onChange={setMinImpact}
-                style={{ width: 100 }}
-                tooltip={{ formatter: (v) => `≥${v}` }}
-              />
-              <Text type="secondary" style={{ fontSize: 12, minWidth: 20 }}>
-                ≥{minImpact}
-              </Text>
-            </Space>
-          </Tooltip>
+    <div style={{ padding: 20 }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          marginBottom: 16,
+        }}
+      >
+        <div>
+          <Title level={3} style={{ margin: 0 }}>
+            <WechatOutlined /> AlphaPai · 微信公众号
+          </Title>
           <Text type="secondary">
-            {total} 篇高价值文章
+            券商 / 行业自媒体 公众号文章聚合 · 来自 crawl/alphapai_crawl
+          </Text>
+        </div>
+        <a onClick={loadStats} style={{ fontSize: 13 }}>
+          <ReloadOutlined /> 刷新
+        </a>
+      </div>
+
+      {statsError && (
+        <Alert
+          type="warning"
+          showIcon
+          message="无法从 MongoDB 加载数据"
+          description={statsError}
+          style={{ marginBottom: 16 }}
+        />
+      )}
+
+      <Spin spinning={statsLoading}>
+        <Card size="small" bodyStyle={{ padding: 14 }} style={{ marginBottom: 16 }}>
+          <Space size={18} align="center">
+            <Statistic
+              title={
+                <span style={{ color: '#10b981' }}>
+                  <ClockCircleOutlined /> 今日新增文章
+                </span>
+              }
+              value={stats?.today.wechat ?? 0}
+              valueStyle={{ color: '#10b981', fontSize: 28 }}
+            />
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {dayjs().format('YYYY-MM-DD')}
+              {stats?.latest_per_category?.wechat && (
+                <> · 最近发布 {stats.latest_per_category.wechat}</>
+              )}
+            </Text>
+          </Space>
+        </Card>
+      </Spin>
+
+      <Card size="small">
+        <Space wrap style={{ marginBottom: 12 }}>
+          <Input.Search
+            placeholder="搜索标题 / 内容"
+            allowClear
+            style={{ width: 260 }}
+            onSearch={(v) => {
+              setQuery(v)
+              setPage(1)
+            }}
+          />
+          <Select
+            placeholder="公众号账号"
+            allowClear
+            value={accountFilter}
+            onChange={(v) => {
+              setAccountFilter(v)
+              setPage(1)
+            }}
+            style={{ width: 220 }}
+            options={(stats?.recent_publishers?.wechat || []).map((p) => ({
+              value: p.name,
+              label: `${p.name} (${p.count})`,
+            }))}
+          />
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            共 {total} 条
           </Text>
         </Space>
+
+        <List
+          loading={itemsLoading}
+          dataSource={items}
+          locale={{ emptyText: <Empty description="暂无数据" /> }}
+          pagination={{
+            current: page,
+            pageSize: 20,
+            total,
+            showSizeChanger: false,
+            onChange: (p) => setPage(p),
+          }}
+          renderItem={(item) => {
+            const accountName = item.account_name || item.institution || '未知'
+            const initial = accountName.slice(0, 2)
+            return (
+              <List.Item
+                key={item.id}
+                style={{ cursor: 'pointer' }}
+                onClick={() => openDetail(item)}
+              >
+                <List.Item.Meta
+                  avatar={
+                    <Avatar
+                      style={{
+                        backgroundColor: avatarColor(accountName),
+                        fontSize: 12,
+                        fontWeight: 600,
+                      }}
+                      size={36}
+                    >
+                      {initial}
+                    </Avatar>
+                  }
+                  title={
+                    <Space size={6} wrap>
+                      <Text strong>{item.title}</Text>
+                    </Space>
+                  }
+                  description={
+                    <Space direction="vertical" size={2} style={{ width: '100%' }}>
+                      <Space size={10} wrap style={{ fontSize: 12 }}>
+                        <Tag color="green" icon={<WechatOutlined />}>
+                          {accountName}
+                        </Tag>
+                        <Text type="secondary">
+                          <ClockCircleOutlined /> {item.publish_time || '—'}
+                        </Text>
+                        {item.industries.slice(0, 4).map((ind) => (
+                          <Tag key={ind} style={{ fontSize: 11 }}>
+                            {ind}
+                          </Tag>
+                        ))}
+                        {item.stocks.slice(0, 3).map((s, idx) => (
+                          <Tag
+                            key={`${s.code}-${idx}`}
+                            color="cyan"
+                            style={{ fontSize: 11 }}
+                          >
+                            {s.name} {s.code}
+                          </Tag>
+                        ))}
+                      </Space>
+                      <Text
+                        style={{ fontSize: 12, color: '#64748b' }}
+                        ellipsis={{ tooltip: item.content_preview } as any}
+                      >
+                        {item.content_preview.replace(/\n+/g, ' ')}
+                      </Text>
+                      <Text type="secondary" style={{ fontSize: 11 }}>
+                        <FileTextOutlined /> {item.content_length} 字
+                      </Text>
+                    </Space>
+                  }
+                />
+              </List.Item>
+            )
+          }}
+        />
       </Card>
 
-      {/* Article List */}
-      <List
-        loading={loading}
-        dataSource={items}
-        locale={{
-          emptyText: (
-            <Empty description="暂无高价值公众号文章，系统正在持续分析中..." />
-          ),
-        }}
-        pagination={{
-          current: page,
-          total,
-          pageSize: 20,
-          onChange: setPage,
-          showSizeChanger: false,
-        }}
-        renderItem={(item) => {
-          const enr = item.enrichment || {}
-          const sentiment = SENTIMENT_MAP[enr.sentiment || '']
-          const tickers = enr.tickers || []
-          const sectors = enr.sectors || []
-          const tags = enr.tags || []
-          const impactScore = enr.market_impact_score
-          const impact = getImpactLevel(impactScore)
-
-          return (
-            <Card
-              size="small"
-              style={{
-                marginBottom: 10,
-                borderLeft: sentiment
-                  ? `3px solid ${sentiment.color}`
-                  : '3px solid #e2e8f0',
-              }}
-              hoverable
-            >
-              <div>
-                {/* Title row */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  {sentiment && (
-                    <Tag
-                      color={sentiment.color}
-                      icon={sentiment.icon}
-                      style={{ margin: 0 }}
-                    >
-                      {sentiment.label}
+      <Drawer
+        title={detail?.title || '详情'}
+        open={detailOpen}
+        onClose={() => setDetailOpen(false)}
+        width={800}
+        extra={
+          <Space>
+            {detail?.source_url && (
+              <a href={detail.source_url} target="_blank" rel="noreferrer">
+                <WechatOutlined /> 原文
+              </a>
+            )}
+            {detail?.web_url && (
+              <a href={detail.web_url} target="_blank" rel="noreferrer">
+                <LinkOutlined /> AlphaPai 原页
+              </a>
+            )}
+          </Space>
+        }
+      >
+        <Spin spinning={detailLoading}>
+          {detail ? (
+            <div>
+              <Space wrap size={6} style={{ marginBottom: 10 }}>
+                <Tag color="green" icon={<WechatOutlined />}>
+                  {detail.account_name || detail.institution || '未知账号'}
+                </Tag>
+                {detail.publish_time && (
+                  <Tag icon={<ClockCircleOutlined />}>{detail.publish_time}</Tag>
+                )}
+              </Space>
+              {detail.industries.length > 0 && (
+                <div style={{ marginBottom: 6 }}>
+                  <Text type="secondary" style={{ marginRight: 6 }}>
+                    <TagOutlined /> 行业:
+                  </Text>
+                  {detail.industries.map((i) => (
+                    <Tag key={i}>{i}</Tag>
+                  ))}
+                </div>
+              )}
+              {detail.stocks.length > 0 && (
+                <div style={{ marginBottom: 10 }}>
+                  <Text type="secondary" style={{ marginRight: 6 }}>
+                    个股:
+                  </Text>
+                  {detail.stocks.map((s, idx) => (
+                    <Tag key={`${s.code}-${idx}`} color="cyan">
+                      {s.name} {s.code}
                     </Tag>
-                  )}
-                  {impactScore != null && (
-                    <Tooltip title={`市场影响力评分: ${impactScore}/10`}>
-                      <Tag
-                        icon={<ThunderboltOutlined />}
-                        color={impact.color}
-                        style={{ margin: 0 }}
-                      >
-                        {impactScore}
-                      </Tag>
-                    </Tooltip>
-                  )}
-                  <span style={{ fontWeight: 600, fontSize: 15, flex: 1 }}>
-                    {item.arc_name}
-                  </span>
-                  {item.url && (
-                    <a
-                      href={item.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      onClick={(e) => e.stopPropagation()}
-                      style={{ flexShrink: 0 }}
-                    >
-                      <Tag icon={<LinkOutlined />} color="blue">
-                        原文
-                      </Tag>
-                    </a>
-                  )}
-                  <FavoriteButton
-                    itemType="wechat"
-                    itemId={item.arc_code}
-                    favoriteIds={favoriteIds}
-                    onToggle={toggleFavorite}
-                  />
+                  ))}
                 </div>
-
-                {/* AI Summary */}
-                {enr.summary && (
-                  <div
-                    style={{
-                      background: '#f8fafc',
-                      borderRadius: 4,
-                      padding: '8px 12px',
-                      marginBottom: 8,
-                      fontSize: 13,
-                      color: '#475569',
-                      lineHeight: 1.6,
-                    }}
-                  >
-                    {enr.summary}
-                  </div>
+              )}
+              <Card
+                size="small"
+                title="文章内容"
+                style={{ marginTop: 8 }}
+                bodyStyle={{
+                  maxHeight: '58vh',
+                  overflowY: 'auto',
+                  fontSize: 13,
+                  lineHeight: 1.8,
+                  background: '#f8fafc',
+                }}
+              >
+                {detail.content ? (
+                  <MarkdownRenderer content={detail.content} />
+                ) : (
+                  <Empty description="无内容" />
                 )}
-
-                {/* Stock & Sector Tags */}
-                {(tickers.length > 0 || sectors.length > 0) && (
-                  <div style={{ marginBottom: 6 }}>
-                    {tickers.map((tk, i) => (
-                      <Tag key={`t-${i}`} color="blue" style={{ fontSize: 12 }}>
-                        {tk}
-                      </Tag>
-                    ))}
-                    {sectors.map((s, i) => (
-                      <Tag key={`s-${i}`} color="cyan" style={{ fontSize: 12 }}>
-                        {s}
-                      </Tag>
-                    ))}
-                    {tags.map((tag, i) => (
-                      <Tag key={`tag-${i}`} style={{ fontSize: 11 }}>
-                        {tag}
-                      </Tag>
-                    ))}
-                  </div>
-                )}
-
-                {/* Meta row */}
-                <div style={{ display: 'flex', gap: 12, fontSize: 12, color: '#8c8c8c' }}>
-                  {item.author && <span>{item.author}</span>}
-                  {item.publish_time && (
-                    <span>
-                      <ClockCircleOutlined style={{ marginRight: 3 }} />
-                      {dayjs(item.publish_time).tz('Asia/Shanghai').fromNow()}
-                    </span>
-                  )}
-                  {enr.relevance_score != null && enr.relevance_score > 0 && (
-                    <Tooltip title={`AI相关性评分: ${(enr.relevance_score * 100).toFixed(0)}%`}>
-                      <Tag
-                        color={enr.relevance_score >= 0.7 ? 'green' : enr.relevance_score >= 0.5 ? 'blue' : 'default'}
-                        style={{ fontSize: 11, lineHeight: '18px', margin: 0 }}
-                      >
-                        {(enr.relevance_score * 100).toFixed(0)}%
-                      </Tag>
-                    </Tooltip>
-                  )}
-                </div>
-              </div>
-            </Card>
-          )
-        }}
-      />
+              </Card>
+              <Paragraph
+                type="secondary"
+                style={{ fontSize: 11, marginTop: 12 }}
+              >
+                ID: {detail.id}
+                {detail.crawled_at &&
+                  ` · 抓取于 ${dayjs(detail.crawled_at).format('YYYY-MM-DD HH:mm')}`}
+              </Paragraph>
+            </div>
+          ) : (
+            <Empty />
+          )}
+        </Spin>
+      </Drawer>
     </div>
   )
 }

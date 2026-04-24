@@ -156,15 +156,21 @@ def _db() -> AsyncIOMotorDatabase:
 
 
 def _docs() -> AsyncIOMotorCollection:
-    return _db()["documents"]
+    # Staging shares the remote `ti-user-knowledge-base` DB with prod
+    # (u_spider cannot create new DBs). Per-env isolation is done via a
+    # `stg_` collection prefix — see Settings.user_kb_docs_collection.
+    return _db()[get_settings().user_kb_docs_collection]
 
 
 def _chunks() -> AsyncIOMotorCollection:
-    return _db()["chunks"]
+    return _db()[get_settings().user_kb_chunks_collection]
 
 
 def _gridfs() -> AsyncIOMotorGridFSBucket:
-    return AsyncIOMotorGridFSBucket(_db())
+    # GridFS materializes as `{bucket}.files` + `{bucket}.chunks`, so the
+    # bucket prefix keeps binary uploads isolated too (`fs.*` for prod,
+    # `stg_fs.*` for staging).
+    return AsyncIOMotorGridFSBucket(_db(), bucket_name=get_settings().user_kb_gridfs_bucket)
 
 
 # ── Index setup ────────────────────────────────────────────────
@@ -1574,7 +1580,7 @@ def _milvus_existing_ids(chunk_ids: list[str]) -> set[str]:
         mc = user_kb_vector._get_milvus_client()
     except user_kb_vector.VectorStoreUnavailable:
         return set()
-    coll = get_settings().user_kb_milvus_collection
+    coll = get_settings().effective_user_kb_milvus_collection
     # Milvus filter expressions have a practical payload limit; page the
     # IN clause at 1000 ids per round-trip.
     existing: set[str] = set()
@@ -2803,7 +2809,10 @@ async def _bm25_search_chunks(
         {"$limit": top_k},
         {
             "$lookup": {
-                "from": "documents",
+                # Must match the env-scoped documents collection (prod: `documents`,
+                # staging: `stg_documents`) so lookup hits the same dataset the
+                # chunks came from.
+                "from": get_settings().user_kb_docs_collection,
                 "localField": "document_id",
                 "foreignField": "_id",
                 "as": "document",

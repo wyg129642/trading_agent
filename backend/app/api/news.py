@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, desc, func, or_, select, text
+from sqlalchemy import String, and_, desc, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -20,6 +20,7 @@ from backend.app.models.news import AnalysisResult, FilterResult, NewsItem, Rese
 _HOT_NEWS_SOURCES = ("华尔街见闻热点", "财联社热点", "雪球热榜", "微博热搜")
 from backend.app.models.user import User
 from backend.app.models.user_preference import UserNewsRead
+from backend.app.models.watchlist import Watchlist, WatchlistItem
 from backend.app.schemas.news import (
     AnalysisResultDetail,
     FilterResultDetail,
@@ -31,6 +32,66 @@ from backend.app.schemas.news import (
 )
 
 router = APIRouter()
+
+
+def _load_portfolio_tickers() -> set[str]:
+    """Load portfolio ticker symbols from config/portfolio_sources.yaml."""
+    from pathlib import Path
+    import yaml
+
+    config_path = Path(__file__).resolve().parent.parent.parent.parent / "config" / "portfolio_sources.yaml"
+    if not config_path.exists():
+        return set()
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return {s["stock_ticker"] for s in data.get("sources", []) if s.get("stock_ticker")}
+    except Exception:
+        return set()
+
+
+def _load_portfolio_stock_names() -> dict[str, str]:
+    """Load portfolio ticker -> stock_name mapping from config."""
+    from pathlib import Path
+    import yaml
+
+    config_path = Path(__file__).resolve().parent.parent.parent.parent / "config" / "portfolio_sources.yaml"
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        result: dict[str, str] = {}
+        for s in data.get("sources", []):
+            ticker = s.get("stock_ticker", "")
+            name = s.get("stock_name", "")
+            if ticker and name and ticker not in result:
+                result[ticker] = name
+        return result
+    except Exception:
+        return {}
+
+
+async def _get_user_watched_values(db: AsyncSession, user_id) -> tuple[set[str], set[str], set[str], dict[str, str]]:
+    """Return (tickers, sectors, keywords, ticker_names) from all of the user's watchlists."""
+    stmt = (
+        select(WatchlistItem.item_type, WatchlistItem.value, WatchlistItem.display_name)
+        .join(Watchlist, Watchlist.id == WatchlistItem.watchlist_id)
+        .where(Watchlist.user_id == user_id)
+    )
+    result = await db.execute(stmt)
+    tickers, sectors, keywords = set(), set(), set()
+    ticker_names: dict[str, str] = {}
+    for item_type, value, display_name in result:
+        if item_type == "ticker":
+            tickers.add(value)
+            if display_name:
+                ticker_names[value] = display_name
+        elif item_type == "sector":
+            sectors.add(value)
+        elif item_type == "keyword":
+            keywords.add(value)
+    return tickers, sectors, keywords, ticker_names
 
 
 def _apply_quality_filter(base, user: User, unfiltered: bool):
@@ -74,6 +135,7 @@ async def list_news(
     category: str | None = None,
     hours: int | None = None,
     unfiltered: bool = Query(False, description="Admin only: show all news including unprocessed"),
+    watchlist_only: bool = Query(False, description="Only show news matching portfolio + watchlist stocks"),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -88,17 +150,65 @@ async def list_news(
     base = _apply_quality_filter(base, user, unfiltered)
 
     conditions = []
+
+    # Watchlist + portfolio filter
+    if watchlist_only:
+        w_tickers, w_sectors, w_keywords, w_ticker_names = await _get_user_watched_values(db, user.id)
+        p_tickers = _load_portfolio_tickers()
+        p_names = _load_portfolio_stock_names()
+        all_tickers = w_tickers | p_tickers
+        # Merge watchlist display names with portfolio names
+        all_names = {**p_names, **w_ticker_names}
+
+        # affected_tickers stores values like ["英特尔(INTC)", "天孚通信(300394.SZ)"]
+        # so we must use text-based ILIKE matching, not exact JSONB containment.
+        match_conditions = []
+        for t in all_tickers:
+            safe_t = _escape_like(t)
+            # Match ticker code inside the JSONB text representation
+            match_conditions.append(
+                AnalysisResult.affected_tickers.cast(String).ilike(f"%{safe_t}%")
+            )
+            # Also match in title
+            match_conditions.append(NewsItem.title.ilike(f"%{safe_t}%"))
+            # Also match by stock name (from watchlist display_name or portfolio config)
+            name = all_names.get(t, "")
+            if name:
+                safe_name = _escape_like(name)
+                match_conditions.append(NewsItem.title.ilike(f"%{safe_name}%"))
+                match_conditions.append(
+                    AnalysisResult.affected_tickers.cast(String).ilike(f"%{safe_name}%")
+                )
+        for s in w_sectors:
+            safe_s = _escape_like(s)
+            match_conditions.append(
+                AnalysisResult.affected_sectors.cast(String).ilike(f"%{safe_s}%")
+            )
+        for kw in w_keywords:
+            safe_kw = _escape_like(kw)
+            match_conditions.append(NewsItem.title.ilike(f"%{safe_kw}%"))
+            match_conditions.append(AnalysisResult.summary.ilike(f"%{safe_kw}%"))
+
+        if match_conditions:
+            conditions.append(or_(*match_conditions))
+        else:
+            # No watchlist items — return empty
+            conditions.append(text("1=0"))
+
     if sentiment:
         conditions.append(AnalysisResult.sentiment == sentiment)
     if impact:
         conditions.append(AnalysisResult.impact_magnitude == impact)
     if sector:
-        conditions.append(AnalysisResult.affected_sectors.op("@>")(f'["{sector}"]'))
+        safe_sector = _escape_like(sector)
+        conditions.append(
+            AnalysisResult.affected_sectors.cast(String).ilike(f"%{safe_sector}%")
+        )
     if ticker:
         safe_ticker = _escape_like(ticker)
         conditions.append(
             or_(
-                AnalysisResult.affected_tickers.op("@>")(f'["{ticker}"]'),
+                AnalysisResult.affected_tickers.cast(String).ilike(f"%{safe_ticker}%"),
                 NewsItem.title.ilike(f"%{safe_ticker}%"),
             )
         )

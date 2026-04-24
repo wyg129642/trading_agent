@@ -199,6 +199,30 @@ WHERE sentiment_score_short IS NOT NULL
 GROUP BY trade_date, ticker, market
 """
 
+_DDL_REVENUE_FUNDAMENTALS = """
+CREATE TABLE IF NOT EXISTS {db}.revenue_fundamentals (
+    ticker              String,
+    industry            String,
+    segment_slug        String,
+    period              String,
+    metric              String,       -- revenue | volume | asp | margin | growth_rate ...
+    value               Float64,
+    unit                String,
+    value_type          String,       -- number | percent | currency | count | text
+    source_type         String,       -- historical | guidance | expert | inferred | assumption | derived
+    confidence          String,       -- HIGH | MEDIUM | LOW
+    review_status       String,       -- pending | approved | flagged
+    model_id            String,
+    recipe_id           String,
+    cell_path           String,
+    paused_by_guard     UInt8 DEFAULT 0,
+    captured_at         DateTime64(3) DEFAULT now64(3)
+) ENGINE = ReplacingMergeTree(captured_at)
+PARTITION BY toYYYYMM(captured_at)
+ORDER BY (ticker, industry, segment_slug, period, metric, model_id)
+SETTINGS index_granularity = 8192
+"""
+
 _DDL_MV_SOURCE_WEEKLY = """
 CREATE MATERIALIZED VIEW IF NOT EXISTS {db}.source_weekly_stats
 ENGINE = ReplacingMergeTree(updated_at)
@@ -280,7 +304,8 @@ class ClickHouseStore:
 
         # Create tables
         for ddl in (_DDL_NEWS_ANALYSIS, _DDL_TICKER_EVENTS, _DDL_TOKEN_USAGE,
-                     _DDL_STOCK_PRICES, _DDL_BREAKING_NEWS):
+                     _DDL_STOCK_PRICES, _DDL_BREAKING_NEWS,
+                     _DDL_REVENUE_FUNDAMENTALS):
             stmt = ddl.format(db=self._db)
             await asyncio.to_thread(self._client.command, stmt)
 

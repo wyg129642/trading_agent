@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, func, desc, delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,26 +27,240 @@ from backend.app.schemas.chat import (
     ConversationListResponse, ConversationDetailResponse,
     MessageResponse, ModelResponseData,
     SendMessageRequest, SendMessageResponse,
+    RegenerateRequest, SavePartialRequest,
     RateRequest, RateResponse,
     TemplateCreate, TemplateUpdate, TemplateResponse,
     FileUploadResponse, ExportResponse,
     ModelInfo, ModelRanking, ModelRankingResponse,
     ChatStatsResponse,
-    DebateRequest,
+    DebateRequest, DebateSummary,
     TrackingTopicCreate, TrackingTopicUpdate, TrackingTopicResponse,
     TrackingAlertResponse,
 )
 from backend.app.services.chat_llm import (
     AVAILABLE_MODELS, MODEL_MAP, MODE_CONFIGS,
-    build_multimodal_content, call_model_stream, call_model_sync,
-    generate_title, _build_messages, search_for_chat,
+    build_multimodal_content, call_model_stream, call_model_stream_with_tools,
+    call_model_sync, generate_title, _build_messages, search_for_chat,
 )
+from backend.app.services.alphapai_service import (
+    ALPHAPAI_TOOLS, ALPHAPAI_SYSTEM_PROMPT,
+)
+from backend.app.services.jinmen_service import (
+    JINMEN_TOOLS, JINMEN_SYSTEM_PROMPT,
+)
+from backend.app.services.web_search_tool import (
+    WEB_SEARCH_TOOLS, WEB_SEARCH_SYSTEM_PROMPT, WEB_SEARCH_FORCE_PROMPT,
+)
+from backend.app.services.kb_service import (
+    KB_TOOLS, KB_SYSTEM_PROMPT,
+)
+from backend.app.services.user_kb_tools import (
+    USER_KB_TOOLS, USER_KB_SYSTEM_PROMPT,
+)
+from backend.app.services import user_kb_service as _user_kb_svc
+from backend.app.services.revenue_model_chat_tool import (
+    TRIGGER_REVENUE_MODEL_TOOLS, TRIGGER_REVENUE_MODEL_SYSTEM_PROMPT,
+)
+from backend.app.services.chat_debug import chat_trace
+from backend.app.services.research_interaction_log import get_recorder
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+def _build_time_awareness_prompt() -> str:
+    """Return a time-awareness system-prompt addition with today's date injected.
+
+    Financial research data has strict time-tiered shelf life; without explicit
+    guidance, models frequently mis-use stale numbers as current reality. This
+    prompt teaches the model to read every result's publish-date field, anchor
+    every claim to a dated timeframe, and distinguish realized / in-progress /
+    forecasted information.
+    """
+    today = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+    return f"""## 时间维度规范（关键，务必遵守）
+
+工具返回的每条资料都带 `发布日期 / 发布时间 / businessTime / date` 字段 —— **引用前先看日期**，否则极易把旧数据当作当前事实。**今天的日期是 {today}**，请据此判断资料新旧。
+
+### 数据时效性分层（不同数据的有效期差异极大）
+- 股价、日内行情 → **天级**（距今 > 1 周的实时数据基本失效）
+- 财务季报数据 → **季级**（新季报披露后，上一期数据自动降级为历史对比）
+- 业务拆分、客户名单、产能数字 → **半年级**（以最新半年报/年报为准）
+- 战略方向、产品路线、研发进展 → **半年级**（战略调整后旧规划不代表当前意图）
+- 行业格局、市场份额 → **1–2 年**（AI/新能源等高速变化行业要更快刷新）
+- 历史业绩趋势、业务变迁 → **稳定**（可随时引用作对比）
+
+### 引用铁律
+1. **每个关键数字必须带时间锚点**。示例：
+   - ✅ "2025Q3 营收 33.87 亿，同比 +27.16% [5]"
+   - ✅ "截至 2024 年年报，高功率服务器电源占数据中心电源 53.48% [27]"
+   - ❌ "营收 15.94 亿"（无时间锚点——读者无法判断是哪一年的数据）
+2. **同一事实有多条来源时，引用发布日期最近的那条**；旧版本可另外作为"历史对比 / 趋势佐证"引用。
+3. **机构预测必须标注机构 + 研报日期**：
+   - ✅ "光大证券 2025-04-27 研报预测 2026E 归母净利润 4.6 亿 [11]"
+   - ❌ "市场预期 2026 年净利润 4.6 亿"（丢失了预测来源和预测发布时间）
+4. **区分"已兑现 / 在研 / 预测"三种时态**，用词要能让读者立刻分辨：
+   - 已兑现用完成态："2024 年**已实现**数据中心电源收入 14.59 亿 [27]"
+   - 在研/导入中明确阶段："与谷歌合作**样品阶段**，预计 2026Q4 出份额判断 [11]"
+   - 预测用未来时 + 来源："XX 证券 2025-xx-xx 研报**预测**..."
+5. **禁止跨时间段混写**：
+   - ❌ "营收持续增长 [A][B]"（[A]=2023 年数据，[B]=2025 年数据混为一谈）
+   - ✅ "2023 年营收 28.70 亿 [A] → 2025 前三季度 33.87 亿，同比 +27.16% [B]"
+
+### 过期数据的处理
+- **发布日期距今 > 6 个月**的"现状"数据要警惕已被新数据替代；如是核心数字，优先用 web_search 或 jinmen_announcements 查最新季报/公告验证。
+- **发布日期距今 > 12 个月**的"对未来的预测"基本失效，只能作为"当时视角"引用（例如 `"2024 年底中金曾预测 2025 全年增速 30%"`），不要当成对当下的预判。
+- 如果工具返回的全是旧数据，**主动承认信息滞后**而不是硬编故事：
+  - ✅ "目前可查到的业务拆分最新为 2024 年年报 [N]，2025 年年报尚未披露，以下基于最近可得数据推断"
+  - ❌ 用 2023 年的产品结构写成"当前主要产品线是 XX"
+
+### 结论层级要求
+在得出任何"当前状况"、"现在怎么样"、"最新进展"的结论前，自问一句：**我引用的那条数据是几个月前发布的？它真的代表"当前"吗？** 如果不是最新，要么换一条新的资料，要么显式注明"截至 XXXX-XX"。"""
+
+
+_RESEARCH_STRATEGY_PROMPT = """## 深度研究策略（务必遵守）
+
+做个股/行业深度研究时，按"**并行多路召回 → 读原文 → 补强 → 写报告**"四步法，避免停留在摘要层面。
+
+### 步骤1｜第一轮：并行多路召回（关键：同一轮内并发）
+**必须在同一轮内同时发起多个工具调用**（现代 LLM 支持 parallel tool calling——多个 tool_calls 放在同一条 assistant 消息里），以压缩等待时间并保证多视角覆盖：
+
+- `kb_search`（**主力检索**）：并发发起 2–4 次，组合不同策略：
+  - 中文 query + tickers 筛选（覆盖国内券商、纪要、点评）
+  - 英文 query + tickers 筛选（覆盖海外研报、外资视角）
+  - 子议题 query 拆分（业务/财务/产能/客户各查一次）
+  - 必须附带 `date_range` 以约束时效（涉及"最新/近期"时，gte 取最近 6–12 个月）
+- `user_kb_search`（若启用）：并发发起 1 次，检索团队私人上传（可能有未公开的内部资料）
+- `web_search`：并发发起 1–2 次，中英双语关键词，捕获最新新闻与宏观事件
+
+> 并行的好处：总延迟约等于最慢工具的单次延迟，而非各工具之和。
+
+### 步骤2｜必须进入"读原文"阶段（极其重要）
+第一轮召回返回后，**不得直接写报告**。扫描命中列表，挑出 2–4 个最硬核的结果读原文：
+
+- 对 `kb_search` / `user_kb_search` 高相关命中 → 调 `kb_fetch_document(doc_id=...)` 读完整原文
+- 对 `web_search` 硬核 URL（公告详情页、pdf.dfcfw.com 研报、IR 页）→ 调 `read_webpage(url=...)`
+
+优先级：官方公告 / 定期报告 PDF > 券商深度研报全文 > 业绩交流/路演纪要 > 权威财经新闻；避开百家号、SEO 聚合站、纯索引页。
+
+### 步骤3｜第二轮：针对性补强（仍可并行）
+基于第一轮 + 深读的结果，用更具体的 query 补漏，同样并行发起：
+- 出现的子业务/客户/竞品名 → 新 `kb_search` 精准检索
+- 发现关键数字但无上下文 → `kb_fetch_document` 回到原文
+- 跨时间对比缺数据 → `kb_list_facets(dimension='date_histogram')` 看分布再分时段检索
+- 行业对标缺海外视角 → `web_search` 英文或 `kb_search` 限定 `sources=['jinmen']`（海外研报覆盖）
+
+### 步骤4｜写作要求
+- 2–3 轮召回 + 深读后停止工具调用，直接输出报告
+- **行内 `[N]` 引用**：每个事实 / 数字 / 观点句末必须带引用；不要在末尾罗列来源列表——UI 自动渲染
+- **时间锚点**：每个关键数字必须带具体日期（"2025Q3 营收 33.87 亿 [5]" 而不是裸的 "营收 33.87 亿"）
+- 覆盖用户所问的所有维度（业务线 / 产能 / 客户 / 财务 / 估值 / 风险）；缺失的维度显式说明"数据不足"
+- 字数 4000+ 字；不要为懒而压缩
+
+### 禁止
+- **在一轮里串行发起多个 kb_search**：必须把它们放进同一个 assistant 消息的 `tool_calls` 数组里并行执行
+- 跳过 `kb_fetch_document` / `read_webpage` 直接写报告（研究深度严重不足）
+- 反复用近义 query 重复调用（浪费 round budget；应改变维度：不同 ticker / 不同日期段 / 不同子议题）
+- 只调 `web_search` 不调 `kb_search`（本地聚合库的专业投研数据质量远高于公网，必须优先）"""
+
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "chat_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ── Personal-knowledge-base reference injection ──────────────────
+
+
+# Per-doc and aggregate char caps. A single dropped PDF can extract to
+# hundreds of KB; we give each doc a fair share and cap the total so the
+# prompt doesn't blow past the model's context.
+_KB_DOC_MAX_CHARS = 30_000
+_KB_TOTAL_MAX_CHARS = 100_000
+
+
+async def _build_kb_reference_prefix(
+    user_id: str,
+    doc_ids: list[str],
+) -> tuple[str, list[dict]]:
+    """Fetch accessible user-kb docs and format as a user-message prefix.
+
+    Returns ``(prefix_text, doc_meta_list)``. ``doc_meta_list`` is a list
+    of ``{"id","title","filename","chars","truncated"}`` for debug logging
+    and client-side display.
+
+    Docs the user can't access (wrong owner, not public, deleted) are
+    silently skipped — a stale drag-dropped id shouldn't break the request.
+    """
+    if not doc_ids:
+        return "", []
+    meta_list: list[dict] = []
+    parts: list[str] = []
+    total_chars = 0
+    dedup_ids: list[str] = []
+    seen: set[str] = set()
+    for d in doc_ids:
+        if d and d not in seen:
+            dedup_ids.append(d)
+            seen.add(d)
+    for idx, did in enumerate(dedup_ids, start=1):
+        if total_chars >= _KB_TOTAL_MAX_CHARS:
+            meta_list.append({
+                "id": did, "title": "", "filename": "",
+                "chars": 0, "truncated": True,
+                "skipped": "total budget exhausted",
+            })
+            continue
+        doc = await _user_kb_svc.get_accessible_document(user_id, did)
+        if doc is None:
+            meta_list.append({
+                "id": did, "title": "", "filename": "",
+                "chars": 0, "truncated": False,
+                "skipped": "not accessible",
+            })
+            continue
+        remaining = _KB_TOTAL_MAX_CHARS - total_chars
+        cap = min(_KB_DOC_MAX_CHARS, max(1000, remaining))
+        content = await _user_kb_svc.get_accessible_document_content(
+            user_id, did, max_chars=cap,
+        )
+        content = (content or "").strip()
+        if not content:
+            meta_list.append({
+                "id": did,
+                "title": doc.get("title") or "",
+                "filename": doc.get("original_filename") or "",
+                "chars": 0, "truncated": False,
+                "skipped": "empty content",
+            })
+            continue
+        full_chars = int(doc.get("extracted_char_count") or len(content))
+        truncated = len(content) < full_chars
+        title = doc.get("title") or doc.get("original_filename") or "(untitled)"
+        filename = doc.get("original_filename") or ""
+        header = (
+            f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"【参考文档 {idx}】: {title}"
+            f"{f' ({filename})' if filename and filename != title else ''}"
+            f"{' [已截断]' if truncated else ''}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+        parts.append(header + content)
+        total_chars += len(content)
+        meta_list.append({
+            "id": did,
+            "title": title,
+            "filename": filename,
+            "chars": len(content),
+            "truncated": truncated,
+        })
+    if not parts:
+        return "", meta_list
+    prefix = (
+        "以下是用户从「个人知识库」中附带的参考文档，"
+        "请在回答中优先参考这些内容。"
+        + "".join(parts)
+        + "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "【参考文档结束】\n\n"
+    )
+    return prefix, meta_list
 
 
 def _best_response(responses: list[ChatModelResponse]) -> ChatModelResponse | None:
@@ -78,6 +292,47 @@ async def list_modes():
             ("fast", MODE_CONFIGS["fast"], "快速响应，适合简单查询和头脑风暴"),
         ]
     ]
+
+
+# ── Recommended questions (quick-start) ─────────────────────────
+
+@router.get("/recommended-questions")
+async def get_recommended_questions(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Return the current user's personalized quick-start questions.
+
+    The scheduler refreshes these daily; if the cache is empty or stale on the
+    first-ever load, we fall back to generating inline so the empty state is
+    never truly blank.
+    """
+    from backend.app.services.recommendation_service import (
+        get_for_user, DEFAULT_QUESTIONS,
+    )
+    try:
+        questions = await get_for_user(db, user.id)
+    except Exception:
+        logger.exception("recommended-questions: fetch failed, using defaults")
+        questions = list(DEFAULT_QUESTIONS)
+    return {"questions": questions}
+
+
+@router.post("/recommended-questions/refresh")
+async def refresh_recommended_questions(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Force-regenerate the current user's recommendations now (manual refresh)."""
+    from backend.app.services.recommendation_service import (
+        generate_for_user, DEFAULT_QUESTIONS,
+    )
+    try:
+        questions = await generate_for_user(db, user.id, force=True)
+    except Exception:
+        logger.exception("recommended-questions: manual refresh failed")
+        questions = list(DEFAULT_QUESTIONS)
+    return {"questions": questions}
 
 
 # ── Conversations ───────────────────────────────────────────────
@@ -189,6 +444,7 @@ async def get_conversation(
                         content=r.content, tokens_used=r.tokens_used,
                         latency_ms=r.latency_ms, rating=r.rating,
                         rating_comment=r.rating_comment, error=r.error,
+                        sources=r.sources,
                         debate_round=getattr(r, "debate_round", None),
                         created_at=r.created_at,
                     )
@@ -336,15 +592,19 @@ async def send_message(
             content=resp.content, tokens_used=resp.tokens_used,
             latency_ms=resp.latency_ms, rating=resp.rating,
             rating_comment=resp.rating_comment, error=resp.error,
+            sources=resp.sources,
             created_at=resp.created_at,
         ))
 
-    # Auto-generate title for first message
-    if conv.title == "新对话":
-        conv.title = await generate_title(body.content)
+    # Auto-generate title in background for first message
+    is_first = conv.title == "新对话"
+    if is_first:
+        conv.title = body.content[:20].strip() + ("..." if len(body.content) > 20 else "")
 
     conv.updated_at = datetime.now(timezone.utc)
     await db.commit()
+    if is_first:
+        asyncio.create_task(_generate_title_background(conv.id, body.content))
 
     return SendMessageResponse(message_id=str(msg.id), model_responses=response_data)
 
@@ -355,6 +615,7 @@ async def send_message(
 async def send_message_stream(
     conv_id: str,
     body: SendMessageRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -366,9 +627,24 @@ async def send_message_stream(
     if not conv:
         raise HTTPException(404, "Conversation not found")
 
-    user_content = build_multimodal_content(body.content, body.attachments)
+    # Prepend referenced personal-KB documents to the user message before
+    # the LLM sees it. We do this BEFORE build_multimodal_content so text and
+    # multimodal paths both pick up the prefix. The prefix is NOT saved into
+    # the DB message — otherwise subsequent turns would reload the full file
+    # bodies every time and blow past context.
+    kb_prefix, kb_meta = await _build_kb_reference_prefix(
+        str(user.id), list(body.kb_document_ids or []),
+    )
+    augmented_content = (kb_prefix + body.content) if kb_prefix else body.content
+    user_content = build_multimodal_content(augmented_content, body.attachments)
+    if kb_meta:
+        logger.info(
+            "chat: injected %d KB docs (chars=%d) into user message",
+            len([m for m in kb_meta if not m.get("skipped")]),
+            sum(int(m.get("chars", 0)) for m in kb_meta),
+        )
 
-    # Save user message
+    # Save user message (without the KB prefix — see above)
     msg = ChatMessage(
         conversation_id=conv.id,
         role="user",
@@ -398,76 +674,364 @@ async def send_message_stream(
             if best and best.content:
                 history.append({"role": "assistant", "content": best.content})
 
-    # Web search (if enabled)
-    search_context = None
-    if body.web_search:
-        search_context = await search_for_chat(body.content)
+    # Build system prompt and tools based on enabled data sources
+    system_prompt = body.system_prompt or ""
+    all_tools: list[dict] = []
 
-    messages_payload = _build_messages(history, user_content, body.system_prompt, search_context)
+    # Web search as a tool (LLM decides when to search)
+    if body.web_search in ("on", "auto"):
+        system_prompt = (system_prompt + "\n\n" + WEB_SEARCH_SYSTEM_PROMPT).strip()
+        all_tools.extend(WEB_SEARCH_TOOLS)
+        if body.web_search == "on":
+            system_prompt += WEB_SEARCH_FORCE_PROMPT
+
+    # Backward-compat consolidation: alphapai_enabled and jinmen_enabled no
+    # longer add the retired external tools; they now only act as a hint that
+    # the user wants investment-research data, which means ``kb_search`` (the
+    # local aggregated corpus) must be available. We therefore coerce kb_enabled
+    # on whenever either legacy flag is set.
+    kb_effective = bool(body.kb_enabled or body.alphapai_enabled or body.jinmen_enabled)
+
+    # ALPHAPAI_TOOLS / JINMEN_TOOLS are now empty lists and their prompts are
+    # empty strings — extending/concatenating them is a safe no-op, but we
+    # intentionally do NOT call them any more to keep the system prompt clean
+    # and avoid misleading the LLM about tool availability.
+
+    if kb_effective:
+        system_prompt = (system_prompt + "\n\n" + KB_SYSTEM_PROMPT).strip()
+        all_tools.extend(KB_TOOLS)
+    if body.user_kb_enabled:
+        system_prompt = (system_prompt + "\n\n" + USER_KB_SYSTEM_PROMPT).strip()
+        all_tools.extend(USER_KB_TOOLS)
+        # Bind the user id for the tool dispatcher. Tools read this via
+        # user_kb_service.get_current_user_id() so searches are scoped.
+        _user_kb_svc.set_current_user_id(str(user.id))
+
+    # Revenue-modeling trigger tool — always available so the chat can
+    # bootstrap a structured model on explicit user ask.
+    system_prompt = (system_prompt + "\n\n" + TRIGGER_REVENUE_MODEL_SYSTEM_PROMPT).strip()
+    all_tools.extend(TRIGGER_REVENUE_MODEL_TOOLS)
+
+    # Add research strategy guidance whenever the aggregated KB is wired in.
+    if kb_effective:
+        system_prompt = (system_prompt + "\n\n" + _RESEARCH_STRATEGY_PROMPT).strip()
+
+    # Time-awareness: any tool that returns dated content needs this guidance.
+    # Without it, models frequently cite a 1-year-old analyst report as if it
+    # describes "current" state, mixing realized/forecasted numbers freely.
+    if (
+        body.web_search in ("on", "auto")
+        or kb_effective
+        or body.user_kb_enabled
+    ):
+        system_prompt = (system_prompt + "\n\n" + _build_time_awareness_prompt()).strip()
+
+    # Long-term user memories (distilled from prior feedback). Prepend at the
+    # very top so it is the first thing the model sees — critical for
+    # "corrections" to take effect on the current turn.
+    memory_prompt_block = ""
+    memory_ids_used: list[uuid.UUID] = []
+    try:
+        from backend.app.services.chat_memory_service import build_user_memory_prompt
+        memory_prompt_block, memory_ids_used = await build_user_memory_prompt(db, user.id)
+    except Exception:
+        logger.warning("build_user_memory_prompt failed — continuing without memory", exc_info=True)
+    if memory_prompt_block:
+        system_prompt = (memory_prompt_block + "\n" + system_prompt).strip()
+
+    # Create debug trace for this request
+    trace = chat_trace(
+        user_id=str(user.id),
+        username=getattr(user, "username", ""),
+        conversation_id=str(conv.id),
+    )
+    trace_id = trace.trace_id
+
+    tool_names = [t.get("function", {}).get("name", "?") for t in all_tools]
+    trace.log_request_start(
+        content=body.content,
+        models=body.models,
+        mode=body.mode or "standard",
+        web_search=body.web_search or "off",
+        alphapai_enabled=body.alphapai_enabled,
+        jinmen_enabled=body.jinmen_enabled,
+        system_prompt_len=len(system_prompt),
+        tools_count=len(all_tools),
+        tool_names=tool_names,
+        history_len=len(history),
+    )
+
+    # Mongo-backed research interaction recorder — start the session doc now so
+    # the admin page can see in-flight requests while they stream.
+    _recorder = get_recorder()
+    messages_payload_preview: list[dict] = []  # filled below after _build_messages
+
+    logger.info(
+        "Chat stream [%s]: web_search=%s alphapai=%s jinmen=%s tools=%d sys_prompt_len=%d models=%s mode=%s",
+        trace_id, body.web_search, body.alphapai_enabled, body.jinmen_enabled, len(all_tools),
+        len(system_prompt), body.models, body.mode,
+    )
+
+    messages_payload = _build_messages(history, user_content, system_prompt or None)
     mode = body.mode if body.mode in MODE_CONFIGS else "standard"
 
-    # Auto-generate title
+    # Log the full messages payload for deep debugging
+    trace.log_messages_payload(messages_payload)
+
+    # Persist the full request setup to Mongo for the visualization page.
+    try:
+        await _recorder.start_request(
+            trace_id=trace_id,
+            user_id=str(user.id),
+            username=getattr(user, "username", ""),
+            conversation_id=str(conv.id),
+            query=body.content,
+            attachments=body.attachments,
+            models_requested=body.models,
+            mode=mode,
+            web_search=body.web_search or "off",
+            alphapai_enabled=body.alphapai_enabled,
+            jinmen_enabled=body.jinmen_enabled,
+            kb_enabled=body.kb_enabled,
+            tools_enabled=tool_names,
+            system_prompt=system_prompt or "",
+            initial_messages=messages_payload,
+            history_len=len(history),
+        )
+    except Exception:
+        logger.warning("Failed to persist research interaction start_request", exc_info=True)
+
+    # Auto-generate title in background (don't block the SSE stream)
     is_first = conv.title == "新对话"
     if is_first:
-        conv.title = await generate_title(body.content)
+        conv.title = body.content[:20].strip() + ("..." if len(body.content) > 20 else "")
     conv.updated_at = datetime.now(timezone.utc)
     await db.commit()
+    if is_first:
+        asyncio.create_task(_generate_title_background(conv.id, body.content))
 
     # SSE event stream from all models concurrently
     async def event_stream():
+        import time as _time
+        _stream_start = _time.monotonic()
         queue: asyncio.Queue = asyncio.Queue()
         model_ids = body.models
+        # Track partial content per model for saving on disconnect
+        model_partial: dict[str, str] = {m: "" for m in model_ids}
 
         async def stream_one_model(model_id: str):
-            async for chunk in call_model_stream(model_id, messages_payload, mode=mode):
-                await queue.put({"model": model_id, **chunk})
+            # Create per-model trace
+            from backend.app.services.chat_debug import chat_trace as _ct
+            model_trace = _ct(
+                user_id=str(user.id),
+                username=getattr(user, "username", ""),
+                conversation_id=str(conv.id),
+                model_id=model_id,
+                trace_id=trace_id,
+            )
+            model_trace.log_sse_event("MODEL_STREAM_START", f"model={model_id}")
+            _mi = MODEL_MAP.get(model_id, {"name": model_id})
+            _recorder.record_model_start(trace_id, model_id, _mi.get("name", model_id))
+            try:
+                async for chunk in call_model_stream_with_tools(
+                    model_id, messages_payload, mode=mode, tools=all_tools or None,
+                    trace_id=trace_id,
+                ):
+                    await queue.put({"model": model_id, **chunk})
+            except asyncio.CancelledError:
+                # Client disconnected — emit done so save logic runs
+                await queue.put({
+                    "model": model_id,
+                    "delta": "",
+                    "done": True,
+                    "error": "[客户端断开连接]",
+                    "content": model_partial.get(model_id, ""),
+                    "tokens": 0,
+                    "latency_ms": 0,
+                })
+            except Exception as e:
+                logger.exception("stream_one_model crashed for %s", model_id)
+                await queue.put({
+                    "model": model_id,
+                    "delta": "",
+                    "done": True,
+                    "error": f"模型调用异常: {str(e)[:200]}",
+                    "content": model_partial.get(model_id, ""),
+                    "tokens": 0,
+                    "latency_ms": 0,
+                })
 
         tasks = [asyncio.create_task(stream_one_model(m)) for m in model_ids]
 
-        # Send message_id + search status
+        # Send message_id + enabled features status
         meta = {'type': 'meta', 'message_id': str(msg_id)}
-        if search_context:
-            meta['web_search'] = True
+        if body.web_search in ("on", "auto"):
+            meta['web_search'] = body.web_search
+        if body.alphapai_enabled:
+            meta['alphapai_enabled'] = True
+        if body.jinmen_enabled:
+            meta['jinmen_enabled'] = True
+        if memory_ids_used:
+            meta['memory_ids'] = [str(mid) for mid in memory_ids_used]
         yield f"data: {json.dumps(meta)}\n\n"
 
         done_count = 0
+        completed_models: set[str] = set()
+        model_sources: dict[str, list] = {}  # track citation sources per model
+        disconnected = False
         try:
             while done_count < len(model_ids):
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=130.0)
-                except asyncio.TimeoutError:
+                # Check client disconnect every queue poll
+                if await request.is_disconnected():
+                    logger.info("Client disconnected during SSE stream for msg %s", msg_id)
+                    disconnected = True
                     break
+
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    # Check if client is still connected
+                    if await request.is_disconnected():
+                        logger.info("Client disconnected (detected on timeout) for msg %s", msg_id)
+                        disconnected = True
+                        break
+                    # Send keepalive comment to prevent proxy/browser timeout
+                    yield ": keepalive\n\n"
+                    continue
 
                 model_id = item.get("model", "")
                 model_info = MODEL_MAP.get(model_id, {"name": model_id})
 
-                if item.get("done"):
+                if item.get("type") == "heartbeat":
+                    yield ": heartbeat\n\n"
+                elif item.get("type") == "tool_status":
+                    yield f"data: {json.dumps({'type': 'tool_status', 'model': model_id, 'tool_name': item.get('tool_name', ''), 'status': item.get('status', '')}, ensure_ascii=False)}\n\n"
+                elif item.get("type") == "search_status":
+                    yield f"data: {json.dumps({'type': 'search_status', 'model': model_id, 'query': item.get('query', ''), 'status': item.get('status', '')}, ensure_ascii=False)}\n\n"
+                elif item.get("type") == "read_status":
+                    yield f"data: {json.dumps({'type': 'read_status', 'model': model_id, 'url': item.get('url', ''), 'status': item.get('status', '')}, ensure_ascii=False)}\n\n"
+                elif item.get("type") == "sources":
+                    model_sources[model_id] = item.get("sources", [])
+                    yield f"data: {json.dumps({'type': 'sources', 'model': model_id, 'sources': item.get('sources', [])}, ensure_ascii=False)}\n\n"
+                elif item.get("done"):
                     done_count += 1
-                    # Save to DB
-                    async with (await _get_session()) as save_db:
-                        resp = ChatModelResponse(
-                            message_id=msg_id,
+                    completed_models.add(model_id)
+
+                    # Log model completion via debug trace
+                    from backend.app.services.chat_debug import chat_trace as _ct2
+                    done_trace = _ct2(
+                        user_id=str(user.id), conversation_id=str(conv.id),
+                        model_id=model_id, trace_id=trace_id,
+                    )
+                    done_trace.log_llm_done(
+                        content_len=len(item.get("content", "")),
+                        tokens=item.get("tokens", 0),
+                        latency_ms=item.get("latency_ms", 0),
+                        error=item.get("error"),
+                    )
+                    done_trace.log_llm_response_content(item.get("content", ""))
+
+                    # Persist per-model completion to Mongo for the visualization.
+                    try:
+                        _recorder.record_model_done(
+                            trace_id=trace_id,
                             model_id=model_id,
-                            model_name=model_info.get("name", model_id),
-                            content=item.get("content", ""),
-                            tokens_used=item.get("tokens"),
-                            latency_ms=item.get("latency_ms"),
+                            final_content=item.get("content", ""),
+                            tokens=item.get("tokens", 0),
+                            latency_ms=item.get("latency_ms", 0),
                             error=item.get("error"),
+                            citations=model_sources.get(model_id),
                         )
-                        save_db.add(resp)
-                        await save_db.commit()
-                        await save_db.refresh(resp)
+                    except Exception:
+                        logger.debug("recorder.record_model_done failed", exc_info=True)
 
-                    yield f"data: {json.dumps({'type': 'done', 'model': model_id, 'model_name': model_info.get('name', model_id), 'response_id': str(resp.id), 'tokens': item.get('tokens', 0), 'latency_ms': item.get('latency_ms', 0), 'error': item.get('error')}, ensure_ascii=False)}\n\n"
+                    # Save to DB — wrapped in try/except so one model's save
+                    # failure doesn't abort the entire SSE stream and lose
+                    # other models' responses.
+                    response_id = ""
+                    save_error = item.get("error")
+                    try:
+                        async with (await _get_session()) as save_db:
+                            resp = ChatModelResponse(
+                                message_id=msg_id,
+                                model_id=model_id,
+                                model_name=model_info.get("name", model_id),
+                                content=item.get("content", ""),
+                                tokens_used=item.get("tokens"),
+                                latency_ms=item.get("latency_ms"),
+                                error=item.get("error"),
+                                sources=model_sources.get(model_id),
+                            )
+                            save_db.add(resp)
+                            await save_db.commit()
+                            await save_db.refresh(resp)
+                            response_id = str(resp.id)
+                    except Exception as save_exc:
+                        logger.exception("Failed to save response for model %s msg %s", model_id, msg_id)
+                        if not save_error:
+                            save_error = f"保存失败: {str(save_exc)[:100]}"
+
+                    yield f"data: {json.dumps({'type': 'done', 'model': model_id, 'model_name': model_info.get('name', model_id), 'response_id': response_id, 'tokens': item.get('tokens', 0), 'latency_ms': item.get('latency_ms', 0), 'error': save_error}, ensure_ascii=False)}\n\n"
                 else:
-                    yield f"data: {json.dumps({'type': 'delta', 'model': model_id, 'delta': item.get('delta', '')}, ensure_ascii=False)}\n\n"
+                    # Delta — track partial content
+                    delta = item.get("delta", "")
+                    if delta:
+                        model_partial[model_id] = model_partial.get(model_id, "") + delta
+                    yield f"data: {json.dumps({'type': 'delta', 'model': model_id, 'delta': delta}, ensure_ascii=False)}\n\n"
 
+        except asyncio.CancelledError:
+            logger.info("SSE generator cancelled (client disconnect) for msg %s", msg_id)
+            disconnected = True
         except Exception as e:
             logger.exception("SSE stream error")
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)[:200]})}\n\n"
+            for mid in model_ids:
+                if mid not in completed_models:
+                    mi = MODEL_MAP.get(mid, {"name": mid})
+                    yield f"data: {json.dumps({'type': 'done', 'model': mid, 'model_name': mi.get('name', mid), 'response_id': '', 'tokens': 0, 'latency_ms': 0, 'error': str(e)[:100]}, ensure_ascii=False)}\n\n"
         finally:
+            # Cancel all model tasks
             for t in tasks:
                 t.cancel()
+
+            # Save partial responses for models that didn't complete (client disconnect or timeout)
+            if disconnected:
+                for mid in model_ids:
+                    if mid not in completed_models and model_partial.get(mid):
+                        try:
+                            mi = MODEL_MAP.get(mid, {"name": mid})
+                            async with (await _get_session()) as save_db:
+                                resp = ChatModelResponse(
+                                    message_id=msg_id,
+                                    model_id=mid,
+                                    model_name=mi.get("name", mid),
+                                    content=model_partial[mid],
+                                    error="[客户端断开连接，内容不完整]",
+                                )
+                                save_db.add(resp)
+                                await save_db.commit()
+                            logger.info("Saved partial response for %s (%d chars)", mid, len(model_partial[mid]))
+                        except Exception:
+                            logger.warning("Failed to save partial response for %s", mid)
+
+            # Log request end
+            total_ms = int((_time.monotonic() - _stream_start) * 1000)
+            trace.log_request_end(total_ms)
+            # Finalize the Mongo research-interaction session document.
+            try:
+                await _recorder.finalize_request(trace_id, total_ms)
+            except Exception:
+                logger.debug("recorder.finalize_request failed", exc_info=True)
+
+            # Bump usage_count on memories that got injected into this turn
+            # (best-effort; opens its own session — `db` is closed by now).
+            if memory_ids_used:
+                try:
+                    from backend.app.services.chat_memory_service import mark_memories_used
+                    async with (await _get_session()) as _mark_db:
+                        await mark_memories_used(_mark_db, memory_ids_used)
+                except Exception:
+                    logger.debug("mark_memories_used failed", exc_info=True)
 
         yield "data: [DONE]\n\n"
 
@@ -488,31 +1052,390 @@ async def _get_session():
     return async_session_factory()
 
 
+async def _generate_title_background(conv_id: str, content: str):
+    """Generate a proper title in the background without blocking SSE stream."""
+    try:
+        title = await generate_title(content)
+        if title and title != "新对话":
+            async with (await _get_session()) as db:
+                await db.execute(
+                    update(ChatConversation)
+                    .where(ChatConversation.id == conv_id)
+                    .values(title=title)
+                )
+                await db.commit()
+    except Exception:
+        logger.warning("Background title generation failed for conv %s", conv_id)
+
+
+# ── Cancel (save partial) ─────────────────────────────────────────
+
+@router.post("/conversations/{conv_id}/messages/{msg_id}/save-partial")
+async def save_partial_responses(
+    conv_id: str,
+    msg_id: str,
+    body: SavePartialRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Save partial model responses when user cancels a streaming request."""
+    conv = await db.scalar(
+        select(ChatConversation)
+        .where(ChatConversation.id == conv_id, ChatConversation.user_id == user.id)
+    )
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+
+    msg = await db.scalar(
+        select(ChatMessage)
+        .where(ChatMessage.id == msg_id, ChatMessage.conversation_id == conv_id)
+    )
+    if not msg:
+        raise HTTPException(404, "Message not found")
+
+    saved = 0
+    for model_id, content in body.partial_responses.items():
+        if not content.strip():
+            continue
+        # Skip if a complete response already exists (saved by backend before abort)
+        existing = await db.scalar(
+            select(ChatModelResponse)
+            .where(ChatModelResponse.message_id == msg.id, ChatModelResponse.model_id == model_id)
+        )
+        if existing:
+            continue
+
+        model_info = MODEL_MAP.get(model_id, {"name": model_id})
+        resp = ChatModelResponse(
+            message_id=msg.id,
+            model_id=model_id,
+            model_name=model_info.get("name", model_id),
+            content=content,
+            error="[已停止生成]",
+        )
+        db.add(resp)
+        saved += 1
+
+    if saved > 0:
+        await db.commit()
+
+    return {"saved": saved}
+
+
+# ── Regenerate ────────────────────────────────────────────────────
+
+@router.post("/conversations/{conv_id}/messages/{msg_id}/regenerate")
+async def regenerate_message_stream(
+    conv_id: str,
+    msg_id: str,
+    body: RegenerateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Regenerate model responses for an existing user message (streaming SSE)."""
+    conv = await db.scalar(
+        select(ChatConversation)
+        .where(ChatConversation.id == conv_id, ChatConversation.user_id == user.id)
+    )
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+
+    msg = await db.scalar(
+        select(ChatMessage)
+        .where(ChatMessage.id == msg_id, ChatMessage.conversation_id == conv_id, ChatMessage.role == "user")
+    )
+    if not msg:
+        raise HTTPException(404, "User message not found")
+
+    # Delete old model responses for this message
+    await db.execute(
+        delete(ChatModelResponse).where(ChatModelResponse.message_id == msg.id)
+    )
+
+    user_content = build_multimodal_content(msg.content, msg.attachments or [])
+
+    # Build conversation history (excluding the message being regenerated)
+    history_result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.conversation_id == conv.id)
+        .options(selectinload(ChatMessage.model_responses))
+        .order_by(ChatMessage.created_at)
+    )
+    history_msgs = history_result.scalars().all()
+
+    history = []
+    for hm in history_msgs:
+        if hm.id == msg.id:
+            continue
+        if hm.role == "user":
+            history.append({"role": "user", "content": hm.content})
+            best = _best_response(hm.model_responses)
+            if best and best.content:
+                history.append({"role": "assistant", "content": best.content})
+
+    # Build system prompt and tools (same logic as send_message_stream)
+    system_prompt = body.system_prompt or ""
+    all_tools: list[dict] = []
+
+    if body.web_search in ("on", "auto"):
+        system_prompt = (system_prompt + "\n\n" + WEB_SEARCH_SYSTEM_PROMPT).strip()
+        all_tools.extend(WEB_SEARCH_TOOLS)
+        if body.web_search == "on":
+            system_prompt += WEB_SEARCH_FORCE_PROMPT
+
+    if body.alphapai_enabled:
+        system_prompt = (system_prompt + "\n\n" + ALPHAPAI_SYSTEM_PROMPT).strip()
+        all_tools.extend(ALPHAPAI_TOOLS)
+    if body.jinmen_enabled:
+        system_prompt = (system_prompt + "\n\n" + JINMEN_SYSTEM_PROMPT).strip()
+        all_tools.extend(JINMEN_TOOLS)
+    if body.kb_enabled:
+        system_prompt = (system_prompt + "\n\n" + KB_SYSTEM_PROMPT).strip()
+        all_tools.extend(KB_TOOLS)
+    if body.user_kb_enabled:
+        system_prompt = (system_prompt + "\n\n" + USER_KB_SYSTEM_PROMPT).strip()
+        all_tools.extend(USER_KB_TOOLS)
+        _user_kb_svc.set_current_user_id(str(user.id))
+
+    messages_payload = _build_messages(history, user_content, system_prompt or None)
+    mode = body.mode if body.mode in MODE_CONFIGS else "standard"
+
+    conv.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+
+    async def event_stream():
+        queue: asyncio.Queue = asyncio.Queue()
+        model_ids = body.models
+        model_partial: dict[str, str] = {m: "" for m in model_ids}
+
+        async def stream_one_model(model_id: str):
+            try:
+                async for chunk in call_model_stream_with_tools(
+                    model_id, messages_payload, mode=mode, tools=all_tools or None,
+                ):
+                    await queue.put({"model": model_id, **chunk})
+            except asyncio.CancelledError:
+                await queue.put({
+                    "model": model_id, "delta": "", "done": True,
+                    "error": "[客户端断开连接]",
+                    "content": model_partial.get(model_id, ""),
+                    "tokens": 0, "latency_ms": 0,
+                })
+            except Exception as e:
+                logger.exception("stream_one_model crashed for %s (regenerate)", model_id)
+                await queue.put({
+                    "model": model_id, "delta": "", "done": True,
+                    "error": f"模型调用异常: {str(e)[:200]}",
+                    "content": model_partial.get(model_id, ""),
+                    "tokens": 0, "latency_ms": 0,
+                })
+
+        tasks = [asyncio.create_task(stream_one_model(m)) for m in model_ids]
+
+        yield f"data: {json.dumps({'type': 'meta', 'message_id': str(msg.id)})}\n\n"
+
+        done_count = 0
+        completed_models: set[str] = set()
+        model_sources: dict[str, list] = {}
+        disconnected = False
+        try:
+            while done_count < len(model_ids):
+                if await request.is_disconnected():
+                    logger.info("Client disconnected during regenerate SSE for msg %s", msg.id)
+                    disconnected = True
+                    break
+
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        disconnected = True
+                        break
+                    yield ": keepalive\n\n"
+                    continue
+
+                model_id = item.get("model", "")
+                model_info = MODEL_MAP.get(model_id, {"name": model_id})
+
+                if item.get("type") == "heartbeat":
+                    yield ": heartbeat\n\n"
+                elif item.get("type") == "tool_status":
+                    yield f"data: {json.dumps({'type': 'tool_status', 'model': model_id, 'tool_name': item.get('tool_name', ''), 'status': item.get('status', '')}, ensure_ascii=False)}\n\n"
+                elif item.get("type") == "search_status":
+                    yield f"data: {json.dumps({'type': 'search_status', 'model': model_id, 'query': item.get('query', ''), 'status': item.get('status', '')}, ensure_ascii=False)}\n\n"
+                elif item.get("type") == "read_status":
+                    yield f"data: {json.dumps({'type': 'read_status', 'model': model_id, 'url': item.get('url', ''), 'status': item.get('status', '')}, ensure_ascii=False)}\n\n"
+                elif item.get("type") == "sources":
+                    model_sources[model_id] = item.get("sources", [])
+                    yield f"data: {json.dumps({'type': 'sources', 'model': model_id, 'sources': item.get('sources', [])}, ensure_ascii=False)}\n\n"
+                elif item.get("done"):
+                    done_count += 1
+                    completed_models.add(model_id)
+                    response_id = ""
+                    save_error = item.get("error")
+                    try:
+                        async with (await _get_session()) as save_db:
+                            resp = ChatModelResponse(
+                                message_id=msg.id,
+                                model_id=model_id,
+                                model_name=model_info.get("name", model_id),
+                                content=item.get("content", ""),
+                                tokens_used=item.get("tokens"),
+                                latency_ms=item.get("latency_ms"),
+                                error=item.get("error"),
+                                sources=model_sources.get(model_id),
+                            )
+                            save_db.add(resp)
+                            await save_db.commit()
+                            await save_db.refresh(resp)
+                            response_id = str(resp.id)
+                    except Exception as save_exc:
+                        logger.exception("Failed to save regenerated response for model %s", model_id)
+                        if not save_error:
+                            save_error = f"保存失败: {str(save_exc)[:100]}"
+
+                    yield f"data: {json.dumps({'type': 'done', 'model': model_id, 'model_name': model_info.get('name', model_id), 'response_id': response_id, 'tokens': item.get('tokens', 0), 'latency_ms': item.get('latency_ms', 0), 'error': save_error}, ensure_ascii=False)}\n\n"
+                else:
+                    delta = item.get("delta", "")
+                    if delta:
+                        model_partial[model_id] = model_partial.get(model_id, "") + delta
+                    yield f"data: {json.dumps({'type': 'delta', 'model': model_id, 'delta': delta}, ensure_ascii=False)}\n\n"
+
+        except asyncio.CancelledError:
+            logger.info("SSE generator cancelled (regenerate) for msg %s", msg.id)
+            disconnected = True
+        except Exception as e:
+            logger.exception("SSE stream error (regenerate)")
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)[:200]})}\n\n"
+            for mid in model_ids:
+                if mid not in completed_models:
+                    mi = MODEL_MAP.get(mid, {"name": mid})
+                    yield f"data: {json.dumps({'type': 'done', 'model': mid, 'model_name': mi.get('name', mid), 'response_id': '', 'tokens': 0, 'latency_ms': 0, 'error': str(e)[:100]}, ensure_ascii=False)}\n\n"
+        finally:
+            for t in tasks:
+                t.cancel()
+            if disconnected:
+                for mid in model_ids:
+                    if mid not in completed_models and model_partial.get(mid):
+                        try:
+                            mi = MODEL_MAP.get(mid, {"name": mid})
+                            async with (await _get_session()) as save_db:
+                                resp = ChatModelResponse(
+                                    message_id=msg.id,
+                                    model_id=mid,
+                                    model_name=mi.get("name", mid),
+                                    content=model_partial[mid],
+                                    error="[客户端断开连接，内容不完整]",
+                                )
+                                save_db.add(resp)
+                                await save_db.commit()
+                        except Exception:
+                            logger.warning("Failed to save partial response for %s (regenerate)", mid)
+
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 # ── Debate mode ─────────────────────────────────────────────────
 
-DEBATE_PROMPTS = {
-    1: "你是一位资深投资分析师。请对以下问题给出你的深度分析和明确立场（看多或看空），包含具体论据、数据支撑和投资逻辑。",
-    2: "你是一位风险评估专家和反方辩手。以下是另一位分析师的观点：\n\n{prev_content}\n\n请仔细审视其中的逻辑漏洞、被忽视的风险和过度乐观/悲观的假设，给出你的反驳和替代观点。",
-    3: "你是一位独立的首席投资官。以下是看多方和质疑方的观点：\n\n【看多方】\n{round1_content}\n\n【质疑方】\n{round2_content}\n\n综合以上两方观点，给出你的独立判断、建议配置策略和关键风险指标。",
-}
+from backend.app.services.debate_prompts import (
+    detect_topic_type,
+    get_bull_bear_prompts,
+    get_multi_perspective_prompts,
+    get_round_robin_prompt,
+    MULTI_PERSPECTIVE_ROLES,
+    DEBATE_SUMMARY_PROMPT,
+)
 
 DEBATE_ROLES = {1: "看多方", 2: "质疑方", 3: "综合判断"}
+
+
+async def _save_debate_round(
+    msg_id: str, model_id: str, model_name: str,
+    content: str, tokens_used: int, latency_ms: int,
+    error_text: str | None, debate_round: int,
+) -> str:
+    """Save a debate round response to DB. Returns response ID."""
+    try:
+        async with (await _get_session()) as save_db:
+            resp = ChatModelResponse(
+                message_id=msg_id,
+                model_id=model_id,
+                model_name=model_name,
+                content=content,
+                tokens_used=tokens_used,
+                latency_ms=latency_ms,
+                error=error_text,
+                debate_round=debate_round,
+            )
+            save_db.add(resp)
+            await save_db.flush()
+            resp_id = str(resp.id)
+            await save_db.commit()
+            return resp_id
+    except Exception:
+        logger.exception("Failed to save debate round %d", debate_round)
+        return ""
+
+
+async def _stream_one_round(
+    round_num: int, role: str, model_id: str, model_info: dict,
+    messages_payload: list[dict], msg_id: str,
+):
+    """Stream a single debate round. Yields SSE events, then a _result dict."""
+    yield f"data: {json.dumps({'type': 'round_start', 'round': round_num, 'role': role, 'model': model_id, 'model_name': model_info.get('name', model_id)})}\n\n"
+
+    full_content = ""
+    tokens_used = 0
+    latency_ms = 0
+    error_text = None
+
+    async for chunk in call_model_stream(model_id, messages_payload, mode="thinking"):
+        if chunk.get("done"):
+            full_content = chunk.get("content", full_content)
+            tokens_used = chunk.get("tokens", 0)
+            latency_ms = chunk.get("latency_ms", 0)
+            error_text = chunk.get("error")
+        else:
+            delta = chunk.get("delta", "")
+            if delta:
+                full_content += delta
+                yield f"data: {json.dumps({'type': 'delta', 'model': model_id, 'delta': delta, 'debate_round': round_num})}\n\n"
+
+    resp_id = await _save_debate_round(
+        msg_id, model_id, model_info.get("name", model_id),
+        full_content, tokens_used, latency_ms, error_text, round_num,
+    )
+
+    yield f"data: {json.dumps({'type': 'done', 'model': model_id, 'model_name': model_info.get('name', model_id), 'debate_round': round_num, 'response_id': resp_id, 'tokens': tokens_used, 'latency_ms': latency_ms, 'error': error_text})}\n\n"
+
+    # Attach result metadata so the caller can access it
+    yield {"_result": {"content": full_content, "error": error_text, "tokens": tokens_used, "latency_ms": latency_ms}}
 
 
 @router.post("/conversations/{conv_id}/messages/debate")
 async def send_debate_message(
     conv_id: str,
     body: DebateRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Multi-model sequential debate: models argue in rounds."""
-    # Validate conversation
+    """Multi-model debate with flexible formats: bull_bear, multi_perspective, round_robin."""
     conv = await db.get(ChatConversation, conv_id)
     if not conv or str(conv.user_id) != str(user.id):
         raise HTTPException(404, "Conversation not found")
 
-    # Build multimodal content
     user_content = build_multimodal_content(body.content, body.attachments)
 
     # Save user message
@@ -527,87 +1450,57 @@ async def send_debate_message(
     await db.flush()
     msg_id = msg.id
 
-    # Auto-generate title
-    if conv.title == "新对话":
-        conv.title = await generate_title(body.content)
+    # Load conversation history (last 5 exchanges for context)
+    history_result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.conversation_id == conv.id)
+        .options(selectinload(ChatMessage.model_responses))
+        .order_by(ChatMessage.created_at)
+    )
+    history_msgs = history_result.scalars().all()
+    history = []
+    for hm in history_msgs:
+        if hm.id == msg_id:
+            continue
+        if hm.role == "user":
+            history.append({"role": "user", "content": hm.content})
+            best = _best_response(hm.model_responses)
+            if best and best.content:
+                history.append({"role": "assistant", "content": best.content})
+    history = history[-10:]  # last 5 exchanges
+
+    # Auto-generate title in background
+    is_first = conv.title == "新对话"
+    if is_first:
+        conv.title = body.content[:20].strip() + ("..." if len(body.content) > 20 else "")
     conv.updated_at = datetime.now(timezone.utc)
     await db.commit()
+    if is_first:
+        asyncio.create_task(_generate_title_background(conv.id, body.content))
 
-    num_rounds = len(body.debate_models)
-    round_contents: dict[int, str] = {}
+    # Detect topic type for prompt customization
+    topic_type = detect_topic_type(body.content)
+    debate_format = body.debate_format if body.debate_format in ("bull_bear", "multi_perspective", "round_robin") else "bull_bear"
 
     async def event_stream():
-        yield f"data: {json.dumps({'type': 'meta', 'message_id': str(msg_id)})}\n\n"
+        yield f"data: {json.dumps({'type': 'meta', 'message_id': str(msg_id), 'debate_format': debate_format, 'topic_type': topic_type})}\n\n"
 
-        for round_num in range(1, num_rounds + 1):
-            model_id = body.debate_models[round_num - 1]
-            model_info = MODEL_MAP.get(model_id, {"name": model_id})
-            role = DEBATE_ROLES[round_num]
+        # Web search (if enabled)
+        search_context = None
+        if body.web_search:
+            yield f"data: {json.dumps({'type': 'web_search_start'})}\n\n"
+            search_context = await search_for_chat(body.content)
+            yield f"data: {json.dumps({'type': 'web_search_done', 'has_results': bool(search_context)})}\n\n"
 
-            # Build round-specific system prompt
-            if round_num == 1:
-                sys_prompt = DEBATE_PROMPTS[1]
-            elif round_num == 2:
-                sys_prompt = DEBATE_PROMPTS[2].format(prev_content=round_contents.get(1, ""))
-            else:
-                sys_prompt = DEBATE_PROMPTS[3].format(
-                    round1_content=round_contents.get(1, ""),
-                    round2_content=round_contents.get(2, ""),
-                )
-
-            # Merge with user's custom system prompt if provided
-            if body.system_prompt:
-                sys_prompt = body.system_prompt + "\n\n" + sys_prompt
-
-            messages_payload = _build_messages([], user_content, sys_prompt)
-
-            # Emit round start
-            yield f"data: {json.dumps({'type': 'round_start', 'round': round_num, 'role': role, 'model': model_id, 'model_name': model_info.get('name', model_id)})}\n\n"
-
-            # Stream this round
-            full_content = ""
-            tokens_used = 0
-            latency_ms = 0
-            error_text = None
-
-            async for chunk in call_model_stream(model_id, messages_payload, mode="thinking"):
-                if chunk.get("done"):
-                    full_content = chunk.get("content", full_content)
-                    tokens_used = chunk.get("tokens", 0)
-                    latency_ms = chunk.get("latency_ms", 0)
-                    error_text = chunk.get("error")
-                else:
-                    delta = chunk.get("delta", "")
-                    if delta:
-                        full_content += delta
-                        yield f"data: {json.dumps({'type': 'delta', 'model': model_id, 'delta': delta, 'debate_round': round_num})}\n\n"
-
-            round_contents[round_num] = full_content
-
-            # Save response to DB
-            try:
-                session = await _get_session()
-                async with session.begin():
-                    resp = ChatModelResponse(
-                        message_id=msg_id,
-                        model_id=model_id,
-                        model_name=model_info.get("name", model_id),
-                        content=full_content,
-                        tokens_used=tokens_used,
-                        latency_ms=latency_ms,
-                        error=error_text,
-                        debate_round=round_num,
-                    )
-                    session.add(resp)
-                    await session.flush()
-                    resp_id = str(resp.id)
-                await session.close()
-            except Exception:
-                logger.exception("Failed to save debate round %d", round_num)
-                resp_id = ""
-
-            # Emit round done
-            yield f"data: {json.dumps({'type': 'done', 'model': model_id, 'model_name': model_info.get('name', model_id), 'debate_round': round_num, 'response_id': resp_id, 'tokens': tokens_used, 'latency_ms': latency_ms, 'error': error_text})}\n\n"
+        if debate_format == "multi_perspective":
+            async for event in _run_multi_perspective(body, msg_id, user_content, history, search_context, topic_type):
+                yield event
+        elif debate_format == "round_robin":
+            async for event in _run_round_robin(body, msg_id, user_content, history, search_context):
+                yield event
+        else:
+            async for event in _run_bull_bear(body, msg_id, user_content, history, search_context, topic_type):
+                yield event
 
         yield f"data: {json.dumps({'type': 'all_done'})}\n\n"
         yield "data: [DONE]\n\n"
@@ -623,6 +1516,235 @@ async def send_debate_message(
     )
 
 
+async def _run_bull_bear(body, msg_id, user_content, history, search_context, topic_type):
+    """Bull/Bear debate format: sequential rounds with context chaining."""
+    prompts = get_bull_bear_prompts(topic_type)
+    roles = {1: "看多方", 2: "质疑方", 3: "综合判断"}
+    num_rounds = len(body.debate_models)
+    round_contents: dict[int, str] = {}
+
+    for round_num in range(1, num_rounds + 1):
+        model_id = body.debate_models[round_num - 1]
+        model_info = MODEL_MAP.get(model_id, {"name": model_id})
+        role = roles.get(round_num, f"Round {round_num}")
+
+        # Build round-specific system prompt
+        if round_num == 1:
+            sys_prompt = prompts[1]
+        elif round_num == 2:
+            sys_prompt = prompts[2].format(prev_content=round_contents.get(1, ""))
+        else:
+            sys_prompt = prompts[3].format(
+                round1_content=round_contents.get(1, ""),
+                round2_content=round_contents.get(2, ""),
+            )
+
+        if body.system_prompt:
+            sys_prompt = body.system_prompt + "\n\n" + sys_prompt
+
+        sc = search_context if round_num == 1 else None
+        messages_payload = _build_messages(history, user_content, sys_prompt, sc)
+
+        result = None
+        async for event in _stream_one_round(round_num, role, model_id, model_info, messages_payload, msg_id):
+            if isinstance(event, dict) and "_result" in event:
+                result = event["_result"]
+            else:
+                yield event
+
+        if result:
+            round_contents[round_num] = result["content"]
+            if result["error"] and round_num < num_rounds:
+                err_reason = f"Round {round_num} failed: {result['error']}"
+                yield f"data: {json.dumps({'type': 'debate_aborted', 'reason': err_reason, 'completed_rounds': round_num})}\n\n"
+                break
+
+
+async def _run_multi_perspective(body, msg_id, user_content, history, search_context, topic_type):
+    """Multi-perspective format: parallel analysts then sequential synthesis."""
+    prompts = get_multi_perspective_prompts(topic_type)
+    num_models = len(body.debate_models)
+    num_analysts = min(num_models - 1, 3) if num_models > 1 else num_models
+    has_synthesis = num_models > num_analysts
+
+    # Phase 1: Run analyst models in parallel
+    analyst_results: dict[int, str] = {}
+    analyst_queues: dict[int, asyncio.Queue] = {}
+
+    async def run_analyst(round_num: int, model_id: str):
+        model_info = MODEL_MAP.get(model_id, {"name": model_id})
+        role = MULTI_PERSPECTIVE_ROLES.get(round_num, f"分析师 {round_num}")
+        sys_prompt = prompts.get(round_num, prompts[1])
+        if body.system_prompt:
+            sys_prompt = body.system_prompt + "\n\n" + sys_prompt
+        sc = search_context if round_num == 1 else None
+        messages_payload = _build_messages(history, user_content, sys_prompt, sc)
+
+        q = analyst_queues[round_num]
+        async for event in _stream_one_round(round_num, role, model_id, model_info, messages_payload, msg_id):
+            if isinstance(event, dict) and "_result" in event:
+                analyst_results[round_num] = event["_result"]["content"]
+            else:
+                await q.put(event)
+        await q.put(None)  # signal done
+
+    for i in range(1, num_analysts + 1):
+        analyst_queues[i] = asyncio.Queue()
+
+    tasks = [
+        asyncio.create_task(run_analyst(i, body.debate_models[i - 1]))
+        for i in range(1, num_analysts + 1)
+    ]
+
+    # Interleave parallel output from all analyst queues
+    done_count = 0
+    while done_count < num_analysts:
+        for rn in range(1, num_analysts + 1):
+            q = analyst_queues[rn]
+            while not q.empty():
+                event = q.get_nowait()
+                if event is None:
+                    done_count += 1
+                else:
+                    yield event
+        await asyncio.sleep(0.05)
+
+    # Drain remaining events
+    for rn in range(1, num_analysts + 1):
+        while not analyst_queues[rn].empty():
+            event = analyst_queues[rn].get_nowait()
+            if event is not None:
+                yield event
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Phase 2: Synthesis round (sees all analyst outputs)
+    if has_synthesis:
+        synthesis_round = num_analysts + 1
+        synthesis_model = body.debate_models[num_analysts]
+        model_info = MODEL_MAP.get(synthesis_model, {"name": synthesis_model})
+        role = MULTI_PERSPECTIVE_ROLES.get(4, "综合判断")
+
+        sys_prompt = prompts.get(4, prompts[1]).format(
+            round1_content=analyst_results.get(1, ""),
+            round2_content=analyst_results.get(2, ""),
+            round3_content=analyst_results.get(3, ""),
+        )
+        if body.system_prompt:
+            sys_prompt = body.system_prompt + "\n\n" + sys_prompt
+
+        messages_payload = _build_messages(history, user_content, sys_prompt)
+
+        async for event in _stream_one_round(synthesis_round, role, synthesis_model, model_info, messages_payload, msg_id):
+            if isinstance(event, dict) and "_result" in event:
+                pass
+            else:
+                yield event
+
+
+async def _run_round_robin(body, msg_id, user_content, history, search_context):
+    """Round-robin format: models take turns, each sees all prior responses."""
+    num_rounds = body.num_rounds or len(body.debate_models)
+    num_models = len(body.debate_models)
+    round_contents: dict[int, str] = {}
+
+    for round_num in range(1, num_rounds + 1):
+        model_idx = (round_num - 1) % num_models
+        model_id = body.debate_models[model_idx]
+        model_info = MODEL_MAP.get(model_id, {"name": model_id})
+        role = f"Round {round_num}"
+
+        sys_prompt = get_round_robin_prompt(round_num, round_contents)
+        if body.system_prompt:
+            sys_prompt = body.system_prompt + "\n\n" + sys_prompt
+
+        sc = search_context if round_num == 1 else None
+        messages_payload = _build_messages(history, user_content, sys_prompt, sc)
+
+        result = None
+        async for event in _stream_one_round(round_num, role, model_id, model_info, messages_payload, msg_id):
+            if isinstance(event, dict) and "_result" in event:
+                result = event["_result"]
+            else:
+                yield event
+
+        if result:
+            round_contents[round_num] = result["content"]
+            if result["error"] and round_num < num_rounds:
+                err_reason = f"Round {round_num} failed: {result['error']}"
+                yield f"data: {json.dumps({'type': 'debate_aborted', 'reason': err_reason, 'completed_rounds': round_num})}\n\n"
+                break
+
+
+# ── Debate summary ────────────────────────────────────────────────
+
+@router.post("/conversations/{conv_id}/messages/{msg_id}/debate-summary")
+async def generate_debate_summary(
+    conv_id: str,
+    msg_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Extract structured summary from a completed debate."""
+    conv = await db.get(ChatConversation, conv_id)
+    if not conv or str(conv.user_id) != str(user.id):
+        raise HTTPException(404, "Conversation not found")
+
+    result = await db.execute(
+        select(ChatModelResponse)
+        .where(ChatModelResponse.message_id == msg_id, ChatModelResponse.debate_round > 0)
+        .order_by(ChatModelResponse.debate_round)
+    )
+    responses = result.scalars().all()
+    if not responses:
+        raise HTTPException(404, "No debate responses found")
+
+    debate_text = ""
+    for resp in responses:
+        round_label = DEBATE_ROLES.get(resp.debate_round, f"Round {resp.debate_round}")
+        debate_text += f"\n\n【{round_label} - {resp.model_name}】\n{resp.content}"
+
+    prompt = DEBATE_SUMMARY_PROMPT.format(debate_content=debate_text)
+
+    summary_result = await call_model_sync(
+        "openai/gpt-4o-mini",
+        [{"role": "user", "content": prompt}],
+        mode="fast",
+    )
+
+    summary_text = summary_result.get("content", "")
+    try:
+        import re as _re
+        json_match = _re.search(r'\{[\s\S]*\}', summary_text)
+        if json_match:
+            summary_data = json.loads(json_match.group())
+        else:
+            summary_data = json.loads(summary_text)
+        summary = DebateSummary(**summary_data)
+    except (json.JSONDecodeError, Exception):
+        logger.warning("Failed to parse debate summary JSON, returning raw text")
+        summary = DebateSummary(conclusion=summary_text[:200])
+
+    # Save summary as special model response (debate_round = -1)
+    try:
+        async with (await _get_session()) as save_db:
+            summary_resp = ChatModelResponse(
+                message_id=msg_id,
+                model_id="system/debate-summary",
+                model_name="辩论总结",
+                content=json.dumps(summary.model_dump(), ensure_ascii=False),
+                tokens_used=summary_result.get("tokens", 0),
+                latency_ms=summary_result.get("latency_ms", 0),
+                debate_round=-1,
+            )
+            save_db.add(summary_resp)
+            await save_db.commit()
+    except Exception:
+        logger.exception("Failed to save debate summary")
+
+    return summary.model_dump()
+
+
 # ── Rating ──────────────────────────────────────────────────────
 
 @router.post("/rate/{response_id}", response_model=RateResponse)
@@ -632,6 +1754,12 @@ async def rate_response(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    """Record a star rating on a model response.
+
+    Also emits a ChatFeedbackEvent so the background memory extractor sees
+    this as a signal. Detailed qualitative feedback (tags + text) uses the
+    separate /chat-memory/feedback/{response_id} endpoint.
+    """
     resp = await db.scalar(select(ChatModelResponse).where(ChatModelResponse.id == response_id))
     if not resp:
         raise HTTPException(404, "Response not found")
@@ -648,7 +1776,26 @@ async def rate_response(
         raise HTTPException(403, "Not your conversation")
 
     resp.rating = body.rating
-    resp.rating_comment = body.comment
+    if body.comment is not None:
+        resp.rating_comment = body.comment
+
+    # Emit a feedback event for the background memory daemon to consume.
+    # The extractor is already rate-limited and only produces memories when
+    # there's a real signal (rating alone with no text rarely distills to a
+    # memory, which is the intended behavior).
+    from backend.app.models.chat_memory import ChatFeedbackEvent
+    from backend.app.services.chat_memory_extractor import _sentiment_from_signals
+    sentiment = _sentiment_from_signals(body.rating, body.comment or "", [])
+    fb_event = ChatFeedbackEvent(
+        response_id=resp.id,
+        user_id=user.id,
+        rating=body.rating,
+        feedback_text=(body.comment or "").strip(),
+        feedback_tags=[],
+        sentiment=sentiment,
+        processed=False,
+    )
+    db.add(fb_event)
     await db.commit()
     return RateResponse(id=str(resp.id), rating=resp.rating, rating_comment=resp.rating_comment)
 

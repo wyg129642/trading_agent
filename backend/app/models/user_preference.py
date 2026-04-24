@@ -38,6 +38,18 @@ class UserPreference(Base):
     theme: Mapped[str] = mapped_column(
         String(20), default="light", server_default="light",
     )
+    # NULL until the user's first personal-KB tree fetch auto-imports their
+    # portfolio holdings into the "持仓股票" folder. Set once so re-imports
+    # don't fire if the user later deletes the folder.
+    kb_holdings_initialized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    # NULL until the user's first personal-KB tree fetch seeds the stock
+    # sub-taxonomy (key-driver.md, notes.md, 研报/... subfolders). Set once
+    # so deleting one subfolder doesn't resurrect it on the next refresh.
+    kb_workspace_subfolders_initialized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, server_default=text("now()"),
     )

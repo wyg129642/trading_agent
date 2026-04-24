@@ -9,11 +9,26 @@ from backend.app.models.alphapai import (
     AlphaPaiArticle, AlphaPaiRoadshowCN, AlphaPaiRoadshowUS,
     AlphaPaiComment, AlphaPaiSyncState, AlphaPaiDigest,
 )
-from backend.app.models.topic_cluster import TopicClusterResult
 from backend.app.models.chat import (
     ChatConversation, ChatMessage, ChatModelResponse, ChatPromptTemplate,
+    ChatTrackingTopic, ChatTrackingAlert, ChatRecommendedQuestion,
+)
+from backend.app.models.chat_memory import (
+    ChatFeedbackEvent, UserChatMemory,
+    MEMORY_TYPES, MEMORY_SOURCE_TYPES, FEEDBACK_SENTIMENTS,
 )
 from backend.app.models.prediction import (
     StockPrediction, PredictionEditLog, PredictionEvaluation,
 )
 from backend.app.models.api_key import ApiKey
+from backend.app.models.leaderboard import SignalEvaluation
+from backend.app.models.kb_folder import KbFolder
+from backend.app.models.kb_skill_template import KbSkillTemplate
+from backend.app.models.revenue_model import (
+    RevenueModel, ModelCell, ModelCellVersion, ProvenanceTrace,
+    DebateOpinion, SanityIssue,
+)
+from backend.app.models.recipe import Recipe, RecipeRun
+from backend.app.models.recipe_change_request import RecipeChangeRequest
+from backend.app.models.feedback import UserFeedbackEvent, PendingLesson
+from backend.app.models.revenue_snapshot import SegmentRevenueSnapshot

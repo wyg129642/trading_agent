@@ -50,6 +50,7 @@ class AlphaPaiClient:
                     "Content-Type": "application/json",
                 },
                 timeout=aiohttp.ClientTimeout(total=60),
+                trust_env=False,
             )
         return self._session
 

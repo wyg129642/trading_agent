@@ -1,4 +1,27 @@
-"""Application configuration loaded from environment variables."""
+"""Application configuration loaded from environment variables.
+
+Environment layering
+--------------------
+At startup pydantic-settings stitches together (in precedence order, last wins):
+
+    1. process env vars (including APP_ENV)
+    2. .env           — per-deploy working config (gitignored)
+    3. .env.secrets   — shared secrets written by installers (gitignored)
+
+For multi-environment deploys (prod vs staging) we ALSO respect
+``APP_ENV``. When ``APP_ENV=staging`` the helper methods on ``Settings``
+automatically scope state to a ``_staging`` suffix (Postgres DB, Redis
+DB index, Milvus collections, ClickHouse DB) or a ``stg_`` prefix
+(Mongo collections in shared databases — the remote ``u_spider`` user
+cannot create new DBs on 192.168.31.176:35002, so we isolate at the
+collection level instead).
+
+The suffix logic is *idempotent*: if an explicit env var already carries
+the ``_staging`` tail the helpers won't double-apply it. This is why
+``.env.staging`` can choose between setting
+``POSTGRES_DB=trading_agent_staging`` explicitly or leaving it blank
+and relying on ``APP_ENV`` to derive it.
+"""
 from pathlib import Path
 from pydantic_settings import BaseSettings
 from functools import lru_cache
@@ -24,11 +47,11 @@ class Settings(BaseSettings):
 
     @property
     def database_url(self) -> str:
-        return f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        return f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.effective_postgres_db}"
 
     @property
     def database_url_sync(self) -> str:
-        return f"postgresql+psycopg2://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        return f"postgresql+psycopg2://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.effective_postgres_db}"
 
     # Redis
     redis_host: str = "localhost"
@@ -37,9 +60,10 @@ class Settings(BaseSettings):
 
     @property
     def redis_url(self) -> str:
+        db = self.redis_db_index
         if self.redis_password:
-            return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/0"
-        return f"redis://{self.redis_host}:{self.redis_port}/0"
+            return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{db}"
+        return f"redis://{self.redis_host}:{self.redis_port}/{db}"
 
     # JWT
     jwt_secret_key: str = "changeme_jwt_secret_key_min_32_chars"
@@ -139,13 +163,15 @@ class Settings(BaseSettings):
     # (LLM calls, tool calls with full args, searches, webpage reads, final
     # responses) for the admin-only visualization page. Writes are best-effort
     # fire-and-forget; auth/connection failures degrade to a no-op.
-    # Remote target per docs/knowledge_base_plan.md §1:
-    #   mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002
-    # — credentials currently rejected, so we default to the local Mongo that
-    # already hosts the crawler DBs. Override via RESEARCH_LOG_MONGO_URI once
-    # the remote auth lands.
-    research_log_mongo_uri: str = "mongodb://localhost:27017"
-    research_log_mongo_db: str = "research-agent-interaction-process-all-accounts"
+    # 2026-04-24: migrated to remote Mongo on 192.168.31.176:35002.
+    # u_spider cannot create new databases, so the recorder is co-hosted inside
+    # the existing `ti-user-knowledge-base` DB as a dedicated `research_sessions`
+    # collection (distinct from the KB's `documents`/`chunks`/`fs.*`). Override
+    # via RESEARCH_LOG_MONGO_URI / RESEARCH_LOG_MONGO_DB.
+    research_log_mongo_uri: str = (
+        "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin"
+    )
+    research_log_mongo_db: str = "ti-user-knowledge-base"
     # AceCamp 内容字段直接从 API 拿到 markdown 全文, 绝大多数无独立 PDF —
     # 仅 can_download 的少数文章会写入此目录 (/articles/download_url 返回 S3 URL)
     acecamp_pdf_dir: str = "/home/ygwang/crawl_data/acecamp_pdfs"
@@ -330,8 +356,12 @@ class Settings(BaseSettings):
     embedding_model_version: str = "qwen3-emb-8b-v1"
 
     # App
-    app_env: str = "development"
-    app_debug: bool = True
+    # APP_ENV is the single source of truth for multi-environment isolation.
+    # Recognised values: "production" (default, no scoping), "staging"
+    # (all properties below auto-scope state). Any other value is treated
+    # as production — we don't create a third environment implicitly.
+    app_env: str = "production"
+    app_debug: bool = False
     app_host: str = "0.0.0.0"
     app_port: int = 8000
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
@@ -339,6 +369,95 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    # ── Environment scoping helpers ─────────────────────────────
+    # Prod / staging share the same machine + Postgres/Redis instance +
+    # remote Mongo cluster. To keep them safely isolated every piece of
+    # named state — DB name, Redis DB index, Milvus collection, Mongo
+    # collection, crawler-process control — is routed through these
+    # helpers. Add a new piece of persistent state? Use them.
+
+    @property
+    def is_staging(self) -> bool:
+        """True when this process is the staging deployment."""
+        return (self.app_env or "").lower() == "staging"
+
+    @property
+    def env_suffix(self) -> str:
+        """`_staging` for staging, empty for prod. Append to SQL/Milvus names."""
+        return "_staging" if self.is_staging else ""
+
+    @property
+    def collection_prefix(self) -> str:
+        """`stg_` for staging, empty for prod. Prepend to Mongo collections
+        that live in a shared database where we cannot create a new DB
+        (the remote 192.168.31.176:35002 cluster's `u_spider` user)."""
+        return "stg_" if self.is_staging else ""
+
+    @property
+    def redis_db_index(self) -> int:
+        """Redis logical DB index. 0 for prod, 1 for staging — a single
+        Redis server exposes 16 DBs and `SELECT` switches cheaply."""
+        return 1 if self.is_staging else 0
+
+    def _suffixed(self, name: str) -> str:
+        """Return `name` with env_suffix, idempotently (never double-appends)."""
+        if not self.is_staging or not name:
+            return name
+        if name.endswith(self.env_suffix):
+            return name
+        return f"{name}{self.env_suffix}"
+
+    def _prefixed(self, name: str) -> str:
+        """Return `name` with collection_prefix, idempotently."""
+        if not self.is_staging or not name:
+            return name
+        if name.startswith(self.collection_prefix):
+            return name
+        return f"{self.collection_prefix}{name}"
+
+    # Effective (= env-scoped) names. Callers should prefer these over the
+    # raw fields. Raw fields remain available for migration tools that need
+    # to address the *prod* DB explicitly from a staging process.
+
+    @property
+    def effective_postgres_db(self) -> str:
+        return self._suffixed(self.postgres_db)
+
+    @property
+    def effective_clickhouse_db(self) -> str:
+        return self._suffixed(self.clickhouse_db)
+
+    @property
+    def effective_milvus_collection(self) -> str:
+        """Shared-KB Milvus collection (crawled corpus)."""
+        return self._suffixed(self.milvus_collection)
+
+    @property
+    def effective_user_kb_milvus_collection(self) -> str:
+        """Personal-KB Milvus collection (user uploads)."""
+        return self._suffixed(self.user_kb_milvus_collection)
+
+    # Mongo collections in shared databases. Fixed names — u_spider has no
+    # permission to create new DBs on the remote cluster so prod+staging
+    # must coexist inside the same DB with a name prefix.
+
+    @property
+    def user_kb_docs_collection(self) -> str:
+        return self._prefixed("documents")
+
+    @property
+    def user_kb_chunks_collection(self) -> str:
+        return self._prefixed("chunks")
+
+    @property
+    def user_kb_gridfs_bucket(self) -> str:
+        """GridFS bucket name — maps to `{bucket}.files` + `{bucket}.chunks`."""
+        return self._prefixed("fs")
+
+    @property
+    def research_sessions_collection(self) -> str:
+        return self._prefixed("research_sessions")
 
     model_config = {
         # Pydantic-settings loads these in order; later files override earlier.

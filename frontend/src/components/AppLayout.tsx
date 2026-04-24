@@ -15,17 +15,19 @@ import {
   UserOutlined,
   ReadOutlined,
   RocketOutlined,
-  FundOutlined,
   DatabaseOutlined,
   AppstoreOutlined,
   LinkOutlined,
   CrownOutlined,
   StockOutlined,
-  RadarChartOutlined,
   TrophyOutlined,
   SolutionOutlined,
   RobotOutlined,
   AimOutlined,
+  ProfileOutlined,
+  AudioOutlined,
+  GlobalOutlined,
+  FundProjectionScreenOutlined,
 } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
 import { useAuthStore } from '../store/auth'
@@ -129,21 +131,136 @@ export default function AppLayout() {
     stock: s,
   }))
 
-  // Build menu items based on role
+  // Build menu items based on role — grouped by researcher workflow
   const menuItems: any[] = [
     {
       type: 'group',
-      label: t('nav.sectionTrading'),
+      label: '研究工作台',
       children: [
         { key: '/', icon: <DashboardOutlined />, label: t('nav.dashboard') },
+        { key: '/ai-chat', icon: <RobotOutlined />, label: 'AI 研究助手' },
+        {
+          key: '/modeling',
+          icon: <FileTextOutlined />,
+          label: '收入拆分建模',
+          children: [
+            { key: '/modeling', label: '模型列表' },
+            { key: '/modeling/cost', label: '成本仪表盘' },
+            { key: '/modeling/feedback', label: '反馈闭环' },
+            { key: '/modeling/expert-calls', label: '专家访谈请求' },
+            { key: '/modeling/recipes', label: 'Recipe 编辑器' },
+            { key: '/modeling/playbook', label: 'Playbook / Lessons' },
+          ],
+        },
+        { key: '/my-knowledge', icon: <DatabaseOutlined />, label: '个人知识库' },
         { key: '/feed', icon: <FileTextOutlined />, label: t('nav.feed') },
-        { key: '/topic-radar', icon: <RadarChartOutlined />, label: '舆情雷达' },
-        { key: '/stock-search', icon: <SearchOutlined />, label: '股票搜索' },
+      ],
+    },
+    {
+      type: 'group',
+      label: '深度研究',
+      children: [
+        { key: '/alphapai/digest', icon: <ProfileOutlined />, label: '每日简报' },
+        {
+          key: '/alphapai',
+          icon: <ReadOutlined />,
+          label: t('nav.alphapai'),
+          children: [
+            { key: '/alphapai/platform-info', label: '平台信息' },
+            { key: '/alphapai/reports', label: t('nav.alphapaiReports') },
+            { key: '/alphapai/roadshows', label: t('nav.alphapaiRoadshows') },
+            { key: '/alphapai/comments', label: t('nav.alphapaiComments') },
+            { key: '/alphapai/feed', label: t('nav.alphapaiFeed') },
+          ],
+        },
+        {
+          key: '/jiuqian',
+          icon: <CrownOutlined />,
+          label: t('nav.jiuqian'),
+          children: [
+            { key: '/meritco/minutes', label: '纪要' },
+            { key: '/meritco/research', label: '研究' },
+            { key: '/meritco/weekly', label: '调研周报' },
+          ],
+        },
+        {
+          key: '/jinmen',
+          icon: <AudioOutlined />,
+          label: '进门专区',
+          children: [
+            { key: '/jinmen/platform-info', label: '平台信息' },
+            { key: '/jinmen/meetings', label: '纪要' },
+            { key: '/jinmen/reports', label: '研报' },
+            { key: '/jinmen/oversea-reports', label: '外资研报' },
+          ],
+        },
+        {
+          key: '/thirdbridge',
+          icon: <GlobalOutlined />,
+          label: '高临专区',
+          children: [
+            { key: '/thirdbridge/interviews', label: '专家访谈' },
+          ],
+        },
+        {
+          key: '/funda',
+          icon: <FundProjectionScreenOutlined />,
+          label: 'Funda 专区',
+          children: [
+            { key: '/funda/posts', label: t('nav.fundaPosts') },
+            { key: '/funda/earnings-reports', label: t('nav.fundaEarningsReports') },
+            { key: '/funda/earnings-transcripts', label: t('nav.fundaEarningsTranscripts') },
+            { key: '/funda/sentiment', label: t('nav.fundaSentiment') },
+          ],
+        },
+        {
+          key: '/gangtise',
+          icon: <ReadOutlined />,
+          label: t('nav.gangtise'),
+          children: [
+            { key: '/gangtise/platform-info', label: '平台信息' },
+            { key: '/gangtise/summary', label: t('nav.gangtiseSummary') },
+            { key: '/gangtise/research', label: t('nav.gangtiseResearch') },
+            { key: '/gangtise/chief', label: t('nav.gangtiseChief') },
+          ],
+        },
+        {
+          key: '/acecamp',
+          icon: <ReadOutlined />,
+          label: t('nav.acecamp'),
+          children: [
+            { key: '/acecamp/platform-info', label: '平台信息' },
+            { key: '/acecamp/minutes', label: t('nav.acecampMinutes') },
+            { key: '/acecamp/research', label: t('nav.acecampResearch') },
+            { key: '/acecamp/article', label: t('nav.acecampArticle') },
+            { key: '/acecamp/opinion', label: t('nav.acecampOpinion') },
+          ],
+        },
+        {
+          key: '/alphaengine',
+          icon: <ReadOutlined />,
+          label: t('nav.alphaengine'),
+          children: [
+            { key: '/alphaengine/summary', label: t('nav.alphaengineSummary') },
+            { key: '/alphaengine/china-report', label: t('nav.alphaengineChinaReport') },
+            { key: '/alphaengine/foreign-report', label: t('nav.alphaengineForeignReport') },
+            { key: '/alphaengine/news', label: t('nav.alphaengineNews') },
+          ],
+        },
+      ],
+    },
+    {
+      type: 'group',
+      label: '跟踪管理',
+      children: [
         { key: '/watchlists', icon: <StarOutlined />, label: t('nav.watchlists') },
         { key: '/favorites', icon: <StarFilled />, label: t('favorites.title') },
-        { key: '/leaderboard', icon: <TrophyOutlined />, label: t('nav.leaderboard') },
-        { key: '/analyst-rating', icon: <SolutionOutlined />, label: t('nav.analystRating') },
-        { key: '/ai-chat', icon: <RobotOutlined />, label: t('nav.aiChat') },
+      ],
+    },
+    {
+      type: 'group',
+      label: '评估排行',
+      children: [
         {
           key: '/predictions',
           icon: <AimOutlined />,
@@ -156,37 +273,17 @@ export default function AppLayout() {
               : []),
           ],
         },
-        ...(isBossOrAdmin
-          ? [{ key: '/portfolio', icon: <FundOutlined />, label: t('nav.portfolio') }]
-          : []),
+        { key: '/leaderboard', icon: <TrophyOutlined />, label: t('nav.leaderboard') },
+        { key: '/analyst-rating', icon: <SolutionOutlined />, label: t('nav.analystRating') },
       ],
     },
     {
       type: 'group',
-      label: t('nav.sectionResearch'),
+      label: '配置',
       children: [
-        {
-          key: '/alphapai',
-          icon: <ReadOutlined />,
-          label: t('nav.alphapai'),
-          children: [
-            { key: '/alphapai/digest', label: t('nav.alphapaiDigest') },
-            { key: '/alphapai/feed', label: t('nav.alphapaiFeed') },
-            { key: '/alphapai/roadshows', label: t('nav.alphapaiRoadshows') },
-            { key: '/alphapai/comments', label: t('nav.alphapaiComments') },
-          ],
-        },
-        {
-          key: '/jiuqian',
-          icon: <CrownOutlined />,
-          label: t('nav.jiuqian'),
-          children: [
-            { key: '/jiuqian/forum', label: t('nav.jiuqianForum') },
-            { key: '/jiuqian/minutes', label: t('nav.jiuqianMinutes') },
-            { key: '/jiuqian/wechat', label: t('nav.jiuqianWechat') },
-          ],
-        },
         { key: '/sources', icon: <LinkOutlined />, label: t('nav.sources') },
+        { key: '/data-sources', icon: <DatabaseOutlined />, label: t('nav.dataSources') },
+        { key: '/database-overview', icon: <DatabaseOutlined />, label: t('nav.databaseOverview') },
       ],
     },
   ]
@@ -200,6 +297,7 @@ export default function AppLayout() {
         { key: '/admin', icon: <TeamOutlined />, label: t('nav.adminUsers') },
         { key: '/admin/feed', icon: <DatabaseOutlined />, label: t('nav.adminFeed') },
         { key: '/admin/sources', icon: <AppstoreOutlined />, label: t('nav.adminSources') },
+        { key: '/admin/research-logs', icon: <ProfileOutlined />, label: t('nav.adminResearchLogs') },
         { key: '/engine', icon: <RocketOutlined />, label: t('nav.adminEngine') },
         { key: '/analytics', icon: <BarChartOutlined />, label: t('nav.adminAnalytics') },
       ],
@@ -236,10 +334,16 @@ export default function AppLayout() {
   // Determine selected key
   const selectedKey = location.pathname === '/' ? '/' : location.pathname
 
-  // Determine open submenu
+  // Determine open submenu (digest is standalone, not inside alphapai submenu)
   const openKeys: string[] = []
-  if (location.pathname.startsWith('/alphapai')) openKeys.push('/alphapai')
-  if (location.pathname.startsWith('/jiuqian')) openKeys.push('/jiuqian')
+  if (location.pathname.startsWith('/alphapai') && location.pathname !== '/alphapai/digest') openKeys.push('/alphapai')
+  if (location.pathname.startsWith('/jiuqian') || location.pathname.startsWith('/meritco')) openKeys.push('/jiuqian')
+  if (location.pathname.startsWith('/jinmen')) openKeys.push('/jinmen')
+  if (location.pathname.startsWith('/thirdbridge')) openKeys.push('/thirdbridge')
+  if (location.pathname.startsWith('/funda')) openKeys.push('/funda')
+  if (location.pathname.startsWith('/gangtise')) openKeys.push('/gangtise')
+  if (location.pathname.startsWith('/acecamp')) openKeys.push('/acecamp')
+  if (location.pathname.startsWith('/alphaengine')) openKeys.push('/alphaengine')
   if (location.pathname.startsWith('/predictions')) openKeys.push('/predictions')
 
   return (

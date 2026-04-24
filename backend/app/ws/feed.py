@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from backend.app.config import get_settings
-from backend.app.core.events import CHANNEL_NEWS, CHANNEL_ALERT
+from backend.app.core.events import CHANNEL_NEWS, CHANNEL_ALERT, CHANNEL_CRAWL_NEW
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +106,7 @@ async def ws_feed(ws: WebSocket):
     try:
         redis_conn = aioredis.from_url(settings.redis_url, decode_responses=True)
         pubsub = redis_conn.pubsub()
-        await pubsub.subscribe(CHANNEL_NEWS, CHANNEL_ALERT)
+        await pubsub.subscribe(CHANNEL_NEWS, CHANNEL_ALERT, CHANNEL_CRAWL_NEW)
 
         # Run two tasks: listen to Redis + listen to client pings
         async def _redis_listener():
@@ -119,6 +119,17 @@ async def ws_feed(ws: WebSocket):
                             data = json.loads(message["data"])
                             if data.get("user_id") == user_id:
                                 await ws.send_text(message["data"])
+                        elif channel == CHANNEL_CRAWL_NEW:
+                            # Wrap the raw event with a `type` discriminator so
+                            # the frontend can tell crawl-new-item from news-analyzed.
+                            try:
+                                payload = json.loads(message["data"])
+                            except Exception:
+                                payload = {"raw": message["data"]}
+                            await ws.send_text(json.dumps(
+                                {"type": "crawl_new_item", "event": payload},
+                                ensure_ascii=False,
+                            ))
                         else:
                             await ws.send_text(message["data"])
                     except Exception:
@@ -143,7 +154,7 @@ async def ws_feed(ws: WebSocket):
         manager.disconnect(ws, user_id)
         if pubsub:
             try:
-                await pubsub.unsubscribe(CHANNEL_NEWS, CHANNEL_ALERT)
+                await pubsub.unsubscribe(CHANNEL_NEWS, CHANNEL_ALERT, CHANNEL_CRAWL_NEW)
                 await pubsub.close()
             except Exception:
                 logger.debug("Error closing Redis pubsub")

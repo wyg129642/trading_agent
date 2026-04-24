@@ -12,6 +12,15 @@ logger = logging.getLogger(__name__)
 
 CHANNEL_NEWS = "news:analyzed"
 CHANNEL_ALERT = "news:alert"
+# Published by crawl/crawler_push.py whenever a scraper successfully inserts
+# a new item. Payload schema:
+#   {"platform": str, "category": str, "collection": str, "doc_id": str,
+#    "title": str, "release_time": str|None, "release_time_ms": int|None,
+#    "organization": str|None, "industry": str|None, "has_pdf": bool,
+#    "at": iso8601 UTC}
+# Broadcast to every logged-in WebSocket client (ws/feed) so the frontend
+# can show toast notifications / auto-refresh list views when new items land.
+CHANNEL_CRAWL_NEW = "crawl:new-item"
 
 
 class EventBus:

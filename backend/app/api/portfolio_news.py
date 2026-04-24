@@ -1,64 +1,126 @@
-"""Portfolio Breaking News API — serves proactive scanner alerts from ClickHouse."""
+"""Portfolio Breaking News API — serves proactive scanner alerts.
+
+Primary data source: PostgreSQL (portfolio_scan_results + portfolio_scan_baselines).
+The proactive scanner always writes scan results to PostgreSQL, making it the
+reliable source of truth. ClickHouse is used for long-term analytics only.
+"""
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.config import get_settings, Settings
-from backend.app.deps import get_current_boss_or_admin
+from backend.app.deps import get_db, get_current_boss_or_admin
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+MARKET_LABELS = {
+    "us": "美股",
+    "china": "A股",
+    "hk": "港股",
+    "kr": "韩股",
+    "jp": "日股",
+}
 
-def _get_ch_client(settings: Settings):
-    """Create a ClickHouse client from settings (cached per process via module-level)."""
-    import clickhouse_connect
-
-    return clickhouse_connect.get_client(
-        host=settings.clickhouse_host,
-        port=settings.clickhouse_port,
-        database=settings.clickhouse_db,
-        username=settings.clickhouse_user,
-        password=settings.clickhouse_password,
-    )
+# Neutral and empty sentiments are excluded from the dashboard.
+_EXCLUDED_SENTIMENTS = ("neutral", "")
 
 
-# Module-level client (lazy singleton)
-_ch_client = None
-
-
-def _client(settings: Settings):
-    global _ch_client
-    if _ch_client is None and settings.clickhouse_enabled:
+def _safe_json(val: Any, default=None):
+    """Handle JSONB values from asyncpg (returned as Python dicts/lists)."""
+    if val is None:
+        return default if default is not None else []
+    if isinstance(val, (list, dict)):
+        return val
+    if isinstance(val, str):
+        import json
         try:
-            _ch_client = _get_ch_client(settings)
-        except Exception as e:
-            logger.error("ClickHouse connection failed: %s", e)
-            return None
-    return _ch_client
+            return json.loads(val)
+        except (json.JSONDecodeError, TypeError):
+            return default if default is not None else []
+    return default if default is not None else []
 
 
-def _parse_json_safe(s: str) -> Any:
-    """Parse a JSON string, returning [] on failure."""
-    if not s:
-        return []
-    try:
-        return json.loads(s)
-    except (json.JSONDecodeError, TypeError):
-        return []
+def _row_to_item(row: Any) -> dict:
+    """Convert a database row to a breaking news item dict."""
+    analysis = _safe_json(row.full_analysis, {})
+    snapshot = _safe_json(row.snapshot_summary, {})
+    market = row.market or ""
+
+    # Extract earliest_report_time from snapshot_summary or news_timeline
+    timeline = _safe_json(row.news_timeline, [])
+    earliest_report_time = snapshot.get("earliest_report_time")
+    if not earliest_report_time and timeline:
+        first_time = timeline[0].get("time") if timeline else None
+        if first_time:
+            earliest_report_time = first_time
+
+    scan_time = row.scan_time
+    created_at = row.created_at
+
+    # Sources from full_analysis (with clickable URLs)
+    sources = analysis.get("sources", [])
+    # Also merge referenced_sources if sources is empty
+    if not sources:
+        sources = _safe_json(row.referenced_sources, [])
+
+    return {
+        "id": row.id,
+        "ticker": row.ticker,
+        "name_cn": row.name_cn or row.ticker,
+        "name_en": getattr(row, "name_en", "") or "",
+        "market": market,
+        "market_label": MARKET_LABELS.get(market, market),
+        "scan_time": scan_time.isoformat() if isinstance(scan_time, datetime) else str(scan_time or ""),
+        "news_materiality": row.delta_magnitude or "none",
+        "news_summary": analysis.get("summary", "") or row.delta_description or "",
+        "new_developments": _safe_json(row.new_developments, []),
+        "novelty_status": snapshot.get("novelty_status", ""),
+        "earliest_report_time": earliest_report_time,
+        "deep_research_performed": bool(row.deep_research_performed),
+        "research_iterations": row.research_iterations or 0,
+        "key_findings": analysis.get("key_findings", []) or _safe_json(row.key_findings, []),
+        "news_timeline": timeline,
+        "referenced_sources": _safe_json(row.referenced_sources, []),
+        "sources": sources,
+        "historical_precedents": snapshot.get("historical_precedents", []),
+        "historical_evidence_summary": analysis.get("historical_evidence_summary", ""),
+        "alert_confidence": round(float(row.alert_confidence or 0), 3),
+        "alert_rationale": row.alert_rationale or "",
+        "sentiment": analysis.get("sentiment", "neutral"),
+        "impact_magnitude": analysis.get("impact_magnitude", "low"),
+        "impact_timeframe": analysis.get("impact_timeframe", "short_term"),
+        "surprise_factor": round(float(analysis.get("surprise_factor", 0.5)), 3),
+        "bull_case": analysis.get("bull_case", ""),
+        "bear_case": analysis.get("bear_case", ""),
+        "recommended_action": analysis.get("recommended_action", ""),
+        "should_alert": bool(row.should_alert),
+        "tokens_used": row.tokens_used or 0,
+        "cost_cny": round(float(row.cost_cny or 0), 4),
+        "created_at": created_at.isoformat() if isinstance(created_at, datetime) else str(created_at or ""),
+    }
+
+
+# Sentiment filter: exclude neutral and NULL sentiment in SQL.
+# full_analysis is JSONB; sentiment lives at full_analysis->>'sentiment'.
+_SENTIMENT_FILTER = """
+    AND r.full_analysis IS NOT NULL
+    AND r.full_analysis->>'sentiment' IS NOT NULL
+    AND r.full_analysis->>'sentiment' NOT IN ('neutral', '')
+"""
 
 
 @router.get("/breaking-news")
 async def list_breaking_news(
     user=Depends(get_current_boss_or_admin),
-    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
     ticker: str | None = Query(None, description="Filter by ticker"),
     market: str | None = Query(None, description="Filter by market (us, china, hk, kr, jp)"),
     materiality: str | None = Query(None, description="Filter by materiality (material, critical)"),
@@ -68,147 +130,176 @@ async def list_breaking_news(
 ):
     """List breaking news from the proactive portfolio scanner.
 
-    Returns recent material/critical breaking news events with full analysis data.
+    Returns material/critical breaking news events with non-neutral sentiment.
+    Reads from PostgreSQL portfolio_scan_results (always available).
     """
-    client = _client(settings)
-    if not client:
-        return {"items": [], "total": 0, "error": "ClickHouse not available"}
-
-    db = settings.clickhouse_db
-
     # Build WHERE clauses
-    conditions = [f"scan_time >= now() - INTERVAL {hours} HOUR"]
-    params: dict[str, Any] = {}
+    conditions = [
+        "r.delta_detected = true",
+        "r.delta_magnitude IN ('material', 'critical')",
+        "r.scan_time >= NOW() - make_interval(hours => :hours)",
+    ]
+    params: dict[str, Any] = {"hours": hours, "limit": limit, "offset": offset}
 
     if ticker:
-        conditions.append("ticker = {ticker:String}")
+        conditions.append("r.ticker = :ticker")
         params["ticker"] = ticker
     if market:
-        conditions.append("market = {market:String}")
+        conditions.append("b.market = :market")
         params["market"] = market
     if materiality:
-        conditions.append("news_materiality = {materiality:String}")
+        conditions.append("r.delta_magnitude = :materiality")
         params["materiality"] = materiality
 
-    where = " AND ".join(conditions)
+    where = " AND ".join(conditions) + _SENTIMENT_FILTER
 
     # Count query
-    count_sql = f"SELECT count() FROM {db}.portfolio_breaking_news FINAL WHERE {where}"
+    count_sql = text(f"""
+        SELECT count(*)
+        FROM portfolio_scan_results r
+        JOIN portfolio_scan_baselines b ON r.ticker = b.ticker
+        WHERE {where}
+    """)
+
     try:
-        total = client.query(count_sql, parameters=params).result_rows[0][0]
+        count_result = await db.execute(count_sql, params)
+        total = count_result.scalar() or 0
     except Exception as e:
-        logger.error("ClickHouse count query failed: %s", e)
+        logger.error("Breaking news count query failed: %s", e)
         return {"items": [], "total": 0, "error": str(e)}
+
+    if total == 0:
+        return {"items": [], "total": 0}
 
     # Data query
-    data_sql = f"""
-    SELECT
-        id, ticker, name_cn, name_en, market, market_label, scan_time,
-        news_materiality, news_summary, new_developments,
-        novelty_status, earliest_report_time, deep_research_performed,
-        research_iterations, key_findings, news_timeline, referenced_sources,
-        historical_precedents,
-        alert_confidence, alert_rationale, sentiment, impact_magnitude,
-        impact_timeframe, surprise_factor, bull_case, bear_case,
-        recommended_action, tokens_used, cost_cny, created_at
-    FROM {db}.portfolio_breaking_news FINAL
-    WHERE {where}
-    ORDER BY scan_time DESC
-    LIMIT {limit} OFFSET {offset}
-    """
+    data_sql = text(f"""
+        SELECT
+            r.id, r.ticker, b.name_cn, b.name_en, b.market,
+            r.scan_time, r.delta_magnitude, r.delta_description,
+            r.new_developments, r.deep_research_performed,
+            r.research_iterations, r.key_findings, r.news_timeline,
+            r.referenced_sources, r.should_alert, r.alert_confidence,
+            r.alert_rationale, r.full_analysis, r.snapshot_summary,
+            r.tokens_used, r.cost_cny, r.created_at
+        FROM portfolio_scan_results r
+        JOIN portfolio_scan_baselines b ON r.ticker = b.ticker
+        WHERE {where}
+        ORDER BY r.scan_time DESC
+        LIMIT :limit OFFSET :offset
+    """)
 
     try:
-        result = client.query(data_sql, parameters=params)
+        result = await db.execute(data_sql, params)
+        rows = result.all()
     except Exception as e:
-        logger.error("ClickHouse data query failed: %s", e)
+        logger.error("Breaking news data query failed: %s", e)
         return {"items": [], "total": 0, "error": str(e)}
 
-    items = []
-    for row in result.result_rows:
-        scan_time = row[6]
-        earliest = row[11]
-
-        items.append({
-            "id": row[0],
-            "ticker": row[1],
-            "name_cn": row[2],
-            "name_en": row[3],
-            "market": row[4],
-            "market_label": row[5],
-            "scan_time": scan_time.isoformat() if isinstance(scan_time, datetime) else str(scan_time),
-            "news_materiality": row[7],
-            "news_summary": row[8],
-            "new_developments": row[9] if isinstance(row[9], list) else [],
-            "novelty_status": row[10],
-            "earliest_report_time": earliest.isoformat() if isinstance(earliest, datetime) else None,
-            "deep_research_performed": bool(row[12]),
-            "research_iterations": row[13],
-            "key_findings": row[14] if isinstance(row[14], list) else [],
-            "news_timeline": _parse_json_safe(row[15]),
-            "referenced_sources": _parse_json_safe(row[16]),
-            "historical_precedents": _parse_json_safe(row[17]),
-            "alert_confidence": round(float(row[18]), 3),
-            "alert_rationale": row[19],
-            "sentiment": row[20],
-            "impact_magnitude": row[21],
-            "impact_timeframe": row[22],
-            "surprise_factor": round(float(row[23]), 3),
-            "bull_case": row[24],
-            "bear_case": row[25],
-            "recommended_action": row[26],
-            "tokens_used": row[27],
-            "cost_cny": round(float(row[28]), 4),
-            "created_at": row[29].isoformat() if isinstance(row[29], datetime) else str(row[29]),
-        })
-
+    items = [_row_to_item(row) for row in rows]
     return {"items": items, "total": total}
 
 
 @router.get("/breaking-news/summary")
 async def breaking_news_summary(
     user=Depends(get_current_boss_or_admin),
-    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
     hours: int = Query(168, ge=1, le=8760, description="Lookback window in hours"),
 ):
-    """Get per-ticker summary of breaking news counts and latest materiality.
+    """Per-ticker summary of breaking news counts and latest materiality.
 
-    Useful for the portfolio overview to show alert badges on each stock card.
+    Used by the portfolio overview to show alert badges on each stock card.
     """
-    client = _client(settings)
-    if not client:
-        return {"summary": {}}
-
-    db = settings.clickhouse_db
-
-    sql = f"""
-    SELECT
-        ticker,
-        count() AS news_count,
-        max(scan_time) AS latest_scan,
-        argMax(news_materiality, scan_time) AS latest_materiality,
-        argMax(sentiment, scan_time) AS latest_sentiment,
-        argMax(news_summary, scan_time) AS latest_summary
-    FROM {db}.portfolio_breaking_news FINAL
-    WHERE scan_time >= now() - INTERVAL {hours} HOUR
-    GROUP BY ticker
-    ORDER BY latest_scan DESC
-    """
+    sql = text(f"""
+        WITH ranked AS (
+            SELECT
+                r.ticker,
+                b.name_cn,
+                r.scan_time,
+                r.delta_magnitude,
+                r.full_analysis,
+                r.delta_description,
+                ROW_NUMBER() OVER (PARTITION BY r.ticker ORDER BY r.scan_time DESC) AS rn,
+                COUNT(*) OVER (PARTITION BY r.ticker) AS news_count
+            FROM portfolio_scan_results r
+            JOIN portfolio_scan_baselines b ON r.ticker = b.ticker
+            WHERE r.delta_detected = true
+              AND r.delta_magnitude IN ('material', 'critical')
+              AND r.scan_time >= NOW() - make_interval(hours => :hours)
+              {_SENTIMENT_FILTER}
+        )
+        SELECT ticker, name_cn, news_count, scan_time,
+               delta_magnitude, full_analysis, delta_description
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY scan_time DESC
+    """)
 
     try:
-        result = client.query(sql)
+        result = await db.execute(sql, {"hours": hours})
+        rows = result.all()
     except Exception as e:
-        logger.error("ClickHouse summary query failed: %s", e)
+        logger.error("Breaking news summary query failed: %s", e)
         return {"summary": {}}
 
     summary: dict[str, dict] = {}
-    for row in result.result_rows:
-        latest_scan = row[2]
-        summary[row[0]] = {
-            "news_count": row[1],
-            "latest_scan": latest_scan.isoformat() if isinstance(latest_scan, datetime) else str(latest_scan),
-            "latest_materiality": row[3],
-            "latest_sentiment": row[4],
-            "latest_summary": row[5][:200] if row[5] else "",
+    for row in rows:
+        analysis = _safe_json(row.full_analysis, {})
+        scan_time = row.scan_time
+        summary[row.ticker] = {
+            "news_count": row.news_count,
+            "latest_scan": scan_time.isoformat() if isinstance(scan_time, datetime) else str(scan_time or ""),
+            "latest_materiality": row.delta_magnitude or "none",
+            "latest_sentiment": analysis.get("sentiment", "neutral"),
+            "latest_summary": (row.delta_description or "")[:200],
         }
 
     return {"summary": summary}
+
+
+@router.get("/scanner-status")
+async def scanner_status(
+    user=Depends(get_current_boss_or_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Scanner health: last scan times, active stock count, recent alert count."""
+    sql = text("""
+        SELECT
+            COUNT(*) AS total_stocks,
+            COUNT(*) FILTER (WHERE last_scan_at >= NOW() - INTERVAL '2 hours') AS active_stocks,
+            MAX(last_scan_at) AS last_scan_at,
+            SUM(scan_count) AS total_scans,
+            SUM(alert_count) AS total_alerts,
+            COUNT(*) FILTER (WHERE last_alert_at >= NOW() - INTERVAL '24 hours') AS stocks_alerted_24h
+        FROM portfolio_scan_baselines
+    """)
+
+    try:
+        result = await db.execute(sql)
+        row = result.one_or_none()
+    except Exception as e:
+        logger.error("Scanner status query failed: %s", e)
+        return {"status": "error", "error": str(e)}
+
+    if not row or row.total_stocks == 0:
+        return {
+            "status": "inactive",
+            "total_stocks": 0,
+            "active_stocks": 0,
+            "last_scan_at": None,
+            "total_scans": 0,
+            "total_alerts": 0,
+            "stocks_alerted_24h": 0,
+        }
+
+    last_scan = row.last_scan_at
+    is_active = row.active_stocks > 0
+
+    return {
+        "status": "active" if is_active else "stale",
+        "total_stocks": row.total_stocks,
+        "active_stocks": row.active_stocks,
+        "last_scan_at": last_scan.isoformat() if isinstance(last_scan, datetime) else None,
+        "total_scans": row.total_scans or 0,
+        "total_alerts": row.total_alerts or 0,
+        "stocks_alerted_24h": row.stocks_alerted_24h or 0,
+    }

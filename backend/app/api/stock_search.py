@@ -76,14 +76,21 @@ async def suggest_stocks(
     q_upper = q.upper()
     q_lower = q.lower()
     results: list[dict] = []
-    seen: set[str] = set()
+    seen_names: set[str] = set()  # dedupe by canonical name across all sources
 
-    def _add(name: str, code: str, market: str, rank: int):
-        key = f"{code}|{name}"
-        if key in seen:
-            return
-        seen.add(key)
-        results.append({"name": name, "code": code, "market": market, "label": f"{name}({code})", "rank": rank})
+    def _canonicalize(code: str) -> str:
+        """Normalize a raw code to its canonical form.
+
+        HK stocks can arrive either as ``00100`` or ``00100.HK`` (the
+        verifier indexes both); we always present the ``.HK`` suffix so the
+        dropdown shows one row per listing.
+        """
+        if code.endswith((".SH", ".SZ", ".BJ", ".HK")):
+            return code
+        if code in verifier._hk_code_to_name:
+            # Numeric HK codes without the suffix.
+            return f"{code}.HK"
+        return code
 
     def _detect_market(code: str) -> str:
         """Determine market label from stock code."""
@@ -95,47 +102,89 @@ async def suggest_stocks(
         custom_market = verifier._custom_code_to_market.get(code) or verifier._custom_code_to_market.get(code.upper())
         if custom_market:
             return custom_market
+        # Bare numeric HK codes (pre-canonicalization) also fall here if
+        # they somehow escaped the normalizer.
+        if code in verifier._hk_code_to_name:
+            return "港股"
         return "美股"
+
+    def _add(name: str, code: str, market: str, rank: int):
+        # Canonicalize once here so every call site (exact, fuzzy, loop)
+        # gets a consistent code shape.
+        code = _canonicalize(code)
+        if market == "美股" and _detect_market(code) == "港股":
+            # Fix the market label if we canonicalized into a .HK suffix.
+            market = "港股"
+        key = f"{code}|{name}"
+        if key in seen_names:
+            return
+        # Also dedupe by (market, name) so "MINIMAX-W" under 港股 only shows once.
+        # A-share + US overlap on ticker is rare enough that name dedup is a
+        # net win for readability.
+        same_name_key = f"{market}|{name}"
+        if same_name_key in seen_names:
+            return
+        seen_names.add(key)
+        seen_names.add(same_name_key)
+        results.append({"name": name, "code": code, "market": market, "label": f"{name}({code})", "rank": rank})
 
     # --- Exact code match (highest priority) ---
     result = verifier._lookup_by_code(q_upper)
     if result:
-        _add(result[0], result[1], _detect_market(result[1]), 0)
+        name, code = result
+        _add(name, code, _detect_market(code), 0)
 
     # --- Exact name match ---
     result = verifier._lookup_by_name(q)
     if result:
-        _add(result[0], result[1], _detect_market(result[1]), 1)
+        name, code = result
+        _add(name, code, _detect_market(code), 1)
 
     # --- Prefix/substring matching across all lists ---
+    # Every block uses case-insensitive substring on the name so queries
+    # like "minimax" match HK listings like "MINIMAX-W". (Historically only
+    # the US block did this; HK/A/custom were case-sensitive, which meant
+    # newer HK listings that only have an uppercase English name were
+    # invisible to lower-case queries.)
+    def _name_matches(name: str) -> bool:
+        return q_lower in name.lower() or q in name
+
     # A-shares: match by code prefix or name substring
     for code, name in verifier._a_code_to_name.items():
         if "." not in code:
             continue  # skip bare codes, only use full codes
         if len(results) >= limit:
             break
-        if code.upper().startswith(q_upper) or q in name:
+        if code.upper().startswith(q_upper) or _name_matches(name):
             _add(name, code, "A股", 2)
 
     # US stocks
     for code, name in verifier._us_code_to_name.items():
         if len(results) >= limit:
             break
-        if code.upper().startswith(q_upper) or q_lower in name.lower() or q in name:
+        if code.upper().startswith(q_upper) or _name_matches(name):
             _add(name, code, "美股", 2)
 
-    # HK stocks
-    for code, name in verifier._hk_code_to_name.items():
+    # HK stocks — iterate by name so each listing is unique. The verifier
+    # stores each HK stock under two code keys (``00100`` and ``00100.HK``),
+    # which makes ``_hk_code_to_name`` return duplicates; the name→code map
+    # is already deduped. ``_add`` canonicalizes the code to the .HK form.
+    for name, bare_code in verifier._hk_name_to_code.items():
         if len(results) >= limit:
             break
-        if code.upper().startswith(q_upper) or q in name:
-            _add(name, code, "港股", 2)
+        full_code = bare_code if bare_code.endswith(".HK") else f"{bare_code}.HK"
+        if (
+            bare_code.upper().startswith(q_upper)
+            or full_code.upper().startswith(q_upper)
+            or _name_matches(name)
+        ):
+            _add(name, full_code, "港股", 2)
 
     # Custom/portfolio stocks (JP, KR, etc.)
     for code, name in verifier._custom_code_to_name.items():
         if len(results) >= limit:
             break
-        if code.upper().startswith(q_upper) or q in name:
+        if code.upper().startswith(q_upper) or _name_matches(name):
             _add(name, code, "其他", 2)
 
     # Sort: exact match first, then prefix, then substring

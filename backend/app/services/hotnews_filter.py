@@ -94,12 +94,12 @@ class HotNewsFilter:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.llm = AsyncOpenAI(
-            api_key=settings.minimax_api_key,
-            base_url=settings.minimax_base_url,
+            api_key=settings.llm_enrichment_api_key,
+            base_url=settings.llm_enrichment_base_url,
             timeout=30.0,
             http_client=httpx.AsyncClient(trust_env=False, timeout=30.0),
         )
-        self.model = settings.minimax_model
+        self.model = settings.llm_enrichment_model
         self._running = False
         self._task: asyncio.Task | None = None
 

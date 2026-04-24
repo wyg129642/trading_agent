@@ -3,7 +3,8 @@
 One-time script: backfill title_zh into news_items.metadata JSONB.
 
 Finds all rows where language != 'zh' and metadata->>'title_zh' is missing,
-then batch-translates the English titles via MiniMax API and writes back.
+then batch-translates the English titles via the configured enrichment LLM
+(OpenAI-compatible, e.g. Aliyun Bailian/DashScope) and writes back.
 
 Usage:
     python scripts/backfill_title_zh.py              # real run
@@ -38,11 +39,13 @@ DB_DSN = (
     f"/{os.getenv('POSTGRES_DB', 'trading_agent')}"
 )
 
-MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "")
-MINIMAX_BASE_URL = os.getenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
-MINIMAX_MODEL = os.getenv("MINIMAX_MODEL", "MiniMax-M2")
+ENRICHMENT_API_KEY = os.getenv("LLM_ENRICHMENT_API_KEY", "")
+ENRICHMENT_BASE_URL = os.getenv(
+    "LLM_ENRICHMENT_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+)
+ENRICHMENT_MODEL = os.getenv("LLM_ENRICHMENT_MODEL", "qwen-plus")
 
-# Fallback: OpenRouter (used when MiniMax is unavailable)
+# Fallback: OpenRouter (used when the enrichment LLM is unavailable)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL = "google/gemini-2.0-flash-001"
@@ -122,11 +125,11 @@ async def translate_batch(
     client: httpx.AsyncClient,
     titles: list[str],
 ) -> list[str]:
-    """Translate a batch of titles. Tries MiniMax first, falls back to OpenRouter."""
+    """Translate a batch of titles. Prefers OpenRouter, falls back to the enrichment LLM."""
     user_content = "\n".join(titles)
 
     payload = {
-        "model": MINIMAX_MODEL,
+        "model": ENRICHMENT_MODEL,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
@@ -135,17 +138,17 @@ async def translate_batch(
     }
 
     resp = None
-    # Prefer OpenRouter (more stable); fall back to MiniMax
+    # Prefer OpenRouter (more stable); fall back to the enrichment LLM
     if OPENROUTER_API_KEY:
         try:
             payload["model"] = OPENROUTER_MODEL
             resp = await _call_llm(client, OPENROUTER_BASE_URL, OPENROUTER_API_KEY, OPENROUTER_MODEL, payload)
         except Exception as e:
-            log.warning("OpenRouter failed (%s), falling back to MiniMax", e)
-            payload["model"] = MINIMAX_MODEL
-            resp = await _call_llm(client, MINIMAX_BASE_URL, MINIMAX_API_KEY, MINIMAX_MODEL, payload)
+            log.warning("OpenRouter failed (%s), falling back to enrichment LLM", e)
+            payload["model"] = ENRICHMENT_MODEL
+            resp = await _call_llm(client, ENRICHMENT_BASE_URL, ENRICHMENT_API_KEY, ENRICHMENT_MODEL, payload)
     else:
-        resp = await _call_llm(client, MINIMAX_BASE_URL, MINIMAX_API_KEY, MINIMAX_MODEL, payload)
+        resp = await _call_llm(client, ENRICHMENT_BASE_URL, ENRICHMENT_API_KEY, ENRICHMENT_MODEL, payload)
 
     data = resp.json()
     reply = data["choices"][0]["message"]["content"].strip()
@@ -175,8 +178,8 @@ async def translate_batch(
 # ---------------------------------------------------------------------------
 
 async def main(dry_run: bool = False) -> None:
-    if not MINIMAX_API_KEY:
-        log.error("MINIMAX_API_KEY is not set. Aborting.")
+    if not ENRICHMENT_API_KEY:
+        log.error("LLM_ENRICHMENT_API_KEY is not set. Aborting.")
         sys.exit(1)
 
     log.info("Connecting to database …")

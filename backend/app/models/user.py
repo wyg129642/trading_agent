@@ -35,6 +35,14 @@ class User(Base):
     last_login_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    # LLM cost governance — monthly USD cap and per-run hard cap. Null = use defaults
+    # from cost_estimation.DEFAULT_MONTHLY_BUDGET_USD. Admins can raise individually.
+    llm_budget_usd_monthly: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
+    llm_run_cap_usd: Mapped[float | None] = mapped_column(
+        Float, nullable=True,
+    )
 
     # Relationships
     watchlists: Mapped[list[Watchlist]] = relationship(

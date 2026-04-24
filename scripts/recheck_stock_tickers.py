@@ -53,15 +53,15 @@ async def get_db_session(settings):
 
 def create_verifier(settings) -> StockVerifier:
     llm = AsyncOpenAI(
-        api_key=settings.minimax_api_key,
-        base_url=settings.minimax_base_url,
+        api_key=settings.llm_enrichment_api_key,
+        base_url=settings.llm_enrichment_base_url,
         timeout=90.0,
         http_client=httpx.AsyncClient(trust_env=False, timeout=90.0),
     )
     verifier = StockVerifier(
         baidu_api_key=settings.baidu_api_key,
         llm_client=llm,
-        llm_model=settings.minimax_model,
+        llm_model=settings.llm_enrichment_model,
     )
     verifier.load_stock_lists()
     return verifier

@@ -161,9 +161,14 @@ class BaselineStore:
     # ------------------------------------------------------------------
 
     async def initialize_baseline(
-        self, ticker: str, name_cn: str, market: str, narrative: str = "",
+        self, ticker: str, name_cn: str, market: str,
+        name_en: str = "", narrative: str = "",
     ) -> StockBaseline:
-        """Create a fresh baseline for a stock (first-time setup)."""
+        """Create a fresh baseline for a stock (first-time setup).
+
+        Uses ON CONFLICT DO UPDATE for name_cn/name_en/market to keep
+        stock metadata up to date even if the baseline already exists.
+        """
         baseline = StockBaseline(
             ticker=ticker,
             last_scan_time=datetime.now(timezone.utc),
@@ -174,14 +179,20 @@ class BaselineStore:
         if pool:
             await pool.execute(
                 """INSERT INTO portfolio_scan_baselines
-                       (ticker, name_cn, market, last_scan_at, last_narrative,
+                       (ticker, name_cn, name_en, market, last_scan_at, last_narrative,
                         known_developments, known_content_ids, known_event_hashes,
                         sentiment_history,
                         scan_count, alert_count, updated_at)
-                   VALUES ($1, $2, $3, $4, $5, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb,
+                   VALUES ($1, $2, $3, $4, $5, $6, '[]'::jsonb, '[]'::jsonb, '[]'::jsonb,
                            '[]'::jsonb, 0, 0, now())
-                   ON CONFLICT (ticker) DO NOTHING""",
-                ticker, name_cn, market,
+                   ON CONFLICT (ticker) DO UPDATE SET
+                       name_cn = CASE WHEN EXCLUDED.name_cn != '' THEN EXCLUDED.name_cn
+                                      ELSE portfolio_scan_baselines.name_cn END,
+                       name_en = CASE WHEN EXCLUDED.name_en != '' THEN EXCLUDED.name_en
+                                      ELSE portfolio_scan_baselines.name_en END,
+                       market = CASE WHEN EXCLUDED.market != '' THEN EXCLUDED.market
+                                     ELSE portfolio_scan_baselines.market END""",
+                ticker, name_cn, name_en, market,
                 baseline.last_scan_time,
                 narrative,
             )
@@ -309,6 +320,7 @@ class BaselineStore:
                 "internal_sources": list(r.snapshot.internal_context.source_items.keys()),
                 "sentiment_dist": r.snapshot.internal_context.sentiment_distribution,
                 "novelty_status": r.novelty_status,
+                "earliest_report_time": r.earliest_report_time.isoformat() if r.earliest_report_time else None,
                 "historical_precedents": r.historical_precedents[:5],
             }, ensure_ascii=False),
             r.tokens_used,

@@ -3,7 +3,12 @@ import { useAuthStore } from '../store/auth'
 
 const api = axios.create({
   baseURL: '/api',
-  timeout: 30000,
+  // 60s default for regular JSON endpoints. Long-running calls (file
+  // uploads, multi-minute LLM chat, heavy search) must pass a per-request
+  // ``timeout`` override — uploads of up to 500 MB audio can take minutes
+  // and would otherwise be killed client-side while the backend is still
+  // receiving bytes.
+  timeout: 60000,
   headers: { 'Content-Type': 'application/json' },
 })
 

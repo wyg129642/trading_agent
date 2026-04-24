@@ -39,6 +39,18 @@ TAVILY_API_URL = "https://api.tavily.com/search"
 JINA_SEARCH_URL = "https://s.jina.ai/"
 JINA_READER_URL = "https://r.jina.ai/"
 
+# Jina (s.jina.ai / r.jina.ai) is blocked in China — needs proxy.
+# Tavily and Baidu are reachable directly — no proxy needed.
+_jina_proxy_cache: str | None = ""
+
+
+def _jina_proxy() -> str | None:
+    """Proxy for Jina APIs. Cached."""
+    global _jina_proxy_cache
+    if _jina_proxy_cache == "":
+        _jina_proxy_cache = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or None
+    return _jina_proxy_cache
+
 
 async def baidu_search(
     query: str,
@@ -69,7 +81,7 @@ async def baidu_search(
     }
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
             resp = await client.post(BAIDU_API_URL, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -140,7 +152,7 @@ async def tavily_search(
         payload["days"] = days
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
             resp = await client.post(TAVILY_API_URL, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -202,7 +214,7 @@ async def jina_search(
     url = JINA_SEARCH_URL + quote(query, safe="")
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, trust_env=False, proxy=_jina_proxy()) as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -270,7 +282,7 @@ async def jina_read_url(
     reader_url = JINA_READER_URL + url
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=30, trust_env=False, proxy=_jina_proxy()) as client:
             resp = await client.get(reader_url, headers=headers)
             resp.raise_for_status()
             data = resp.json()

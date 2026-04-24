@@ -44,6 +44,15 @@ class BacktestScheduler:
 
     async def _loop(self):
         """Main scheduler loop — checks if it's time to run backtest."""
+        # On startup, if the leaderboard data is stale (>36h), run a light
+        # refresh immediately so the UI has fresh rankings to show.
+        try:
+            if await self._is_leaderboard_stale(threshold_hours=36):
+                logger.info("BacktestScheduler: startup — leaderboard data is stale, running refresh")
+                await self._refresh_signal_evaluations(days=30)
+        except Exception:
+            logger.exception("BacktestScheduler: startup stale check failed")
+
         while not self._stop_event.is_set():
             try:
                 await self._check_and_run()
@@ -79,6 +88,21 @@ class BacktestScheduler:
             await self._run_backtest()
             self._last_run_date = today_str
 
+    async def _is_leaderboard_stale(self, threshold_hours: float) -> bool:
+        """Return True if the newest signal_evaluations.evaluated_at is older than threshold."""
+        from sqlalchemy import select, func
+        from backend.app.core.database import async_session_factory
+        from backend.app.models.leaderboard import SignalEvaluation
+
+        async with async_session_factory() as session:
+            last_eval = await session.scalar(select(func.max(SignalEvaluation.evaluated_at)))
+        if last_eval is None:
+            return True
+        if last_eval.tzinfo is None:
+            last_eval = last_eval.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - last_eval
+        return age.total_seconds() / 3600.0 > threshold_hours
+
     async def _run_backtest(self):
         """Execute the backtest pipeline."""
         import sys
@@ -91,12 +115,33 @@ class BacktestScheduler:
             from scripts.backfill_prices import backfill
             from scripts.fill_returns import fill_returns
 
-            logger.info("BacktestScheduler: Step 1/2 — backfilling prices (last 5 days)")
+            logger.info("BacktestScheduler: Step 1/3 — backfilling prices (last 5 days)")
             await backfill(days=5, dry_run=False)
 
-            logger.info("BacktestScheduler: Step 2/2 — filling returns")
+            logger.info("BacktestScheduler: Step 2/3 — filling returns")
             await fill_returns(days=None, dry_run=False)
+
+            logger.info("BacktestScheduler: Step 3/3 — updating signal_evaluations leaderboard")
+            await self._refresh_signal_evaluations()
 
             logger.info("BacktestScheduler: daily backtest update complete")
         except Exception:
             logger.exception("BacktestScheduler: backtest pipeline failed")
+
+    async def _refresh_signal_evaluations(self, days: int = 60) -> None:
+        """Populate/refresh the PostgreSQL signal_evaluations table.
+
+        Uses the same code path as ``POST /api/leaderboard/evaluate`` so the
+        source-accuracy leaderboard stays fresh without a manual trigger.
+        Runs in a fresh DB session scoped to this job.
+        """
+        from backend.app.core.database import async_session_factory
+        from backend.app.services.signal_evaluator import run_evaluation
+
+        async with async_session_factory() as session:
+            try:
+                summary = await run_evaluation(session, days=days)
+                logger.info("BacktestScheduler: signal_evaluations refresh %s", summary)
+            except Exception:
+                logger.exception("BacktestScheduler: signal_evaluations refresh failed")
+                await session.rollback()

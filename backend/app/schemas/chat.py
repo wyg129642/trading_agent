@@ -54,6 +54,7 @@ class ModelResponseData(BaseModel):
     rating: int | None = None
     rating_comment: str | None = None
     error: str | None = None
+    sources: list[dict] | None = None
     debate_round: int | None = None
     created_at: datetime
 
@@ -84,11 +85,36 @@ class SendMessageRequest(BaseModel):
     attachments: list[dict] = []
     system_prompt: str | None = None
     mode: str = "standard"  # standard | thinking | fast
-    web_search: bool = False  # enable web search for real-time info
+    web_search: str = "auto"  # "on" = always search, "off" = never, "auto" = LLM decides
+    alphapai_enabled: bool = True  # enable Alpha派投研工具
+    jinmen_enabled: bool = True  # enable 进门财经投研数据
+    kb_enabled: bool = True  # enable 内部知识库 (7个来源: alphapai+jinmen+meritco+thirdbridge+funda+gangtise+acecamp)
+    user_kb_enabled: bool = False  # enable 用户个人知识库 (用户上传的 PDF/文本/Markdown 等)
+    # Files dragged from the personal knowledge base workspace into the chat
+    # input. Each id points at a user_kb document the caller can read (own
+    # personal or any public doc). Content is inlined as a "Reference
+    # Documents" prefix on the user message before the LLM sees it.
+    kb_document_ids: list[str] = []
 
 class SendMessageResponse(BaseModel):
     message_id: str
     model_responses: list[ModelResponseData]
+
+
+class RegenerateRequest(BaseModel):
+    models: list[str] = Field(..., min_length=1)
+    system_prompt: str | None = None
+    mode: str = "standard"
+    web_search: str = "auto"
+    alphapai_enabled: bool = True
+    jinmen_enabled: bool = True
+    kb_enabled: bool = True
+    user_kb_enabled: bool = False
+    kb_document_ids: list[str] = []
+
+
+class SavePartialRequest(BaseModel):
+    partial_responses: dict[str, str]  # model_id -> partial content
 
 
 # ── Rating ──────────────────────────────────────────────────────
@@ -101,6 +127,68 @@ class RateResponse(BaseModel):
     id: str
     rating: int
     rating_comment: str | None
+
+
+# ── Detailed feedback ───────────────────────────────────────────
+
+class FeedbackSubmitRequest(BaseModel):
+    """Detailed qualitative feedback on a single model response.
+
+    At least one of `rating`, `feedback_tags`, or `feedback_text` must be
+    populated — an empty submission is rejected at the endpoint.
+    """
+    rating: int | None = Field(default=None, ge=1, le=5)
+    feedback_tags: list[str] = Field(default_factory=list, max_length=32)
+    feedback_text: str = Field(default="", max_length=4000)
+
+
+class FeedbackResponse(BaseModel):
+    id: str
+    response_id: str
+    rating: int | None
+    feedback_tags: list[str]
+    feedback_text: str
+    sentiment: str
+    processed: bool
+    created_at: datetime
+
+
+# ── User chat memory ────────────────────────────────────────────
+
+class MemoryResponse(BaseModel):
+    id: str
+    memory_type: str
+    memory_key: str
+    content: str
+    evidence: list[dict]
+    confidence_score: float
+    source_type: str
+    usage_count: int
+    is_active: bool
+    is_pinned: bool
+    last_used_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class MemoryListResponse(BaseModel):
+    memories: list[MemoryResponse]
+    total: int
+    total_active: int
+
+
+class MemoryUpdateRequest(BaseModel):
+    """Partial update on a memory. Only the fields the user touches are sent."""
+    is_active: bool | None = None
+    is_pinned: bool | None = None
+    content: str | None = Field(default=None, max_length=600)
+
+
+class MemoryCreateRequest(BaseModel):
+    memory_type: str
+    memory_key: str = Field(..., min_length=1, max_length=120)
+    content: str = Field(..., min_length=1, max_length=600)
+    is_pinned: bool = False
 
 
 # ── Prompt templates ────────────────────────────────────────────
@@ -169,9 +257,26 @@ class ExportResponse(BaseModel):
 
 class DebateRequest(BaseModel):
     content: str = Field(..., min_length=1, max_length=50000)
-    debate_models: list[str] = Field(..., min_length=2, max_length=3)
+    debate_models: list[str] = Field(..., min_length=2, max_length=6)
     attachments: list[dict] = []
     system_prompt: str | None = None
+    web_search: bool = False
+    debate_format: str = "bull_bear"  # "bull_bear" | "multi_perspective" | "round_robin"
+    num_rounds: int | None = None  # override auto-detection
+
+
+class DebateSummary(BaseModel):
+    conclusion: str = ""
+    rating: str = ""
+    confidence: int = 0
+    time_horizon: str = ""
+    key_bull_arguments: list[str] = []
+    key_bear_arguments: list[str] = []
+    consensus_points: list[str] = []
+    unresolved_questions: list[str] = []
+    action_items: list[str] = []
+    key_metrics_to_watch: list[str] = []
+    mentioned_tickers: list[str] = []
 
 
 # ── Tracking topics ────────────────────────────────────────────

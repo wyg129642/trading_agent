@@ -24,6 +24,10 @@ from backend.app.deps import get_current_user, get_db
 from backend.app.models.source import SourceHealth, UserSource
 from backend.app.models.user import User
 from backend.app.schemas.analytics import SourceHealthListResponse, SourceHealthResponse
+from backend.app.services.stock_quote import get_quotes
+from backend.app.services.consensus_forecast import fetch_consensus
+from fastapi import Request
+from dataclasses import asdict
 
 router = APIRouter()
 
@@ -200,6 +204,67 @@ async def list_portfolio_holdings(
             }
     holdings = list(seen.values())
     return {"holdings": holdings, "total": len(holdings)}
+
+
+@router.get("/portfolio/quotes")
+async def get_portfolio_quotes(
+    request: Request,
+    user: User = Depends(get_current_user),
+    refresh: bool = False,
+):
+    """Return realtime quote data for every portfolio holding.
+
+    Source routing: US → Alpaca IEX (realtime), A-shares → ClickHouse db_market
+    (realtime), HK/KR/JP/AU → yfinance (15-min delayed). Cached in Redis for 1
+    min. Pass `?refresh=true` to bypass the cache.
+    """
+    from backend.app.config import get_settings
+    raw = _load_portfolio_yaml()
+    pairs: dict[str, str] = {}
+    for s in raw:
+        ticker = s.get("stock_ticker", "")
+        if ticker and ticker not in pairs:
+            pairs[ticker] = s.get("stock_market", "")
+    redis = getattr(request.app.state, "redis", None)
+    quotes = await get_quotes(
+        list(pairs.items()),
+        redis=redis,
+        settings=get_settings(),
+        use_cache=not refresh,
+    )
+    return {"quotes": {k: asdict(v) for k, v in quotes.items()}, "total": len(quotes)}
+
+
+@router.get("/portfolio/consensus")
+async def get_portfolio_consensus(
+    request: Request,
+    user: User = Depends(get_current_user),
+    refresh: bool = False,
+):
+    """A-share analyst consensus forecast (一致预期) for every portfolio holding.
+
+    Source: Wind `ASHARECONSENSUS*` tables on 192.168.31.176 (read-only MySQL).
+    Non-A-share holdings are skipped. Cached in Redis for 30 min; pass
+    `?refresh=true` to bypass the cache.
+    """
+    from backend.app.config import get_settings
+    raw = _load_portfolio_yaml()
+    pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for s in raw:
+        ticker = s.get("stock_ticker", "")
+        market = s.get("stock_market", "")
+        if ticker and ticker not in seen:
+            seen.add(ticker)
+            pairs.append((ticker, market))
+    redis = getattr(request.app.state, "redis", None)
+    data = await fetch_consensus(
+        pairs,
+        settings=get_settings(),
+        redis=redis,
+        use_cache=not refresh,
+    )
+    return {"consensus": {k: asdict(v) for k, v in data.items()}, "total": len(data)}
 
 
 @router.get("/companies")

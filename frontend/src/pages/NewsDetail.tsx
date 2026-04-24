@@ -36,6 +36,7 @@ import relativeTime from 'dayjs/plugin/relativeTime'
 import api from '../services/api'
 import { useFavorites } from '../hooks/useFavorites'
 import FavoriteButton from '../components/FavoriteButton'
+import MarkdownRenderer from '../components/MarkdownRenderer'
 import { useAuthStore } from '../store/auth'
 
 dayjs.extend(relativeTime)
@@ -813,9 +814,9 @@ export default function NewsDetailPage() {
           {/* Summary + Key facts */}
           {a.summary && (
             <Card size="small" title={t('news.summary')} style={{ marginBottom: 16 }}>
-              <Paragraph style={{ marginBottom: a.key_facts?.length > 0 ? 0 : undefined }}>
-                {a.summary}
-              </Paragraph>
+              <div style={{ marginBottom: a.key_facts?.length > 0 ? 0 : undefined }}>
+                <MarkdownRenderer content={a.summary} />
+              </div>
               {a.key_facts?.length > 0 && (
                 <>
                   <Divider orientation="left" plain style={{ fontSize: 13 }}>
@@ -894,7 +895,7 @@ export default function NewsDetailPage() {
               <Text strong style={{ display: 'block', marginBottom: 4 }}>
                 {t('news.executiveSummary')}
               </Text>
-              <Paragraph style={{ marginBottom: 0 }}>{r.executive_summary}</Paragraph>
+              <MarkdownRenderer content={r.executive_summary} />
             </div>
           )}
 
@@ -904,7 +905,7 @@ export default function NewsDetailPage() {
                 <BulbOutlined style={{ marginRight: 4 }} />
                 {t('news.recommendedActions')}
               </Text>
-              <Paragraph style={{ marginBottom: 0 }}>{r.recommended_actions}</Paragraph>
+              <MarkdownRenderer content={r.recommended_actions} />
             </div>
           )}
 
@@ -986,18 +987,17 @@ export default function NewsDetailPage() {
                     key: 'content',
                     label: `${t('news.articleContent')} (${news.content.length.toLocaleString()} ${t('news.chars')})`,
                     children: (
-                      <Paragraph
+                      <div
                         style={{
                           maxHeight: 400,
                           overflow: 'auto',
-                          whiteSpace: 'pre-wrap',
                           marginBottom: 0,
                           fontSize: 13,
                           lineHeight: 1.8,
                         }}
                       >
-                        {news.content}
-                      </Paragraph>
+                        <MarkdownRenderer content={news.content} />
+                      </div>
                     ),
                   },
                 ]

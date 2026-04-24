@@ -24,8 +24,8 @@ from sqlalchemy import select, func
 async def main():
     settings = get_settings()
 
-    if not settings.minimax_api_key:
-        print("ERROR: minimax_api_key not configured. Cannot run enrichment.")
+    if not settings.llm_enrichment_api_key:
+        print("ERROR: llm_enrichment_api_key not configured. Cannot run enrichment.")
         sys.exit(1)
 
     from backend.app.services.jiuqian_processor import JiuqianProcessor

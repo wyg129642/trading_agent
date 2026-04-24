@@ -25,10 +25,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import re
 from typing import Any
 from urllib.parse import quote, urlparse
+
+import os
 
 import httpx
 
@@ -39,8 +40,26 @@ TAVILY_API_URL = "https://api.tavily.com/search"
 JINA_SEARCH_URL = "https://s.jina.ai/"
 JINA_READER_URL = "https://r.jina.ai/"
 
-# Overseas API endpoints need proxy from China mainland
-_PROXY_URL = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "http://127.0.0.1:7890"
+# ── Proxy routing ─────────────────────────────────────────────
+# Connectivity test results (from China, 2026-04-09):
+#   api.openai.com      → ConnectTimeout  → needs proxy
+#   openrouter.ai       → OK              → direct
+#   s.jina.ai / r.jina.ai → ConnectTimeout → needs proxy
+#   api.tavily.com      → OK              → direct
+#   qianfan.baidubce.com → OK             → direct (domestic)
+#
+# Proxy adds ~200ms latency; skip it for APIs reachable directly.
+
+_jina_proxy_cache: str | None = ""  # sentinel
+
+
+def _jina_proxy() -> str | None:
+    """Proxy for Jina APIs (s.jina.ai / r.jina.ai). Cached."""
+    global _jina_proxy_cache
+    if _jina_proxy_cache == "":
+        _jina_proxy_cache = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or None
+    return _jina_proxy_cache
+
 
 
 async def baidu_search(
@@ -143,7 +162,7 @@ async def tavily_search(
         payload["days"] = days
 
     try:
-        async with httpx.AsyncClient(timeout=30, proxy=_PROXY_URL) as client:
+        async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
             resp = await client.post(TAVILY_API_URL, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -175,6 +194,13 @@ async def tavily_search(
     except httpx.TimeoutException:
         logger.warning("Tavily search timeout for: %s", query[:50])
         return []
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403, 433):
+            logger.error("[TavilySearch] AUTH FAILURE (%d) — check API key! query='%s'",
+                         e.response.status_code, query[:50])
+        else:
+            logger.error("Tavily search failed for '%s': %s", query[:50], e)
+        return []
     except Exception as e:
         logger.error("Tavily search failed for '%s': %s", query[:50], e)
         return []
@@ -205,7 +231,7 @@ async def jina_search(
     url = JINA_SEARCH_URL + quote(query, safe="")
 
     try:
-        async with httpx.AsyncClient(timeout=30, proxy=_PROXY_URL) as client:
+        async with httpx.AsyncClient(timeout=30, trust_env=False, proxy=_jina_proxy()) as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -273,7 +299,7 @@ async def jina_read_url(
     reader_url = JINA_READER_URL + url
 
     try:
-        async with httpx.AsyncClient(timeout=30, proxy=_PROXY_URL) as client:
+        async with httpx.AsyncClient(timeout=30, trust_env=False, proxy=_jina_proxy()) as client:
             resp = await client.get(reader_url, headers=headers)
             resp.raise_for_status()
             data = resp.json()

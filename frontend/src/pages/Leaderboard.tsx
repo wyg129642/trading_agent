@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import {
+  Alert,
   Card,
   Table,
   Tag,
@@ -14,6 +15,7 @@ import {
   Progress,
   Segmented,
   InputNumber,
+  message,
 } from 'antd'
 import {
   TrophyOutlined,
@@ -22,11 +24,12 @@ import {
   FallOutlined,
   FireOutlined,
   ClockCircleOutlined,
+  ExclamationCircleOutlined,
 } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
 import api from '../services/api'
 
-const { Text, Title } = Typography
+const { Text } = Typography
 
 const CATEGORY_LABELS: Record<string, { en: string; zh: string }> = {
   analyst_research:   { en: 'Analyst Research',     zh: '券商研报' },
@@ -116,12 +119,36 @@ function ReturnCell({ value }: { value: number | null }) {
   )
 }
 
+// Treat null as "less than any number" so null rows sort to the bottom in
+// descending order — we care about the BEST sources, not the incomplete ones.
+const cmpNullable = (a: number | null, b: number | null) => {
+  if (a === null && b === null) return 0
+  if (a === null) return -1
+  if (b === null) return 1
+  return a - b
+}
+
+interface EvaluationStats {
+  total_evaluations: number
+  sources_evaluated: number
+  last_run: string | null
+  last_signal_time: string | null
+  hours_since_last_run: number | null
+  period_days: number
+  is_stale: boolean
+}
+
 export default function Leaderboard() {
-  const { t, i18n } = useTranslation()
+  const { i18n } = useTranslation()
   const lang = i18n.language === 'zh' ? 'zh' : 'en'
   const [data, setData] = useState<LeaderboardData | null>(null)
+  const [stats, setStats] = useState<EvaluationStats | null>(null)
   const [loading, setLoading] = useState(true)
-  const [days, setDays] = useState(7)
+  const [evaluating, setEvaluating] = useState(false)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
+  // Default to 30 days — short windows can be empty (T+5 not yet resolved)
+  // and 7-day data becomes fully stale after two weeks without a refresh.
+  const [days, setDays] = useState(30)
   const [minSignals, setMinSignals] = useState(3)
   const [categoryFilter, setCategoryFilter] = useState('')
   const [marketFilter, setMarketFilter] = useState('')
@@ -135,8 +162,9 @@ export default function Leaderboard() {
 
   const fetchLeaderboard = useCallback(async () => {
     setLoading(true)
+    setErrorMsg(null)
     try {
-      const params: any = { days, min_signals: minSignals }
+      const params: any = { days, min_signals: Math.max(1, minSignals) }
       if (categoryFilter) params.category = categoryFilter
       if (marketFilter) params.market = marketFilter
       if (minConfidence > 0) params.min_confidence = minConfidence
@@ -144,21 +172,62 @@ export default function Leaderboard() {
 
       // Use /quick endpoint for short periods (≤7 days), /leaderboard for longer
       const endpoint = days <= 7 ? '/leaderboard/quick' : '/leaderboard'
-      if (days <= 7) {
-        params.min_signals = Math.max(1, minSignals)
-      }
       const res = await api.get(endpoint, { params })
       setData(res.data)
-    } catch (e) {
+    } catch (e: any) {
       console.error(e)
+      const detail = e?.response?.data?.detail || e?.message || (lang === 'zh' ? '加载失败' : 'Failed to load')
+      setErrorMsg(String(detail))
     } finally {
       setLoading(false)
     }
-  }, [days, minSignals, categoryFilter, marketFilter, minConfidence, minScore])
+  }, [days, minSignals, categoryFilter, marketFilter, minConfidence, minScore, lang])
+
+  const fetchStats = useCallback(async () => {
+    try {
+      const res = await api.get<EvaluationStats>('/leaderboard/stats')
+      setStats(res.data)
+    } catch (e) {
+      // stats are advisory — don't block the page
+      console.error(e)
+    }
+  }, [])
+
+  const triggerEvaluation = useCallback(async () => {
+    if (evaluating) return
+    setEvaluating(true)
+    try {
+      const res = await api.post('/leaderboard/evaluate', null, {
+        params: { days: Math.max(7, days) },
+        timeout: 300000, // 5 min — evaluation can be slow (price fetches)
+      })
+      const { evaluated, updated, skipped, errors, total_signals_found } = res.data || {}
+      message.success(
+        lang === 'zh'
+          ? `评估完成：新增 ${evaluated} / 更新 ${updated} / 跳过 ${skipped} / 错误 ${errors}（共 ${total_signals_found}）`
+          : `Done: +${evaluated} / updated ${updated} / skipped ${skipped} / errors ${errors} (of ${total_signals_found})`,
+        6,
+      )
+      await Promise.all([fetchLeaderboard(), fetchStats()])
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail || e?.message || 'Failed'
+      if (e?.response?.status === 403) {
+        message.error(lang === 'zh' ? '需要管理员权限才能触发评估' : 'Admin role required to trigger evaluation')
+      } else {
+        message.error(String(detail))
+      }
+    } finally {
+      setEvaluating(false)
+    }
+  }, [days, evaluating, fetchLeaderboard, fetchStats, lang])
 
   useEffect(() => {
     fetchLeaderboard()
   }, [fetchLeaderboard])
+
+  useEffect(() => {
+    fetchStats()
+  }, [fetchStats])
 
   const columns = [
     {
@@ -202,7 +271,7 @@ export default function Leaderboard() {
       key: 'accuracy_t0',
       width: 110,
       render: (v: number | null) => <AccuracyCell value={v} />,
-      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => (a.accuracy_t0 || 0) - (b.accuracy_t0 || 0),
+      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => cmpNullable(a.accuracy_t0, b.accuracy_t0),
     },
     {
       title: lang === 'zh' ? '次日准确率' : 'T+1',
@@ -210,7 +279,7 @@ export default function Leaderboard() {
       key: 'accuracy_t1',
       width: 110,
       render: (v: number | null) => <AccuracyCell value={v} />,
-      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => (a.accuracy_t1 || 0) - (b.accuracy_t1 || 0),
+      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => cmpNullable(a.accuracy_t1, b.accuracy_t1),
     },
     {
       title: lang === 'zh' ? '5日准确率' : 'T+5',
@@ -218,7 +287,7 @@ export default function Leaderboard() {
       key: 'accuracy_t5',
       width: 110,
       render: (v: number | null) => <AccuracyCell value={v} />,
-      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => (a.accuracy_t5 || 0) - (b.accuracy_t5 || 0),
+      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => cmpNullable(a.accuracy_t5, b.accuracy_t5),
     },
     {
       title: lang === 'zh' ? '月度准确率' : 'T+20',
@@ -226,7 +295,7 @@ export default function Leaderboard() {
       key: 'accuracy_t20',
       width: 110,
       render: (v: number | null) => <AccuracyCell value={v} />,
-      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => (a.accuracy_t20 || 0) - (b.accuracy_t20 || 0),
+      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => cmpNullable(a.accuracy_t20, b.accuracy_t20),
     },
     {
       title: 'IC(T+1)',
@@ -234,7 +303,7 @@ export default function Leaderboard() {
       key: 'ic_t1',
       width: 75,
       render: (v: number | null) => <ICCell value={v} />,
-      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => (a.ic_t1 || 0) - (b.ic_t1 || 0),
+      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => cmpNullable(a.ic_t1, b.ic_t1),
     },
     {
       title: 'IC(T+5)',
@@ -242,7 +311,7 @@ export default function Leaderboard() {
       key: 'ic_t5',
       width: 75,
       render: (v: number | null) => <ICCell value={v} />,
-      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => (a.ic_t5 || 0) - (b.ic_t5 || 0),
+      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => cmpNullable(a.ic_t5, b.ic_t5),
     },
     {
       title: 'ICIR',
@@ -250,7 +319,7 @@ export default function Leaderboard() {
       key: 'icir',
       width: 70,
       render: (v: number | null) => <ICCell value={v} />,
-      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => (a.icir || 0) - (b.icir || 0),
+      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => cmpNullable(a.icir, b.icir),
     },
     {
       title: <span><RiseOutlined /> {lang === 'zh' ? '看多收益' : 'Bull Ret.'}</span>,
@@ -258,6 +327,7 @@ export default function Leaderboard() {
       key: 'avg_return_bullish',
       width: 90,
       render: (v: number | null) => <ReturnCell value={v} />,
+      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => cmpNullable(a.avg_return_bullish, b.avg_return_bullish),
     },
     {
       title: <span><FallOutlined /> {lang === 'zh' ? '看空收益' : 'Bear Ret.'}</span>,
@@ -265,6 +335,8 @@ export default function Leaderboard() {
       key: 'avg_return_bearish',
       width: 90,
       render: (v: number | null) => <ReturnCell value={v} />,
+      // Bear-signal ranking: lower (more negative) return = more accurate, so ascending sort
+      sorter: (a: LeaderboardEntry, b: LeaderboardEntry) => cmpNullable(a.avg_return_bearish, b.avg_return_bearish),
     },
     {
       title: <span><FireOutlined /> {lang === 'zh' ? '综合得分' : 'Score'}</span>,
@@ -296,8 +368,64 @@ export default function Leaderboard() {
     { value: 'global', label: lang === 'zh' ? '全球' : 'Global' },
   ]
 
+  const lastEvalDate = data?.last_evaluated ? new Date(data.last_evaluated) : null
+  const lastEvalLabel = lastEvalDate ? lastEvalDate.toLocaleString() : '-'
+  const isStale = stats?.is_stale ?? false
+  const hoursSince = stats?.hours_since_last_run ?? null
+  const staleMessage = (() => {
+    if (!isStale) return null
+    const hoursStr = hoursSince !== null ? hoursSince.toFixed(0) : '?'
+    if (lang === 'zh') {
+      return `数据已陈旧：上次评估在 ${hoursStr} 小时前。排行榜只覆盖到 ${lastEvalLabel}。点击"立即评估"更新最新数据。`
+    }
+    return `Data is stale — last evaluation was ${hoursStr}h ago (up to ${lastEvalLabel}). Click "Evaluate now" to refresh.`
+  })()
+  const emptyResults = !loading && !errorMsg && (data?.entries?.length ?? 0) === 0
+
   return (
     <div>
+      {errorMsg && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={lang === 'zh' ? '加载失败' : 'Failed to load'}
+          description={errorMsg}
+          closable
+          onClose={() => setErrorMsg(null)}
+        />
+      )}
+      {staleMessage && (
+        <Alert
+          type="warning"
+          showIcon
+          icon={<ExclamationCircleOutlined />}
+          style={{ marginBottom: 12 }}
+          message={staleMessage}
+          action={
+            <Button
+              size="small"
+              type="primary"
+              loading={evaluating}
+              onClick={triggerEvaluation}
+            >
+              {lang === 'zh' ? '立即评估' : 'Evaluate now'}
+            </Button>
+          }
+        />
+      )}
+      {emptyResults && !isStale && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={
+            lang === 'zh'
+              ? '当前筛选没有匹配的数据源。尝试增大回溯天数或降低最少信号数。'
+              : 'No sources match these filters. Try increasing the lookback window or lowering the minimum signal count.'
+          }
+        />
+      )}
       <Card style={{ marginBottom: 16 }}>
         <Row gutter={[16, 16]}>
           <Col xs={12} sm={6}>
@@ -316,7 +444,7 @@ export default function Leaderboard() {
           </Col>
           <Col xs={12} sm={6}>
             <Statistic
-              title={lang === 'zh' ? '最佳准确率' : 'Best Accuracy'}
+              title={lang === 'zh' ? '最佳综合得分' : 'Top Composite'}
               value={data?.entries?.[0]?.composite_score ? `${(data.entries[0].composite_score * 100).toFixed(1)}%` : '-'}
               prefix={<RiseOutlined />}
             />
@@ -324,8 +452,9 @@ export default function Leaderboard() {
           <Col xs={12} sm={6}>
             <Statistic
               title={lang === 'zh' ? '最后评估' : 'Last Evaluated'}
-              value={data?.last_evaluated ? new Date(data.last_evaluated).toLocaleDateString() : '-'}
+              value={lastEvalDate ? lastEvalDate.toLocaleDateString() : '-'}
               prefix={<ClockCircleOutlined />}
+              valueStyle={isStale ? { color: '#faad14' } : undefined}
             />
           </Col>
         </Row>
@@ -418,8 +547,26 @@ export default function Leaderboard() {
             >
               {lang === 'zh' ? '刷新' : 'Refresh'}
             </Button>
+            <Tooltip
+              title={
+                lang === 'zh'
+                  ? '对最近的新闻与券商信号重新评估（管理员权限；最长 5 分钟）'
+                  : 'Re-score recent signals against actual price moves (admin; up to ~5 min)'
+              }
+            >
+              <Button
+                size="small"
+                type="default"
+                loading={evaluating}
+                onClick={triggerEvaluation}
+              >
+                {lang === 'zh' ? '立即评估' : 'Evaluate now'}
+              </Button>
+            </Tooltip>
             <Text type="secondary" style={{ fontSize: 11 }}>
-              {lang === 'zh' ? '每日16:00自动评估' : 'Auto-evaluated daily 16:00'}
+              {lang === 'zh'
+                ? `每日 16:00 CST 自动评估${hoursSince !== null ? `（已 ${hoursSince.toFixed(0)}h 未刷新）` : ''}`
+                : `Auto-evaluates daily 16:00 CST${hoursSince !== null ? ` (last ${hoursSince.toFixed(0)}h ago)` : ''}`}
             </Text>
           </Space>
         </div>
