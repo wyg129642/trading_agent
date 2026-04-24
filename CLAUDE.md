@@ -177,52 +177,42 @@ All health/status `curl` calls use `--noproxy '*'` because the shell has `HTTP_P
 
 ## Tool Integration Details
 
-### AlphaPai (Alpha派)
-- Only uses `alphapai_recall` with types: comment, roadShow, report, ann
-- API key in `alphapai_service.py` ALPHAPAI_CONFIG
-- Client: `alphapai-skill/alphapai-research/scripts/alphapai_client.py`
-- Docs: `alphapai-skill/alphapai-research/SKILL.md`
-- `/api/platform-info` (and the frontend `PlatformInfo` / `JinmenPlatformInfo` / `GangtisePlatformInfo` pages) proxy the homepage widgets (hot searches, hot stocks, daily topics, institution-preferred stocks) from each platform's SPA API, using the crawler's saved credential — 20s in-process cache.
-
-### Jinmen (进门财经)
-- MCP 2.0 protocol over SSE + HTTP POST
-- Server: `https://mcp-server-global.comein.cn`
-- Tools are vector-DB backed — use natural language queries, not keyword/date pagination
-- Available tools: searchComeinResource, searchAnalystComments, searchRoadshowSummary, searchAnnouncementReport, searchForeignReports, get_main_business_segments, get_financial_snapshot
-- To list all tools: run MCP `tools/list` against the session URL
-
-### Web Search
-- 3 engines in parallel: Baidu (domestic, fast), Tavily (international), Jina (international, via proxy)
-- API keys in `.env`: BAIDU_API_KEY, TAVILY_API_KEY, JINA_API_KEY
-
 ### Knowledge Base — shared corpus (`kb_search` / `kb_fetch_document` / `kb_list_facets`)
-- **Phase A** (`kb_service.py`): metadata filter (ticker / date / doc_type / source) + in-memory char-bigram scoring across all 16 crawler collections concurrently. No embeddings.
-- **Phase B** (`kb_vector_query.py`): Milvus 2.5 hybrid search — dense top-100 (TEI Qwen3-Embedding-8B on jumpbox 192.168.31.224:8080) + BM25 top-100 via Milvus Function API, RRF-fused, per-doc cap=3 for diversity. Ingestion (`kb_vector_ingest.py`) is Markdown-aware + atomic-regex-guarded. Routing flag: `KB_SEARCH_LEGACY=True` rolls back to Phase A; `VECTOR_SYNC_ENABLED=False` disables the poller/delete-sweep/reaper.
-- Stack lives under `scripts/kb_vector/` (sweep/remove/status/verify CLIs) and `docker-compose.vector.yml` (etcd + MinIO + Milvus standalone, persisted to `/home/ygwang/crawl_data/milvus_data/`).
+- **Phase A** (`kb_service.py`): metadata filter (ticker / date / doc_type / source) + in-memory char-bigram scoring across all crawler collections concurrently. No embeddings.
+- **Phase B** (`kb_vector_query.py`): Milvus 2.5 hybrid search — dense top-100 (TEI Qwen3-Embedding-8B on jumpbox 192.168.31.224:8080) + BM25 top-100 via Milvus Function API, RRF-fused, per-doc cap=3 for diversity. Ingestion (`kb_vector_ingest.py`) is Markdown-aware + atomic-regex-guarded.
+- Phase A and Phase B run **in parallel** and merge via RRF — covers un-indexed new collections automatically (see `kb_search_consolidation_2026_04_24` memory). WeChat articles excluded by default via `CollectionSpec.low_quality` + Milvus `doc_type != "wechat_article"` filter.
+- Routing flags: `KB_SEARCH_LEGACY=True` rolls back to Phase A only; `VECTOR_SYNC_ENABLED=False` disables the poller/delete-sweep/reaper. Stack under `scripts/kb_vector/` + `docker-compose.vector.yml`.
 
 ### Personal Knowledge Base — per-team uploads (`user_kb_search` / `user_kb_fetch_document`)
-- User-uploaded files (PDF / MD / DOCX / XLSX / TXT / audio) parsed into chunks → MongoDB **`ti-user-knowledge-base`** on the shared ops cluster `192.168.31.176:35002` (u_spider auth, migrated 2026-04-23 from local `user_knowledge_base`; see the "Crawler data migrated to remote Mongo" memory for auth and scope). Collections: `documents`, `chunks`, `fs.files`, `fs.chunks`. All rows (and GridFS blobs via `metadata.user_id`) are scoped by `user_id` so one account never sees another's uploads — shared collections, not per-user collections, because Mongo's soft-limit on collection count and the per-DB GridFS bucket semantics make per-user fracturing a scaling trap. Dense vectors still live in Milvus `user_kb_chunks` (OpenAI `text-embedding-3-small`, 1536-dim).
+- User-uploaded files (PDF / MD / DOCX / XLSX / TXT / audio) parsed into chunks → remote Mongo `ti-user-knowledge-base` (see `user_kb_remote_mongo` memory). Collections `documents`, `chunks`, `fs.files`, `fs.chunks` — all rows and GridFS blobs scoped by `user_id` in shared collections (per-user collections would blow past Mongo's soft limit and split the GridFS bucket). Dense vectors in Milvus `user_kb_chunks` (OpenAI `text-embedding-3-small`, 1536-dim).
 - Folder tree in Postgres (`kb_folders`): `scope ∈ {personal, public}` × `folder_type ∈ {stock, industry, general}`, 6-level deep. First read auto-creates a "持仓股票" folder per user (gated by `user_preferences.kb_holdings_initialized_at`).
-- Audio path: upload → Qwen3-ASR service on jumpbox (via the `asr` SSH tunnel) → transcript → same chunk/index pipeline. Live progress (`parse_progress_percent`, `parse_phase`) surfaced in the `MyKnowledgeBase` UI. `asr_recovery_sweep_loop` re-enqueues pending audio every 60s when the tunnel recovers.
-- Shared across team members — `user_kb_search` is team-wide (not user-scoped), reflected in the tool's system prompt. BM25 stays available even if Milvus is unreachable (fail-open).
+- Audio path: upload → Qwen3-ASR service on jumpbox (via the `asr` SSH tunnel) → transcript → same chunk/index pipeline. Live progress surfaced in `MyKnowledgeBase` UI; `asr_recovery_sweep_loop` re-enqueues pending audio every 60s when the tunnel recovers.
+- Shared across team members — `user_kb_search` is team-wide (not user-scoped). BM25 stays available even if Milvus is unreachable (fail-open).
+
+### Web Search
+- 3 engines in parallel: Baidu (domestic, fast), Tavily (international), Jina (international, via proxy). API keys in `.env`: `BAIDU_API_KEY`, `TAVILY_API_KEY`, `JINA_API_KEY`.
+- `read_webpage` tool for LLM-initiated deep reads of specific URLs.
+
+### Platform homepage widgets
+- `/api/platform-info` proxies homepage widgets (hot searches, hot stocks, daily topics, institution-preferred stocks) from AlphaPai / Jinmen / Gangtise SPA APIs, using the crawler's saved credential — 20s in-process cache. Consumed by `PlatformInfo` / `JinmenPlatformInfo` / `GangtisePlatformInfo` pages.
 
 ## Crawler System
 
-Raw research data (analyst notes, expert calls, roadshow transcripts, earnings transcripts, WeChat articles, sentiment indicators, etc.) is scraped from **8 external platforms** (~18 parallel watcher variants). All crawlers live under `crawl/` and share a common architecture: one subdirectory + one `scraper.py` per platform, one MongoDB DB per platform (all at `localhost:27017`), one shared throttle module, one shared monitor, and a common Playwright auto-login skeleton.
+Raw research data (analyst notes, expert calls, roadshow transcripts, earnings transcripts, WeChat articles, sentiment indicators, etc.) is scraped from **8 external platforms** (~18 parallel watcher variants). All crawlers live under `crawl/` and share a common architecture: one subdirectory + one `scraper.py` per platform, one shared throttle module, one shared monitor, and a common Playwright auto-login skeleton. **Mongo target is the remote ops cluster `192.168.31.176:35002` (u_spider auth)** — migrated 2026-04-23 from localhost; PDFs now live in GridFS on each DB. See `crawler_data_remote_mongo` memory for the full DB-name mapping.
 
 **Data sources:**
 
-| Platform | Dir | Mongo DB | Collections | Auth mechanism |
+| Platform | Dir | Remote Mongo DB | Collections | Auth mechanism |
 |---|---|---|---|---|
-| AlphaPai (Alpha派) | `crawl/alphapai_crawl/` | `alphapai` | `roadshows`, `reports`, `comments`, `wechat_articles` | JWT bearer (localStorage `token`) |
-| Jinmen (进门财经) | `crawl/jinmen/` | `jinmen` | `meetings`, `reports`, `oversea_reports` | base64 JSON + AES-CBC response decryption |
-| Meritco (久谦中台) | `crawl/meritco_crawl/` | `meritco` | `forum` (type 2 pro + type 3 internal) | RSA-signed `X-My-Header` |
-| Third Bridge (高临咨询) | `crawl/third_bridge/` | `thirdbridge` | `interviews` | Full AWS Cognito cookie jar (hardest) |
+| AlphaPai (Alpha派) | `crawl/alphapai_crawl/` | `alphapai-full` | `roadshows`, `reports`, `comments`, `wechat_articles` | JWT bearer (localStorage `token`) |
+| Jinmen (进门财经) | `crawl/jinmen/` | `jinmen-full` | `meetings`, `reports`, `oversea_reports` | base64 JSON + AES-CBC response decryption |
+| Meritco (久谦中台) | `crawl/meritco_crawl/` | `jiuqian-full` | `forum` (type 2 pro + type 3 internal) | RSA-signed `X-My-Header` |
+| Third Bridge (高临咨询) | `crawl/third_bridge/` | `third-bridge` | `interviews` | Full AWS Cognito cookie jar (hardest) |
 | Funda (funda.ai US equities) | `crawl/funda/` | `funda` | `posts`, `earnings_reports`, `earnings_transcripts`, `sentiments` | `session-token` cookie (tRPC superjson) |
-| Gangtise (港推 HK) | `crawl/gangtise/` | `gangtise` | `summaries`, `researches`, `chief_opinions` | bearer (`G_token`); **CDN bans proxies — no proxy envs** |
+| Gangtise (港推 HK) | `crawl/gangtise/` | `gangtise-full` | `summaries`, `researches`, `chief_opinions` | bearer (`G_token`); **CDN bans proxies — no proxy envs** |
 | AceCamp | `crawl/AceCamp/` | `acecamp` | `articles`, `events` | Cookie 三件套 (`user_token` JWT 90d + Rails session 7d + `aceid`) |
 | AlphaEngine (阿尔法引擎) | `crawl/alphaengine/` | `alphaengine` | `summaries`, `china_reports`, `foreign_reports`, `news_items` | localStorage `token` JWT + `refresh_token` rotation |
-| SentimenTrader | `crawl/sentimentrader/` | `sentimentrader` | `indicators` (+ PNG assets) | email + password (Playwright-driven, daily) |
+| SentimenTrader | `crawl/sentimentrader/` | `funda.sentimentrader_indicators` | merged into funda DB (u_spider can't create new DBs) | email + password (Playwright-driven, daily) |
 
 **Shared CLI** — every `crawl/*/scraper.py` supports the same flags:
 
@@ -267,13 +257,7 @@ PYTHONPATH=. python3 scripts/enrich_tickers.py --incremental
 # coll.find({"_canonical_tickers": "NVDA.US"})
 ```
 
-**PDF storage (migrated 2026-04-17)** — large PDFs moved out of git to `/home/ygwang/crawl_data/`:
-
-- `alphapai_pdfs/`, `jinmen_pdfs/`, `gangtise_pdfs/`, `meritco_pdfs/`, `alphaengine_pdfs/`, `acecamp_pdfs/` (the few can_download articles), `sentimentrader_images/` (Highcharts PNGs)
-- `pdf_full/` — ~706 GB historical archive
-- `milvus_data/` — Milvus etcd + MinIO + data volumes for the vector stack
-
-Old `crawl/<platform>/pdfs` paths preserved as symlinks. Config in `backend/app/config.py`: `alphapai_pdf_dir`, `jinmen_pdf_dir`, `gangtise_pdf_dir`, `meritco_pdf_dir`, `alphaengine_pdf_dir`, `acecamp_pdf_dir` (env overrides `ALPHAPAI_PDF_DIR`, etc.).
+**PDF storage** — PDFs now live in **GridFS** on each platform's remote Mongo DB (`fs.files` / `fs.chunks`), `filename` is the original relative path (`alphapai_pdfs/2025-11/xxx.pdf`). `backend/app/services/pdf_storage.py::stream_pdf_or_file` is the unified reader: GridFS first, fall back to local disk for un-migrated new PDFs. Local `/home/ygwang/crawl_data/{alphapai,jinmen,gangtise,meritco,alphaengine,acecamp}_pdfs/` kept as rollback fallback; `pdf_full/` ~501 GB historical archive stays local; `milvus_data/` holds the vector-stack volumes.
 
 **Monitoring & orchestration:**
 
@@ -306,16 +290,13 @@ python3 crawl/crawler_monitor.py --web --port 8080
 
 Five stores, each with a distinct role:
 
-1. **PostgreSQL 16** — primary operational store. All user/app state (auth, watchlists, chat, predictions, alerts, KB folder tree, enriched mirrors of AlphaPai/Jiuqian). Async SQLAlchemy via `asyncpg`, pool 20 + 10 overflow, `pool_pre_ping=True`. Config: `database_url` in `backend/app/config.py`.
-2. **Redis 7** — rate-limit counters for open-API keys, login session state (`login:{platform}:{session_id}`), OTP relay, scraper PIDs, quote cache, consensus cache. `localhost:6379`.
-3. **MongoDB** — crawler output (8 platforms), personal KB, and the AI research session log all live on the shared remote cluster at `192.168.31.176:35002` (u_spider auth, DB scope listed in the crawler-migration memory). The research session log (`research_sessions`) is co-hosted inside the `ti-user-knowledge-base` DB as a sibling collection to `documents`/`chunks`/`fs.*` — u_spider can't create new DBs on the cluster, so the recorder lives inside an existing writable DB. Accessed by `*_db.py` routers and the KB / research-log services.
-4. **Milvus 2.5** (docker-compose.vector.yml, standalone + etcd + MinIO, persisted to `/home/ygwang/crawl_data/milvus_data/`) — hybrid vector + BM25 retrieval for the shared KB (`kb_chunks`, Qwen3-Embedding-8B 4096-dim) and the personal KB (`user_kb_chunks`, OpenAI `text-embedding-3-small` 1536-dim).
+1. **PostgreSQL 16** (`localhost:5432`) — primary operational store. All user/app state (auth, watchlists, chat, predictions, alerts, KB folder tree, enriched mirrors of AlphaPai/Jiuqian). Async SQLAlchemy via `asyncpg`, pool 20 + 10 overflow, `pool_pre_ping=True`. Config: `database_url` in `backend/app/config.py`.
+2. **Redis 7** (`localhost:6379`) — rate-limit counters for open-API keys, login session state (`login:{platform}:{session_id}`), OTP relay, scraper PIDs, quote cache, consensus cache.
+3. **Remote Mongo** at `192.168.31.176:35002` (u_spider auth) — crawler output (8 platforms, see table above), personal KB (`ti-user-knowledge-base`), and AI research session log (`ti-user-knowledge-base.research_sessions` — co-hosted in the KB DB because u_spider can't create new DBs). Accessed by `*_db.py` routers and the KB / research-log services.
+4. **Milvus 2.5** (`docker-compose.vector.yml`, standalone + etcd + MinIO, persisted to `/home/ygwang/crawl_data/milvus_data/`) — hybrid vector + BM25 retrieval. `kb_chunks` (Qwen3-Embedding-8B 4096-dim) for shared corpus; `user_kb_chunks` (OpenAI `text-embedding-3-small` 1536-dim) for personal KB.
 5. **ClickHouse** — optional OLAP / time-series (generic node disabled by default; `clickhouse_enabled=False`). Used by engine for backtesting + ticker sentiment aggregation. A **second** ClickHouse node at `192.168.31.137:38123` holds A-share klines (`db_market.t_realtime_kline_1m`, `t_adj_daily_data`) and is queried live by the portfolio dashboard when Futu is down.
 
-Plus two external MySQL/Mongo dependencies the backend reads from:
-
-- **Wind MySQL** at `192.168.31.176:3306` — `wind.ASHARECONSENSUS*` + `ASHARESTOCKRATINGCONSUSHIS` for A-share 一致预期. No indexes → 15s cold query, 30-min Redis cache, pre-warmed every 25 min.
-- **Remote Mongo** at `192.168.31.176:35002` — `u_spider:prod_X5BKVbAc?authSource=admin` — primary store for all crawler DBs, the personal KB (`ti-user-knowledge-base`), and the AI research session log (`ti-user-knowledge-base.research_sessions`, co-hosted in the same DB because u_spider can't create new DBs).
+Plus one external MySQL dependency: **Wind MySQL** at `192.168.31.176:3306` — `wind.ASHARECONSENSUS*` + `ASHARESTOCKRATINGCONSUSHIS` for A-share 一致预期. No indexes → 15s cold query, 30-min Redis cache, pre-warmed every 25 min.
 
 **PostgreSQL models** (`backend/app/models/`, one module per domain):
 
@@ -332,35 +313,15 @@ Plus two external MySQL/Mongo dependencies the backend reads from:
 - `source.py` — source config / health
 - `api_key.py` — `api_keys` (SHA256-hashed, per-key rate_limit)
 - `token_usage.py` — LLM cost tracking per stage (filter/analysis/research/enrich)
+- Plus feature-specific modules added as new surfaces land: `chat_memory.py`, `feedback.py`, `kb_skill_template.py`, `recipe.py`, `revenue_model.py`, etc. — check `backend/app/models/` for the current set.
 
-(Removed: `topic_cluster.py` / `TopicRadar` page / `/api/topic-radar` router — topic clustering was retired.)
+**Alembic migrations** — `backend/alembic/versions/` is the source of truth (`alembic history` to list, `alembic current` for DB state). Run migrations from repo root:
 
-**Alembic migrations** (`backend/alembic/versions/`, applied in prefix order):
-
-```
-92d81a4ce161  initial_schema
-5ddf6f55ba47  add_alphapai_tables
-a3f8e2c71b90  add_stock_fields
-b7c9d3e5f1a2  add_deep_research_data
-c4a2b1d9e3f7  add_user_favorites
-d5b3c2e8f4a1  add_concept_industry_tags
-d5e9f1a2b3c4  add_jiuqian_tables
-e6f4a3b5c7d8  add_topic_cluster_results
-f7a5b4c3d2e1  add_category_to_user_sources
-g8b6c5d4e3f2  add_signal_evaluations
-h9c7d6e5f4a3  add_ticker_sector_sentiments
-i1a2b3c4d5e6  add_multihorizon_signal_columns
-j2b3c4d5e6f7  add_chat_tables
-k3c4d5e6f7a8  add_prediction_tables
-l4d5e6f7a8b9  add_debate_and_tracking
-m5e6f7a8b9c0  add_api_keys_table
-n6f7a8b9c0d1  add_proactive_scan_tables
-o7g8h9i0j1k2  add_chat_recommended_questions
-p8h9i0j1k2l3  add_kb_folders
-q9i0j1k2l3m4  add_kb_holdings_init
+```bash
+PYTHONPATH=. alembic upgrade head
 ```
 
-Run from repo root: `PYTHONPATH=. alembic upgrade head` (see `alembic_invocation` memory — the conda `agent` env is required and Postgres is on 5432, not 5433).
+See `alembic_invocation` memory — the conda `agent` env is required and Postgres is on 5432, not 5433.
 
 **ClickHouse tables** (`engine/clickhouse_store.py`):
 
@@ -423,7 +384,7 @@ The dashboard's 持仓概览 also calls `consensus_forecast.fetch_consensus()` f
 
 ### Backend — FastAPI (`backend/app/main.py`)
 
-35 API routers mounted in `create_app()`, all under `/api/*`:
+API routers are mounted in `create_app()` under `/api/*`. Core set (check `main.py` for the current list — new routers are added as features land):
 
 | Router | Prefix | Purpose |
 |---|---|---|
@@ -465,7 +426,7 @@ The dashboard's 持仓概览 also calls `consensus_forecast.fetch_consensus()` f
 
 **Auth** — JWT access + refresh (`backend/app/api/auth.py` / `services/auth_service.py`). Frontend attaches `Authorization: Bearer` automatically (`frontend/src/services/api.ts`). 401 triggers logout + redirect. Role tiers: `user`, `boss`, `admin`. Route guards in `frontend/src/App.tsx`: `ProtectedRoute`, `AdminRoute`, `BossOrAdminRoute`.
 
-**Chat streaming** — `POST /api/chat/conversations/{id}/messages/stream` returns SSE `data: {json}` chunks. Fan-out is concurrent across every requested model; each model uses `call_model_stream_with_tools`, which loops many rounds calling `alphapai_recall`, `jinmen_*`, `web_search`, `read_webpage`, `kb_search`, `user_kb_search`. See "AI Chat Debug Logging" above for the per-request trace schema; every request is also persisted to MongoDB via `research_interaction_log.py`.
+**Chat streaming** — `POST /api/chat/conversations/{id}/messages/stream` returns SSE `data: {json}` chunks. Fan-out is concurrent across every requested model; each model uses `call_model_stream_with_tools`, which loops many rounds calling `kb_search`, `kb_fetch_document`, `user_kb_search`, `user_kb_fetch_document`, `web_search`, `read_webpage`. See "AI Chat Debug Logging" above for the per-request trace schema; every request is also persisted to MongoDB via `research_interaction_log.py`.
 
 **Lifespan background services** (`main.py` lifespan, in startup order):
 
