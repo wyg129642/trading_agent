@@ -45,12 +45,12 @@
 #   ./start_web.sh migrate         Run DB migrations
 #   ./start_web.sh init-staging    One-shot: CREATE DATABASE trading_agent_staging + migrate
 #   ./start_web.sh sync-users-from-prod
-#                                  Staging only. Copies users / user_preferences /
-#                                  user_sources / kb_folders / watchlists /
-#                                  watchlist_items from prod's Postgres DB so
-#                                  employees can log into staging with their
-#                                  normal credentials. Re-run after new users
-#                                  register in prod.
+#                                  Staging only. Manual fallback — the staging
+#                                  backend auto-runs this on boot and every 15
+#                                  min (see staging_user_sync.py), so under
+#                                  normal operation you never need to call this.
+#                                  Useful for forcing an immediate refresh
+#                                  without restarting the backend.
 # ==============================================================
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -915,9 +915,19 @@ run_migrations() {
 }
 
 sync_users_from_prod() {
-    # Copy user/auth + workspace-skeleton tables from prod's Postgres DB
-    # into staging's, so employees can log in to staging with their normal
-    # credentials and see their folder tree on the MyKnowledgeBase page.
+    # MANUAL FALLBACK. The backend already auto-runs this same sync on
+    # startup and then every 15 min via the lifespan task registered in
+    # `backend/app/services/staging_user_sync.py`, so under normal
+    # operation nobody needs to call this by hand.
+    #
+    # Use this shell path only when:
+    #   * you want to force an immediate refresh without restarting the
+    #     backend (rare), OR
+    #   * you need to diagnose the pipeline without the async indirection.
+    #
+    # Copies user/auth + workspace-skeleton tables from prod's Postgres
+    # DB into staging's, so employees can log in with their normal creds
+    # and see their folder tree on the MyKnowledgeBase page.
     # Runs inside the shared Postgres container via pg_dump | psql.
     #
     # Tables synced:

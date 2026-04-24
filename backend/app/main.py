@@ -453,6 +453,19 @@ async def lifespan(app: FastAPI):
 
     app.state.ab_distiller_task = _aio.create_task(_ab_distiller_cron())
 
+    # Staging-only: auto-mirror users + user_preferences + user_sources +
+    # kb_folders + watchlists + watchlist_items from prod Postgres into
+    # the staging DB. Runs once on boot (so employees can log in to a
+    # fresh staging instance with their prod credentials immediately),
+    # then every 15 min to pick up new signups / preference edits.
+    # See backend/app/services/staging_user_sync.py for the full rationale.
+    if settings.is_staging:
+        from backend.app.services.staging_user_sync import run_staging_user_sync_loop
+        app.state.staging_user_sync_task = _aio.create_task(
+            run_staging_user_sync_loop(interval_seconds=900)
+        )
+        logger.info("staging_user_sync: scheduled (interval=900s)")
+
     yield
 
     # Shutdown
@@ -472,6 +485,9 @@ async def lifespan(app: FastAPI):
     if task:
         task.cancel()
     task = getattr(app.state, "ab_distiller_task", None)
+    if task:
+        task.cancel()
+    task = getattr(app.state, "staging_user_sync_task", None)
     if task:
         task.cancel()
     try:
