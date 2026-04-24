@@ -78,11 +78,7 @@ Tool execution
 - `TOOL_EXEC_START/DONE` — per-tool execution timing and result preview
 - `TOOL_TIMEOUT` — when a tool exceeds its timeout
 - `WEB_SEARCH_TOOL_ENTRY/EXIT` — web search tool entry/exit markers
-- `ALPHAPAI_TOOL_ENTRY/EXIT/ERROR` — AlphaPai recall args + raw call
-- `ALPHAPAI_RESULTS` — structured: recall_types, per-type counts, top titles
-- `JINMEN_TOOL_ENTRY/EXIT/ERROR` — Jinmen wrapper entry/exit
-- `JINMEN_MCP_CALL` — underlying MCP tool name, http_status, latency, args
-- `JINMEN_RESULTS` — structured: item count, top items with title/institution/date/score/url
+- `KB_SEARCH_*` / `USER_KB_*` — kb_search / user_kb_search entry, phase A/B timing, result counts, top hits
 
 Gemini-specific flow
 - `ROUTE_GEMINI` / `GEMINI_ROUND_START` / `GEMINI_NO_FUNC_CALLS` / `GEMINI_SYNTHESIS_INJECTED` — Gemini routing events
@@ -107,11 +103,9 @@ grep "WEBPAGE_READ" logs/chat_debug.log
 grep "REQUEST_SUMMARY" logs/chat_debug.log -A 10
 ```
 
-**Code:** `backend/app/services/chat_debug.py` — the `ChatTrace` class and `setup_chat_debug_logging()`. Trace emission is wired through `chat_llm.py`, `web_search_tool.py`, `alphapai_service.py`, `jinmen_service.py`, and the underlying `src/tools/web_search.py` engines.
+**Code:** `backend/app/services/chat_debug.py` — the `ChatTrace` class and `setup_chat_debug_logging()`. Trace emission is wired through `chat_llm.py`, `web_search_tool.py`, `kb_service.py`, `user_kb_service.py`, and the underlying `src/tools/web_search.py` engines.
 
-Parallel to the live debug log, every request is also persisted to MongoDB as a `research_sessions` document by `backend/app/services/research_interaction_log.py` and replayed by the admin-only `/admin/research-logs` page. Target is the remote ops cluster `mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002` DB **`ti-user-knowledge-base`** collection **`research_sessions`** (co-hosted in the KB database because u_spider has no permission to create new DBs on the cluster; the collection is isolated from the KB's `documents`/`chunks`/`fs.*`). Writes are best-effort; connection failures degrade to a no-op so the chat path never blocks on logging.
-
-Staging writes to `stg_research_sessions` in the same DB instead (collection name comes from `Settings.research_sessions_collection` which is env-aware).
+Parallel to the live debug log, every request is also persisted to remote Mongo as a `research_sessions` document by `backend/app/services/research_interaction_log.py` and replayed by the admin-only `/admin/research-logs` page. Target collection: `ti-user-knowledge-base.research_sessions` (prod) / `ti-user-knowledge-base.stg_research_sessions` (staging). Writes are best-effort — connection failures degrade to a no-op so the chat path never blocks on logging.
 
 ## Key Architecture
 
@@ -119,11 +113,10 @@ Staging writes to `stg_research_sessions` in the same DB instead (collection nam
 - **Chat API:** `backend/app/api/chat.py` — SSE streaming endpoint at `/chat/conversations/{id}/messages/stream`
 - **LLM Service:** `backend/app/services/chat_llm.py` — routes to OpenRouter (Claude), Google native API (Gemini), OpenAI native API (GPT)
 - **Chat Tool Services** (all tool-callable from the LLM):
-  - `alphapai_service.py` — AlphaPai recall (comment/roadShow/report/ann)
-  - `jinmen_service.py` — Jinmen MCP vector-search tools
-  - `web_search_tool.py` — Baidu + Tavily + Jina web search
-  - `kb_service.py` / `kb_vector_query.py` — Phase A/B 团队共享知识库 (filter-first BM25 then hybrid BM25+dense via Milvus)
+  - `kb_service.py` / `kb_vector_query.py` — unified `kb_search` / `kb_fetch_document` / `kb_list_facets` across all 8 crawler platforms (parallel Phase A keyword + Phase B Milvus hybrid, RRF-merged)
   - `user_kb_service.py` / `user_kb_tools.py` — per-team personal knowledge base (`user_kb_search`, `user_kb_fetch_document`)
+  - `web_search_tool.py` — Baidu + Tavily + Jina web search + `read_webpage`
+  - `alphapai_service.py` / `jinmen_service.py` — **retired to deprecation shims** (2026-04-24). `*_TOOLS = []`, frontend `alphapai_enabled` / `jinmen_enabled` toggles now coerce `kb_enabled=True` for backward compat.
 - **Quote Service:** `backend/app/services/stock_quote.py` routes tickers to `quote_providers/` (Futu primary, Alpaca/ClickHouse/yfinance fallbacks); 90s Redis cache, warmed every 60s by the lifespan loop in `main.py`
 - **Consensus Forecast:** `backend/app/services/consensus_forecast.py` pulls A-share 一致预期 from Wind MySQL `ASHARECONSENSUS*` tables (30-min Redis cache, re-warmed every 25 min; see Wind memory)
 - **Frontend:** React + Vite at `frontend/`, built to `frontend/dist/`
