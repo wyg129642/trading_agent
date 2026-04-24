@@ -98,6 +98,7 @@ crawl/*/debug_html/
 crawl/*/credentials.lock
 crawl/logs_monitor_health.json
 crawl/jinmen/_progress_oversea_summary.json
+crawl/jinmen/_progress_oversea_direct.json
 crawl/meritco_crawl/pdfs/
 
 # Vendored novnc (large, not in hot path — install on demand)
