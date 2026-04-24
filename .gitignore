@@ -18,12 +18,24 @@ __pycache__/
 *.pyo
 venv/
 .venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Vite / TypeScript
+node_modules/
+frontend/dist/
+frontend/dist-staging/
+frontend/tsconfig.tsbuildinfo
 
 # 日志和数据
 logs/
 data/
 *.log
 reprocess.log
+nohup.out
+*.pid
 
 # IDE
 .vscode/
@@ -48,3 +60,44 @@ settings.local.json
 # .env.staging.example — those ARE committed)
 .env.production
 .env.staging
+
+# ---- Large crawler / research artifacts (regenerable, not source code) ----
+# Raw crawler dumps that get materialized by scrapers — no need in git.
+comment-jinmen/
+comment-jinmen.jsonl
+downloaded_reports/
+jinmen-store/
+jinmen-full-pdf-mndj-report/
+jinmen_api_samples/
+alphapai_recall_samples/
+alphapai-research.zip
+test_news/
+
+# Claude skill bundles (per-user, per-machine)
+alphapai-skill/
+kb-api-skill/
+
+# Top-level secondary scraper kit — source stays tracked, but data/
+# and credentials/test dumps are local-only.
+meritco_crawl/data/
+meritco_crawl/credentials.json
+meritco_crawl/test_detail.json
+meritco_crawl/test_list.json
+meritco_crawl/js/node_modules/
+
+# Vendored novnc (large, not in hot path — install on demand)
+vendor/novnc/
+
+# Backend scratch workspace — experimental alembic for vector store, not the
+# real alembic/ directory. Keep it local for now; re-add when stabilised.
+backend/alembic_vector/
+
+# Personal/internal artifacts that should not enter git
+姚泾河-接口说明书.pdf
+重点股票.xlsx
+
+# Work-in-progress dev notes (not shipped)
+REVENUE_MODELING_PROGRESS.md
+
+# Twitter/X experimental scraper — scratch only, outside main pipeline
+twitter_playwright.py
