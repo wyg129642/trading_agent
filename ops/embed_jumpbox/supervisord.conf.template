@@ -1,0 +1,47 @@
+; supervisord config for the Qwen3-Embedding-8B jumpbox service.
+;
+; Rendered by install_embed_jumpbox.sh with concrete paths substituted in.
+; ${HOME} and ${EMBED_API_KEY} are interpolated at install time; after that
+; this is a plain supervisord config (no runtime env expansion required).
+
+[unix_http_server]
+file=${HOME}/embed/run/supervisor.sock
+chmod=0700
+
+[supervisord]
+logfile=${HOME}/embed/logs/supervisord.log
+logfile_maxbytes=50MB
+logfile_backups=5
+loglevel=info
+pidfile=${HOME}/embed/run/supervisord.pid
+nodaemon=false
+minfds=4096
+minprocs=200
+childlogdir=${HOME}/embed/logs
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix://${HOME}/embed/run/supervisor.sock
+
+[program:qwen3embed]
+command=${HOME}/embed/venv/bin/python ${HOME}/embed/server.py
+directory=${HOME}/embed
+autostart=true
+autorestart=true
+; Model load is ~60s on a cold A100. Set startsecs wide enough that a slow but
+; successful start doesn't look like flapping.
+startsecs=60
+startretries=10
+stopwaitsecs=60
+stopsignal=TERM
+; CUDA_VISIBLE_DEVICES pins to GPU 2: GPU 0 historically had ECC issues and
+; GPU 1 is reserved for the ASR service. GPU 2 is the free slot.
+environment=EMBED_HOST="0.0.0.0",EMBED_PORT="8080",EMBED_MODEL_PATH="${HOME}/models/Qwen3-Embedding-8B",CUDA_VISIBLE_DEVICES="2",EMBED_API_KEY="${EMBED_API_KEY}",EMBED_DTYPE="bfloat16",EMBED_MAX_SEQ_LEN="2048",EMBED_MAX_BATCH_SIZE="32",EMBED_MAX_BATCH_TOKENS="16384",PYTHONUNBUFFERED="1"
+stdout_logfile=${HOME}/embed/logs/embed.log
+stderr_logfile=${HOME}/embed/logs/embed.err
+stdout_logfile_maxbytes=100MB
+stdout_logfile_backups=10
+stderr_logfile_maxbytes=50MB
+stderr_logfile_backups=10

@@ -1,0 +1,40 @@
+# Peer comps for optical modules — used by MARGIN_CASCADE and sanity_check peer_sanity.
+
+peers:
+  - ticker: LITE.US
+    name: Lumentum
+    role: primary
+    segments: ["cloudlight_modules", "eml_cw", "telecom", "industrial"]
+
+  - ticker: COHR.US
+    name: Coherent
+    role: peer
+    segments: ["network_optics", "laser_chips", "display", "industrial"]
+
+  - ticker: AAOI.US
+    name: Applied Optoelectronics
+    role: peer
+    segments: ["cable_tv", "datacenter_modules", "telecom"]
+
+  - ticker: CIEN.US
+    name: Ciena
+    role: peer
+    segments: ["optical_networking", "routing_switching"]
+
+  - ticker: INLT.US
+    name: Innolight
+    role: peer
+    note: "Private in China — volume leader in 800G/1.6T"
+
+typical_ranges:
+  gross_margin: [0.25, 0.55]
+  operating_margin: [0.00, 0.40]
+  net_margin: [-0.05, 0.35]
+  rev_yoy: [-0.30, 2.00]
+
+recent_guidance_summary:
+  LITE.US:
+    FY26_revenue_guidance: "Non-telecom business up 30-40% YoY; cloud segment material acceleration"
+    FY26_margin_trajectory: "Operating margin expanding 500-700 bps on volume leverage"
+  COHR.US:
+    FY26_revenue_guidance: "Networking +35-40% YoY; Materials/Laser stable"

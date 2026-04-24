@@ -1,0 +1,51 @@
+; supervisord config for the Qwen3-ASR jumpbox service.
+;
+; Rendered by install_asr_jumpbox.sh with concrete paths substituted in.
+; ${HOME} and ${ASR_API_KEY} are interpolated at install time; after that
+; this is a plain supervisord config (no runtime env expansion required).
+
+[unix_http_server]
+file=${HOME}/asr/run/supervisor.sock
+chmod=0700
+
+[supervisord]
+logfile=${HOME}/asr/logs/supervisord.log
+logfile_maxbytes=50MB
+logfile_backups=5
+loglevel=info
+pidfile=${HOME}/asr/run/supervisord.pid
+nodaemon=false
+minfds=4096
+minprocs=200
+childlogdir=${HOME}/asr/logs
+
+[rpcinterface:supervisor]
+supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface
+
+[supervisorctl]
+serverurl=unix://${HOME}/asr/run/supervisor.sock
+
+[program:qwen3asr]
+command=${HOME}/asr/venv/bin/python ${HOME}/asr/server.py
+directory=${HOME}/asr
+autostart=true
+autorestart=true
+; Give the model time to load before declaring the process "started" — if we
+; flap during a 10s load we'd churn the GPU. startsecs is the window in which
+; a clean exit counts as a crash; 20 s is comfortable.
+startsecs=20
+startretries=10
+; On shutdown give uvicorn a chance to drain queued jobs before a hard kill.
+stopwaitsecs=60
+stopsignal=TERM
+; GPU 0 on this host has 150+ uncorrectable ECC errors (hardware fault).
+; Pinning to GPU 1 until that card is replaced / reset. The TEI embedding
+; service (if redeployed) also needs to avoid GPU 0 — see jumpbox
+; nvidia-smi for ECC volatile counts.
+environment=ASR_HOST="127.0.0.1",ASR_PORT="8760",ASR_MODEL_PATH="${HOME}/models/Qwen3-ASR-1.7B",CUDA_VISIBLE_DEVICES="1",ASR_API_KEY="${ASR_API_KEY}",PYTHONUNBUFFERED="1"
+stdout_logfile=${HOME}/asr/logs/asr.log
+stderr_logfile=${HOME}/asr/logs/asr.err
+stdout_logfile_maxbytes=100MB
+stdout_logfile_backups=10
+stderr_logfile_maxbytes=50MB
+stderr_logfile_backups=10

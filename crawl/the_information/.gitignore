@@ -1,0 +1,7 @@
+credentials.json
+credentials.lock
+playwright_data/
+logs/
+debug_screenshots/
+debug_network.jsonl
+debug_network.*.jsonl

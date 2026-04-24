@@ -49,6 +49,40 @@ TIMEFRAME_CN = {
 }
 
 
+def _fmt_age(hours: float) -> str:
+    """Format an age in hours as a compact human string.
+
+    Rounding rules match the UI (Portfolio.tsx timeAgo): <60min shown as
+    minutes, <24h as hours, else days.
+    """
+    if hours < 0:
+        hours = 0.0
+    if hours < 1:
+        return f"{int(hours * 60)}分钟前"
+    if hours < 24:
+        return f"{int(hours)}小时前"
+    return f"{int(hours / 24)}天前"
+
+
+def _resolve_display_novelty(result, analysis: dict) -> str:
+    """Pick the novelty label to render.
+
+    The freshness gate sets `rejection_reason=event_too_old` in
+    full_analysis and forces `novelty_status=stale` on the result, so we
+    prefer the result's post-gate novelty_status over whatever the LLM
+    originally said. If event_age_hours is known and large but the gate
+    didn't rewrite novelty (e.g. corroborated story), we still downgrade
+    a "verified_fresh" claim to "likely_fresh" to avoid overclaiming.
+    """
+    status = result.novelty_status or analysis.get("novelty_status") or ""
+    if analysis.get("rejection_reason") == "event_too_old":
+        return "stale"
+    age = analysis.get("event_age_hours")
+    if isinstance(age, (int, float)) and age >= 48 and status == "verified_fresh":
+        return "likely_fresh"
+    return status
+
+
 def _price_link(ticker: str, market: str) -> str:
     if market == "china":
         code = ticker.split(".")[0] if "." in ticker else ticker
@@ -125,7 +159,11 @@ class ProactiveAlertFormatter:
         sources = analysis.get("sources", [])
         timeline = result.news_timeline
         timeframe = analysis.get("impact_timeframe", "short_term")
-        novelty_status = result.novelty_status
+        # Event-freshness gate (freshness_gate.py) overrides LLM novelty_status
+        # when the underlying event is provably stale. We always prefer the
+        # computed event age over the LLM's qualitative label.
+        novelty_status = _resolve_display_novelty(result, analysis)
+        event_age_hours = analysis.get("event_age_hours")
 
         mag_icon = MAGNITUDE_ICONS.get(magnitude, "")
         sent_icon = SENTIMENT_ICONS.get(sentiment, "")
@@ -191,6 +229,9 @@ class ProactiveAlertFormatter:
             "stale": "⚠️ 可能旧闻",
             "repackaged": "❌ 旧闻重包装",
         }.get(novelty_status, novelty_status)
+
+        if isinstance(event_age_hours, (int, float)):
+            novelty_label = f"{novelty_label} (事件 {_fmt_age(event_age_hours)})"
 
         assess_lines = [
             f"方向: {sent_icon} {sent_cn} | 信心度: {confidence:.0%} | 新鲜度: {novelty_label}",

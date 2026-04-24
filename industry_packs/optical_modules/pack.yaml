@@ -1,0 +1,33 @@
+slug: optical_modules
+name: 光通信
+display_name_en: Optical Modules
+display_name_zh: 光通信/光模块
+description: |
+  Optical transceiver manufacturers — datacenter connectivity 400G/800G/1.6T modules,
+  EML and CW laser chips, co-packaged optics (CPO), optical circuit switches (OCS),
+  DCI, legacy telecom and industrial.
+ticker_patterns:
+  - "LITE.US"
+  - "COHR.US"
+  - "AAOI.US"
+  - "INLT.US"       # Innolight (private but comparable)
+  - "CIEN.US"
+  - "AXTI.US"       # substrates
+default_periods:
+  - "FY25E"
+  - "FY26E"
+  - "FY27E"
+units:
+  currency: "USD"
+  revenue: "亿美元"
+  volume_count: "万颗"
+  volume_module: "万块"
+  volume_substrate: "万片"
+  asp_module: "美元"
+  asp_chip: "美元"
+margin_basis: "operating_margin"   # EBIT or EBITDA; here EBIT (operating)
+tax_rate_default: 0.15
+tags:
+  - semi
+  - optics
+  - AI-infra

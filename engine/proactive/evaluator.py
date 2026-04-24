@@ -21,6 +21,7 @@ from engine.proactive.models import (
     StockBaseline,
     StockSnapshot,
 )
+from engine.proactive.freshness_gate import enforce_event_freshness
 from engine.proactive.prompts import (
     TRIAGE_ROUND1_SYSTEM_PROMPT,
     TRIAGE_ROUND2_SYSTEM_PROMPT,
@@ -679,6 +680,18 @@ class StockEvaluator:
         result.news_summary = assessment.get("summary", result.news_summary)
         total_tokens += assessment.get("tokens_used", 0)
         total_cost += assessment.get("cost_cny", 0.0)
+
+        # Apply event-freshness hard gate — overrides LLM novelty_status
+        # and suppresses alerts where the underlying event is too old and
+        # no recent corroborating source exists.
+        gate_outcome = enforce_event_freshness(result, novelty_hours=self._novelty_hours)
+        if gate_outcome.get("enforced"):
+            logger.info(
+                "[Proactive:%s] Freshness gate suppressed alert: age=%.1fh > %dh",
+                holding.ticker,
+                gate_outcome.get("event_age_hours") or 0.0,
+                self._novelty_hours,
+            )
 
         # Apply confidence gate (0.8 threshold)
         if result.should_alert and result.alert_confidence < self._alert_confidence_min:

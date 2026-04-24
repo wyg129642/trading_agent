@@ -1,0 +1,52 @@
+# Numeric sanity bounds for optical-modules models.
+#
+# Values outside these bounds emit a SanityIssue; "error" severity blocks
+# the RecipeRun from completing, "warn" is just surfaced on the UI.
+
+# Ranges are (min, max) inclusive. Use nulls for unbounded.
+
+margin:
+  operating_margin:
+    range: [-0.05, 0.55]      # optical module industry historical
+    severity: warn
+  net_margin:
+    range: [-0.10, 0.45]
+    severity: warn
+  gross_margin:
+    range: [0.10, 0.65]
+    severity: warn
+
+yoy:
+  revenue:
+    range: [-0.40, 3.00]      # capped at 300% yoy
+    severity: warn
+  asp:
+    range: [-0.30, 0.50]
+    severity: warn
+  volume:
+    range: [-0.30, 3.00]
+    severity: warn
+
+ratios:
+  pe:
+    range: [2.0, 200.0]
+    severity: warn
+  price_to_sales:
+    range: [0.2, 30.0]
+    severity: info
+
+# Absolute bounds for reality checks
+absolute:
+  module_asp_usd:
+    400g: [100, 500]
+    800g: [300, 1500]
+    1_6t: [500, 3000]
+  chip_asp_usd:
+    100g_eml: [3, 15]
+    200g_eml: [10, 30]
+    cw_laser: [1, 10]
+
+# Structural
+structural:
+  segment_sum_tolerance: 0.005   # revenue sum of segments vs total — 0.5% allowed
+  period_monotonicity_check: false  # periods need not be monotone (bear case OK)

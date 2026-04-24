@@ -1,0 +1,8 @@
+# Credentials — never commit
+credentials.json
+.env
+
+# Crawled data
+data/
+*.log
+test_*.json

@@ -1,0 +1,13 @@
+# Credentials — never commit
+credentials.json
+.env
+
+# Runtime artifacts
+*.log
+__pycache__/
+*.pyc
+pdfs/
+
+# Debug dumps
+debug_*.json
+test_*.json

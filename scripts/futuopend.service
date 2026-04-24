@@ -1,0 +1,18 @@
+[Unit]
+Description=Futu OpenD gateway (HK/US quote source for trading_agent)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/ygwang/futuopend/start.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:/tmp/futu_opend.log
+StandardError=append:/tmp/futu_opend.log
+# OpenD is stateful (trusts this device, holds session) — don't let systemd kill it aggressively
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

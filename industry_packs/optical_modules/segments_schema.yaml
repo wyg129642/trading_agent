@@ -1,0 +1,125 @@
+# Optical Modules — canonical business-segment skeleton.
+#
+# This skeleton is the strict structural contract that the DECOMPOSE_SEGMENTS
+# step targets. Real companies may have subsets or renamings (e.g. LITE uses
+# "Cloudlight" instead of "光模块"), but the recipe maps them to this schema.
+#
+# Format: list of segment blocks. Each block is either:
+#   * leaf (has volume + asp)
+#   * aggregator (sum of children)
+
+segments:
+  - slug: module_400g
+    label_zh: 400G光模块
+    label_en: 400G optical module
+    kind: module
+    volume_unit: 万块
+    asp_unit: 美元
+    volume_driver_hint: "客户 hyperscaler 需求;对应 400G 交换机部署节奏"
+    price_driver_hint: "成熟 CWDM4/DR4 市场,每年 -5% 到 -15%"
+
+  - slug: module_800g
+    label_zh: 800G光模块
+    label_en: 800G optical module
+    kind: module
+    volume_unit: 万块
+    asp_unit: 美元
+    volume_driver_hint: "AI 训练集群: GPU/TPU 对应 800G 接入占比"
+    price_driver_hint: "量产初期有折扣,成熟后年降 10-20%"
+
+  - slug: module_1_6t
+    label_zh: 1.6T光模块
+    label_en: 1.6T optical module
+    kind: module
+    volume_unit: 万块
+    asp_unit: 美元
+    volume_driver_hint: "26-27 年 NVIDIA Blackwell/Rubin + Google TPUv7 部署"
+    price_driver_hint: "2026 首发高定价,随良率改善降价"
+
+  - slug: chip_eml_cw
+    label_zh: EML+CW 光芯片
+    label_en: EML + CW laser chips
+    kind: chip
+    subchildren:
+      - slug: eml_100g
+        label_zh: 100G EML
+        volume_unit: 万颗
+        asp_unit: 美元
+      - slug: eml_200g
+        label_zh: 200G EML
+        volume_unit: 万颗
+        asp_unit: 美元
+      - slug: cw_laser
+        label_zh: CW 激光器
+        volume_unit: 万颗
+        asp_unit: 美元
+
+  - slug: ocs
+    label_zh: OCS 光路开关
+    label_en: Optical Circuit Switch
+    kind: product
+    revenue_directly: true
+    volume_driver_hint: "Google 等云服务商 OCS 采购;目前 3 客户各 $100M/Q 潜力"
+
+  - slug: cpo
+    label_zh: CPO 共封装光学
+    label_en: Co-packaged Optics
+    kind: product
+    revenue_directly: true
+    volume_driver_hint: "NVIDIA CPO 路线进度;专家口径约 100 万颗粒 2026"
+
+  - slug: dci
+    label_zh: DCI 光模块/子系统
+    label_en: Data-Center Interconnect
+    kind: product
+    revenue_directly: true
+
+  - slug: legacy_comms
+    label_zh: 传统通信
+    label_en: Legacy Communications
+    kind: product
+    revenue_directly: true
+    growth_profile_hint: "stable"
+
+  - slug: industrial
+    label_zh: 工业/其他
+    label_en: Industrial / Other
+    kind: product
+    revenue_directly: true
+    growth_profile_hint: "stable"
+
+# Operating model rows (applied by MARGIN_CASCADE step)
+margin_rows:
+  - slug: total_revenue
+    label: Total revenue
+    derivation: "sum of segment revenues"
+    unit: 亿美元
+  - slug: operating_margin
+    label: Operating margin
+    unit: "%"
+    value_type: percent
+    typical_range: [0.15, 0.45]
+  - slug: ebit
+    label: EBIT
+    formula_template: "=total_revenue * operating_margin"
+    unit: 亿美元
+  - slug: net_margin
+    label: Net margin
+    unit: "%"
+    value_type: percent
+    hint: "management guidance or peer comp; ~net/gross × gross_margin"
+  - slug: ni
+    label: Net income
+    formula_template: "=ebit * (1 - tax_rate)"
+    unit: 亿美元
+  - slug: shares
+    label: Shares outstanding
+    unit: 亿股
+  - slug: eps
+    label: EPS
+    formula_template: "=ni / shares"
+    unit: USD
+  - slug: pe
+    label: PE
+    formula_template: "=price / eps"
+    unit: 倍
