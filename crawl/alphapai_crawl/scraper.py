@@ -102,11 +102,14 @@ COL_ACCOUNT = "account"
 COL_STATE = "_state"  # checkpoint / 当日统计
 
 # 研报 PDF 下载目录 (可被 --pdf-dir 或 env ALPHAPAI_PDF_DIR 覆盖).
-# 2026-04-17: 从 crawl/alphapai_crawl/pdfs 迁移到 /home/ygwang/crawl_data/alphapai_pdfs
-# 以把大文件隔离在项目外; 老路径保留 symlink 做后向兼容.
+# 2026-04-17: 从 crawl/alphapai_crawl/pdfs 迁移到 /home/ygwang/crawl_data/alphapai_pdfs.
+# 2026-04-24: 再次迁移到 /mnt/share/ygwang/alphapai_pdfs (SMB 共享盘, 跨机可见,
+# 67T 容量). 老 /home/ygwang/crawl_data/alphapai_pdfs 仍保留历史文件供 backend
+# 后向兼容读取 (见 backend/app/services/pdf_storage.py 的 pdf_root 多 root 支持).
+# env ALPHAPAI_PDF_DIR (.env 已配) 照常覆盖默认.
 PDF_DIR_DEFAULT = os.environ.get(
     "ALPHAPAI_PDF_DIR",
-    "/home/ygwang/crawl_data/alphapai_pdfs",
+    "/mnt/share/ygwang/alphapai_pdfs",
 )
 
 OK_CODE = 200000  # AlphaPai 成功码 (不是 0)
@@ -775,11 +778,63 @@ def fetch_list_paginated(session, cfg: dict, max_items: Optional[int],
 
 _SAFE_FNAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
+# Linux ext4 文件名上限 = 255 字节 (NOT chars). UTF-8 中文每字 3 字节, 200 字 ≈ 600 字节,
+# 远超上限 → OSError(Errno 36). 留 14 字节余量给 ".pdf" + 极端字符宽度.
+_FNAME_MAX_BYTES = 240
+
+
+def _truncate_to_bytes(s: str, max_bytes: int = _FNAME_MAX_BYTES) -> str:
+    """按 UTF-8 字节宽度截断字符串, 不会截到半个字符."""
+    if not s:
+        return s
+    encoded = s.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return s
+    # 二分截到一个完整 UTF-8 边界 (errors='ignore' 砍掉断尾的不完整字节)
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
 
 def _safe_filename(name: str, max_len: int = 200) -> str:
-    """把任意字符串清成合法文件名 (保留中文, 去掉 / : 等)."""
+    """把任意字符串清成合法文件名 (保留中文, 去掉 / : 等).
+
+    既限字符数 (`max_len`) 又限 UTF-8 字节宽度 (`_FNAME_MAX_BYTES`),
+    后者防 OSError(Errno 36) 在中文/日文文件名上炸盘.
+    """
     cleaned = _SAFE_FNAME_RE.sub("_", name).strip().strip(".")
-    return cleaned[:max_len] or "untitled"
+    cleaned = cleaned[:max_len]
+    cleaned = _truncate_to_bytes(cleaned, _FNAME_MAX_BYTES)
+    return cleaned or "untitled"
+
+
+# 把 pdf_error 字符串映射到稳定的 kind, 与 backend/app/api/alphapai_db.py
+# 的 _classify_pdf_error 保持一致. 主要用途: dump_one 在 --resume 时跳过
+# 永久性失败 (permission_denied) 的 re-fetch, 不浪费 API 配额.
+def classify_pdf_error_kind(err: str | None) -> str:
+    if not err:
+        return "none"
+    s = str(err)
+    low = s.lower()
+    # 2026-04-24: 探测发现 detail/pdf 真实拒绝原因是 code=810002 "今日外资报告
+    # 查看上限" (账号 tier=0/day). 不传 originType 时服务端降级返回 10222.
+    # 两类同等不可重试.
+    if "code=810002" in s or "上限" in s:
+        return "quota_exhausted"
+    if "code=10222" in s or "无权限查看" in s:
+        return "permission_denied"
+    if "file name too long" in low or "errno 36" in low:
+        return "filename_too_long"
+    if any(m in low for m in (
+            "chunkedencodingerror", "broken pipe", "connectionerror",
+            "ssl", "eof", "timeout", "timed out",
+            "connection reset", "remote disconnected")):
+        return "transient_network"
+    if "code=404" in s or "code=400404" in s or "empty_data" in s:
+        return "not_found"
+    if s.startswith("relpath_err"):
+        return "relpath_unknown"
+    if s.startswith("download_err"):
+        return "download_unknown"
+    return "unknown"
 
 
 def fetch_report_pdf_relpath(session: requests.Session, raw_id: str,
@@ -822,10 +877,21 @@ def download_report_pdf(session: requests.Session, relpath: str, token: str,
     """下载 PDF 到本地文件. 返回 (bytes_written, err_message).
 
     对 SSL EOF / 网络抖动重试 (alphapai-storage 经常在中途关连接).
+
+    2026-04-24 加固 (SMB 共享盘 /mnt/share/ygwang/alphapai_pdfs):
+      - 写入时同时捕获前 4 字节, 不再 re-open 读 magic — 避免 CIFS
+        actimeo=1/closetimeo=1 短缓存窗口里 .part 暂时不可见的 race
+        (今早 5 条 read_back_err: [Errno 2] No such file 都源于此).
+      - 显式 flush + os.fsync + 文件关闭后再 rename, 强制 CIFS commit.
+      - tmpfile 名带 PID + 随机后缀, 防止两个 watcher 撞同一 dest 互删 .part.
+      - rename 用 os.replace, 跨 CIFS 比 Path.rename 更稳 (POSIX semantics).
     """
+    import os, secrets
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     url = build_pdf_url(relpath, token)
-    tmp = dest_path.with_suffix(dest_path.suffix + ".part")
+    # 进程独占的 .part 后缀, 避免多 watcher 撞 dest_path 时互删彼此的临时文件.
+    suffix = f".{os.getpid()}.{secrets.token_hex(4)}.part"
+    tmp = dest_path.with_suffix(dest_path.suffix + suffix)
     last_err = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -848,12 +914,23 @@ def download_report_pdf(session: requests.Session, relpath: str, token: str,
             return 0, last_err
         ctype = (r.headers.get("Content-Type") or "").lower()
         total = 0
+        head = b""
         try:
             with open(tmp, "wb") as f:
                 for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
-                        total += len(chunk)
+                    if not chunk:
+                        continue
+                    if not head:
+                        head = chunk[:4]  # capture magic during write — no re-read needed
+                    f.write(chunk)
+                    total += len(chunk)
+                # CIFS 安全: flush 用户态缓冲 → fsync 推到远端 → 关闭. 不依赖
+                # 后续 open() 来读回, 因为 CIFS 短缓存可能还没让新 inode 可见.
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass  # fsync 不支持的 FS (罕见, 不致命)
         except (requests.RequestException, IOError) as e:
             r.close()
             try: tmp.unlink(missing_ok=True)
@@ -863,17 +940,16 @@ def download_report_pdf(session: requests.Session, relpath: str, token: str,
             _THROTTLE.sleep_before_next()
             continue
         r.close()
-        # magic check (PDF 必须以 %PDF 开头)
-        try:
-            with open(tmp, "rb") as f:
-                head = f.read(4)
-        except IOError as e:
-            return 0, f"read_back_err: {e}"
         if head != b"%PDF":
             try: tmp.unlink(missing_ok=True)
             except Exception: pass
             return 0, f"not_pdf ctype={ctype} head={head!r}"
-        tmp.rename(dest_path)
+        try:
+            os.replace(tmp, dest_path)  # POSIX-atomic rename, 比 Path.rename 在 CIFS 上更稳
+        except OSError as e:
+            try: tmp.unlink(missing_ok=True)
+            except Exception: pass
+            return 0, f"rename_err: {e}"
         return total, None
     return 0, last_err or "exhausted retries"
 
@@ -899,7 +975,12 @@ def _pdf_dest_path(pdf_dir: Path, publish_time: str, relpath: str,
 
 def enrich_report_doc(session, doc: dict, item: dict, pdf_dir: Path,
                       token: str, download: bool = True) -> None:
-    """给研报 doc 附加 pdf_rel_path / pdf_local_path / pdf_size / pdf_error."""
+    """给研报 doc 附加 pdf_rel_path / pdf_local_path / pdf_size / pdf_error.
+
+    成功时清掉旧的 pdf_error / pdf_error_kind, 失败时同时写入 kind 标记 ——
+    后者让 dump_one 的 --resume re-fetch 决策能跳过 permission_denied 这种
+    永远不会成功的错误, 不浪费 API 配额.
+    """
     if not item.get("pdfFlag"):
         doc["pdf_flag"] = False
         return
@@ -908,7 +989,9 @@ def enrich_report_doc(session, doc: dict, item: dict, pdf_dir: Path,
     version = item.get("version") or item.get("originalVersion") or 1
     relpath, err = fetch_report_pdf_relpath(session, raw_id, version)
     if err or not relpath:
-        doc["pdf_error"] = f"relpath_err: {err}"
+        msg = f"relpath_err: {err}"
+        doc["pdf_error"] = msg
+        doc["pdf_error_kind"] = classify_pdf_error_kind(msg)
         return
     doc["pdf_rel_path"] = relpath
     if not download:
@@ -918,13 +1001,19 @@ def enrich_report_doc(session, doc: dict, item: dict, pdf_dir: Path,
     if dest.exists() and dest.stat().st_size > 0:
         doc["pdf_local_path"] = str(dest)
         doc["pdf_size"] = dest.stat().st_size
+        doc["pdf_error"] = ""
+        doc["pdf_error_kind"] = "none"
         return
     size, derr = download_report_pdf(session, relpath, token, dest)
     if derr:
-        doc["pdf_error"] = f"download_err: {derr}"
+        msg = f"download_err: {derr}"
+        doc["pdf_error"] = msg
+        doc["pdf_error_kind"] = classify_pdf_error_kind(msg)
         return
     doc["pdf_local_path"] = str(dest)
     doc["pdf_size"] = size
+    doc["pdf_error"] = ""
+    doc["pdf_error_kind"] = "none"
 
 
 # -------------------- Mongo 存储 --------------------
@@ -946,11 +1035,19 @@ def dump_one(session, db, category_key: str, cfg: dict, item: dict,
     if not force:
         ex = col.find_one({"_id": dedup_id},
                           {"_id": 1, "content": 1, "pdf_size": 1, "pdf_error": 1,
-                           "pdf_flag": 1, "content_truncated": 1, "hasPermission": 1})
+                           "pdf_error_kind": 1, "pdf_flag": 1,
+                           "content_truncated": 1, "hasPermission": 1})
         if ex:
-            # 研报: 已入库但 PDF 下载失败过 → 重试
+            # 研报: 已入库但 PDF 下载失败过 → 重试 (除了永久无权限).
+            # 老数据没有 pdf_error_kind 字段, 在这里现场分类一次, 让历史的
+            # 21k 条 code=10222 doc 也能被识别为 permission_denied 并跳过,
+            # 不然 --resume 每次都重新打 detail/pdf 接口浪费配额.
+            ex_kind = ex.get("pdf_error_kind") or classify_pdf_error_kind(
+                ex.get("pdf_error") or "")
             if category_key == "report" and ex.get("pdf_flag") \
-                    and not ex.get("pdf_size") and pdf_dir is not None and download_pdf:
+                    and not ex.get("pdf_size") and pdf_dir is not None \
+                    and download_pdf \
+                    and ex_kind not in ("permission_denied", "quota_exhausted"):
                 pass  # fall through to re-fetch
             # 研报: 之前 detail 因"已达到今日查看上限"返回 400000, 标了
             # content_truncated=True → 下次再扫时尝试重拉, 跨天配额重置后可拿到内容
@@ -1593,8 +1690,9 @@ def parse_args():
                         "/reading/report/detail?id=...&version=... 拉取文本后 upsert. "
                         "不下 PDF, 不刷新列表, 适合修复 2026-04 平台变化前入库的数据.")
     # 反爬节流 (crawl/antibot.py) — platform 字符串供 SoftCooldown / AccountBudget 用
+    # 2026-04-25 default_cap 500 → 0: 实时档不再靠数量闸防跑飞, 见 antibot.py 顶部 §5/§6.
     add_antibot_args(p, default_base=3.0, default_jitter=2.0,
-                     default_burst=40, default_cap=500, platform="alphapai")
+                     default_burst=40, default_cap=0, platform="alphapai")
     return p.parse_args()
 
 

@@ -40,6 +40,7 @@ import {
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import api from '../services/api'
+import { useAuthStore } from '../store/auth'
 
 dayjs.extend(relativeTime)
 
@@ -52,6 +53,19 @@ function fmtReportTime(t: string | null | undefined): string {
   if (!t) return '—'
   return t.endsWith(' 00:00') ? t.slice(0, 10) : t
 }
+
+// PDF 状态分类 — 对齐 backend/app/api/alphapai_db.py::_classify_pdf_error
+// 决定 UI 显示哪种 Tag, 是否提供"重试"按钮.
+type PdfErrorKind =
+  | 'none'
+  | 'permission_denied'
+  | 'quota_exhausted'
+  | 'filename_too_long'
+  | 'transient_network'
+  | 'not_found'
+  | 'relpath_unknown'
+  | 'download_unknown'
+  | 'unknown'
 
 interface Item {
   id: string
@@ -75,6 +89,14 @@ interface Item {
   market_name: string | null
   crawled_at: string | null
   core_viewpoint?: string
+  // PDF 状态 (仅 report 类目): 后端在 _normalize_item 里 merge 进来.
+  // 老接口/非 report 文档可能缺字段, 因此都标 optional.
+  pdf_flag?: boolean
+  pdf_available?: boolean
+  pdf_error?: string
+  pdf_error_kind?: PdfErrorKind
+  pdf_error_human?: string
+  pdf_retryable?: boolean
 }
 
 // 研报分区列表 — 和 /reading/home/point 页面左侧保持一致
@@ -116,12 +138,20 @@ interface StatsResponse {
 
 interface DetailResponse extends Item {
   content: string
+  // 外资研报的双语字段 — 平台 list_item 自带 titleCn / contentCn 翻译, PDF 受
+  // tier 限制锁住时, 这是 AlphaPai SPA 同款的可读替代.
+  title_cn: string | null
+  content_cn: string | null
   pdf_local_path: string | null
   pdf_size: number | null
   raw_id: string | null
 }
 
 export default function AlphaPaiReports() {
+  // PDF 重试按钮只对 admin/boss 显示 (后端也用同款守门 dep, 这里只是 UI 优雅).
+  const userRole = useAuthStore((s) => s.user?.role)
+  const isBossOrAdmin = userRole === 'admin' || userRole === 'boss'
+
   const [stats, setStats] = useState<StatsResponse | null>(null)
   const [statsLoading, setStatsLoading] = useState(true)
   const [statsError, setStatsError] = useState<string | null>(null)
@@ -203,6 +233,27 @@ export default function AlphaPaiReports() {
     } catch (err: any) {
       const msg = err?.response?.data?.detail || err?.message || '下载失败'
       message.error(`下载失败: ${msg}`)
+    }
+  }, [])
+
+  // 重试单个研报的 PDF 抓取 (admin/boss only — backend 用 get_current_boss_or_admin
+  // 守门). 用 antibot 安全的单发, 不会进入爬虫日额度. 成功后用返回的状态刷新 detail.
+  const [retryingPdf, setRetryingPdf] = useState(false)
+  const retryPdf = useCallback(async (itemId: string) => {
+    setRetryingPdf(true)
+    try {
+      const res = await api.post(`/alphapai-db/items/report/${itemId}/pdf-retry`,
+        null, { timeout: 90000 })
+      message.success(`PDF 重抓成功 ${res.data?.size ? `(${Math.round(res.data.size / 1024)}KB)` : ''}`)
+      // 把 detail 重新拉一遍, 让 PDF 按钮立刻可用.
+      const refreshed = await api.get<DetailResponse>(
+        `/alphapai-db/items/report/${itemId}`)
+      setDetail(refreshed.data)
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || err?.message || '重试失败'
+      message.error(`PDF 重试失败: ${msg}`)
+    } finally {
+      setRetryingPdf(false)
     }
   }, [])
 
@@ -421,11 +472,27 @@ export default function AlphaPaiReports() {
                         {item.institution}
                       </Tag>
                     )}
-                    {item.has_pdf && (
-                      <Tag color="volcano" icon={<FilePdfOutlined />}>
-                        PDF
-                      </Tag>
-                    )}
+                    {item.has_pdf && (() => {
+                      // 列表里区分"可看 PDF" vs "需权限/失败" — 避免点开才发现没有.
+                      // pdf_available / pdf_error_kind 来自 backend _pdf_status,
+                      // 老 API 可能没有这两字段, 默认沿用旧的 volcano 色 PDF tag.
+                      if (item.pdf_available === true) {
+                        return (
+                          <Tag color="volcano" icon={<FilePdfOutlined />}>PDF</Tag>
+                        )
+                      }
+                      if (item.pdf_error_kind === 'permission_denied') {
+                        return (
+                          <Tag color="default" icon={<FilePdfOutlined />}>PDF · 无权限</Tag>
+                        )
+                      }
+                      if (item.pdf_available === false) {
+                        return (
+                          <Tag color="orange" icon={<FilePdfOutlined />}>PDF · 缺失</Tag>
+                        )
+                      }
+                      return <Tag color="volcano" icon={<FilePdfOutlined />}>PDF</Tag>
+                    })()}
                     <Text strong>{item.title}</Text>
                   </Space>
                 }
@@ -536,9 +603,52 @@ export default function AlphaPaiReports() {
                     下载
                   </Button>
                 )}
-                {detail.has_pdf && !detail.pdf_local_path && (
-                  <Tag color="red">PDF 未落盘 (可能下载失败, 重启爬虫 --resume 即可补抓)</Tag>
-                )}
+                {detail.has_pdf && !detail.pdf_local_path && (() => {
+                  // 根据 backend 分类的 pdf_error_kind 给出可执行提示, 而不是
+                  // 一律"重启爬虫" — 后者对 98% 的失败 (无权限) 是误导.
+                  // 2026-04-24 实验探测确认: 外资研报 PDF 受 tier=0/day 限制,
+                  // 服务端返回 code=10222 (掩盖) 或 code=810002 (originType 提示后).
+                  // 但 list_item 已带英文 + 中文翻译, 与 AlphaPai SPA 同步, 直接读即可.
+                  const kind = detail.pdf_error_kind || 'none'
+                  const human = detail.pdf_error_human || detail.pdf_error || 'PDF 未落盘'
+                  const hasTextSubstitute = !!(detail.content || detail.content_cn)
+                  if (kind === 'permission_denied' || kind === 'quota_exhausted') {
+                    return (
+                      <Tag color={hasTextSubstitute ? 'blue' : 'default'} icon={<FilePdfOutlined />}>
+                        {kind === 'quota_exhausted' ? '📊 ' : '🔒 '}
+                        {human}
+                        {hasTextSubstitute && ' · 文本/翻译版可在下方阅读'}
+                      </Tag>
+                    )
+                  }
+                  if (kind === 'not_found') {
+                    return (
+                      <Tag color="default" icon={<FilePdfOutlined />}>
+                        📭 平台未提供 PDF 资源
+                      </Tag>
+                    )
+                  }
+                  // 其余: filename_too_long / transient_network / *_unknown / none
+                  // — 都属于"理论上能再试一次", 给一个清晰说明 + (admin/boss) 重试按钮.
+                  return (
+                    <>
+                      <Tag color="orange" icon={<FilePdfOutlined />}>
+                        ⚠️ PDF 未落盘: {human}
+                      </Tag>
+                      {isBossOrAdmin && detail.pdf_retryable !== false && (
+                        <Button
+                          size="small"
+                          type="primary"
+                          icon={<ReloadOutlined />}
+                          loading={retryingPdf}
+                          onClick={() => retryPdf(detail.id)}
+                        >
+                          重试下载
+                        </Button>
+                      )}
+                    </>
+                  )
+                })()}
                 {detail.analysts.map((a) => (
                   <Tag key={a} color="geekblue" icon={<UserOutlined />}>
                     {a}
@@ -630,9 +740,46 @@ export default function AlphaPaiReports() {
                   <MarkdownRenderer content={detail.core_viewpoint} />
                 </Card>
               )}
+              {/* 外资研报 PDF 受 tier 限制时, 中文翻译版是真正可读的替代.
+                  优先级最高, 用强调色卡片放在英文原文之前. */}
+              {detail.content_cn && (detail.pdf_error_kind === 'permission_denied'
+                  || detail.pdf_error_kind === 'quota_exhausted') && (
+                <Card
+                  size="small"
+                  title={
+                    <span>
+                      <TagOutlined style={{ color: '#0ea5e9', marginRight: 6 }} />
+                      中文翻译版
+                      {detail.title_cn && (
+                        <Text type="secondary" style={{ fontSize: 12, marginLeft: 8 }}>
+                          {detail.title_cn}
+                        </Text>
+                      )}
+                      <Tag color="blue" style={{ marginLeft: 8, fontSize: 11 }}>
+                        AlphaPai 同步翻译
+                      </Tag>
+                    </span>
+                  }
+                  style={{
+                    marginTop: 8,
+                    background: 'linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%)',
+                    borderLeft: '3px solid #0ea5e9',
+                  }}
+                  bodyStyle={{
+                    fontSize: 13,
+                    lineHeight: 1.85,
+                    color: '#0c4a6e',
+                    maxHeight: '40vh',
+                    overflowY: 'auto',
+                  }}
+                >
+                  <MarkdownRenderer content={detail.content_cn} />
+                </Card>
+              )}
               <Card
                 size="small"
-                title="研报内容 (文本)"
+                title={detail.content_cn && detail.content !== detail.content_cn
+                  ? '研报内容 (英文原文)' : '研报内容 (文本)'}
                 style={{ marginTop: 8 }}
                 bodyStyle={{
                   maxHeight: pdfVisible ? '32vh' : '62vh',

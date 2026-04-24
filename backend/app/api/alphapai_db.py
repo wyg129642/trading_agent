@@ -22,7 +22,7 @@ from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pydantic import BaseModel
 
 from backend.app.config import get_settings
-from backend.app.deps import get_current_user
+from backend.app.deps import get_current_boss_or_admin, get_current_user
 from backend.app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -204,6 +204,99 @@ def _extract_core_viewpoint(content: str, max_chars: int = 600) -> str:
     return out
 
 
+# --------------------------------------------------------------------------- #
+# PDF error classification
+# --------------------------------------------------------------------------- #
+# After the 2026-04-23 remote-Mongo migration, ~22k of the 42k pdf_flag=True
+# reports are missing pdf_local_path. The DB stores a free-form `pdf_error`
+# string per doc; classify it so the frontend can show meaningful messages
+# (98% are permanent permission denials — retrying does nothing).
+def _classify_pdf_error(err: str | None) -> tuple[str, str]:
+    """Map a raw `pdf_error` string to (kind, human_message).
+
+    Kinds:
+      - permission_denied  : 账号无访问权限 (code=10222) — permanent until
+                             account upgrades; --resume re-fetch is wasted.
+      - filename_too_long  : OS 文件名超长 (Errno 36) — fixable by re-running
+                             with a shorter destination filename.
+      - transient_network  : 临时网络错误 (timeout / chunked / broken pipe) —
+                             worth retrying.
+      - not_found          : 平台返回未找到资源 (404 / empty data).
+      - relpath_unknown    : relpath 步骤其它未知失败.
+      - download_unknown   : download 步骤其它未知失败.
+      - unknown            : 未识别的错误格式.
+      - none               : 没有错误记录 (orphan: pdf_flag 但既无 path 也无
+                             error — 一般是迁移前老数据).
+    """
+    if not err:
+        return "none", ""
+    s = str(err)
+    low = s.lower()
+    # Foreign-report daily quota exhausted (tier=0/day on our account). Probed
+    # 2026-04-24: passing originType=1 to reading/report/detail/pdf returns
+    # the precise message "您今日外资报告-禁运期报告查看已达0篇上限" (code=810002).
+    # Without originType the server falls back to the generic 10222 — that's
+    # why ~21k historical docs say permission_denied when the underlying cause
+    # is actually quota. Treat both kinds the same way (don't auto-retry, no
+    # operator retry button) but use the precise wording when we know.
+    if "code=810002" in s or "上限" in s:
+        return "quota_exhausted", "今日外资研报 PDF 查看额度已用尽 (账号 tier 限制)"
+    # Permission denied — the masked version of quota_exhausted, plus
+    # genuine no-access cases.
+    if "code=10222" in s or "无权限查看" in s:
+        return "permission_denied", "当前账号无该研报 PDF 访问权限 (多为外资研报 tier 限制)"
+    # OS filename too long (Errno 36)
+    if "file name too long" in low or "errno 36" in low:
+        return "filename_too_long", "文件名超长 (OS 拒绝写盘)"
+    # Transient network conditions worth retrying
+    transient_markers = (
+        "chunkedencodingerror", "broken pipe", "connectionerror",
+        "ssl", "eof", "timeout", "timed out", "resetbyperror",
+        "connection reset", "remote disconnected",
+    )
+    if any(m in low for m in transient_markers):
+        return "transient_network", "网络中断 / 临时下载失败"
+    # Server-side 404 or empty payload from the relpath endpoint
+    if "code=404" in s or "empty_data" in s or "code=400404" in s:
+        return "not_found", "平台未提供该研报的 PDF"
+    # Step-typed fallbacks
+    if s.startswith("relpath_err"):
+        return "relpath_unknown", "获取 PDF 路径失败"
+    if s.startswith("download_err"):
+        return "download_unknown", "下载 PDF 失败"
+    return "unknown", s[:120]
+
+
+# Kinds that the on-demand retry endpoint should attempt. Permission_denied is
+# explicitly excluded — retrying just burns API calls and may attract bot
+# detection.
+_PDF_ERROR_RETRYABLE: set[str] = {
+    "filename_too_long", "transient_network", "relpath_unknown",
+    "download_unknown", "none", "unknown",
+}
+
+
+def _pdf_status(doc: dict) -> dict:
+    """Build the front-end PDF status block for a report doc."""
+    has_flag = bool(doc.get("pdf_flag"))
+    has_path = bool(doc.get("pdf_local_path"))
+    err = doc.get("pdf_error") or ""
+    kind, human = _classify_pdf_error(err)
+    # If we already have a path, the error (if any) is stale — clear the
+    # categorization so the UI doesn't show a confusing "failed" tag for a
+    # PDF the user can in fact open.
+    if has_path:
+        kind, human, err = "none", "", ""
+    return {
+        "pdf_flag": has_flag,
+        "pdf_available": has_flag and has_path,
+        "pdf_error": err,
+        "pdf_error_kind": kind,
+        "pdf_error_human": human,
+        "pdf_retryable": kind in _PDF_ERROR_RETRYABLE and has_flag and not has_path,
+    }
+
+
 def _normalize_item(doc: dict) -> dict:
     """Map a raw Mongo doc to a uniform front-end shape."""
     content = doc.get("content") or ""
@@ -249,6 +342,9 @@ def _normalize_item(doc: dict) -> dict:
     # a distinct "view" section, so we only extract for reports.
     if doc.get("category") == "report":
         item["core_viewpoint"] = _extract_core_viewpoint(content)
+        # Categorized PDF status — replaces the plain has_pdf so the UI can
+        # tell "PDF available" vs "no permission" vs "transient failure".
+        item.update(_pdf_status(doc))
     return item
 
 
@@ -361,10 +457,22 @@ async def get_item(
     doc = await db[CATEGORY_COLLECTION[category]].find_one({"_id": item_id})
     if not doc:
         raise HTTPException(404, "Item not found")
-    # Strip raw detail/list_item payload to keep response light; expose content
+    # Strip raw detail/list_item payload to keep response light; expose content.
+    # _normalize_item already merges the categorized pdf_status block for
+    # report docs; pdf_local_path / pdf_size stay for backward compat with the
+    # frontend's "查看 PDF" button gate (which historically read pdf_local_path).
+    # Also surface foreign-broker bilingual fields (titleCn / contentCn) when
+    # present — these come from list_item and let the UI show the same Chinese
+    # translation the AlphaPai SPA renders, which is the only viable substitute
+    # when the original PDF is locked behind tier quota.
+    li = doc.get("list_item") or {}
+    title_cn = li.get("titleCn") if isinstance(li, dict) else None
+    content_cn = li.get("contentCn") if isinstance(li, dict) else None
     return {
         **_normalize_item(doc),
         "content": doc.get("content") or "",
+        "title_cn": title_cn or None,
+        "content_cn": content_cn or None,
         "pdf_local_path": doc.get("pdf_local_path"),
         "pdf_size": doc.get("pdf_size"),
         "raw_id": doc.get("raw_id"),
@@ -404,13 +512,216 @@ async def get_report_pdf(
     title = (doc.get("title") or f"report-{item_id[:12]}")[:120]
     from ..services.pdf_storage import stream_pdf_or_file
     settings = get_settings()
+    # 2026-04-24: 两个 root 都放行 — 新 PDF 在 /mnt/share/ygwang/...,
+    # 历史 PDF (约 41GB, 迁移前) 在 /home/ygwang/crawl_data/...
+    pdf_roots = [settings.alphapai_pdf_dir]
+    legacy = getattr(settings, "alphapai_pdf_dir_legacy", None)
+    if legacy and legacy not in pdf_roots:
+        pdf_roots.append(legacy)
     return await stream_pdf_or_file(
         db=db,
         pdf_rel_path=rel,
-        pdf_root=settings.alphapai_pdf_dir,
+        pdf_root=pdf_roots,
         download_filename=title,
         download=bool(download),
     )
+
+
+# ------------------------------------------------------------------ #
+# On-demand PDF retry (admin/boss only)
+# ------------------------------------------------------------------ #
+# After the 2026-04-23 remote-Mongo migration, ~370 reports have transient
+# pdf_error states (broken pipe / timeout / filename-too-long / orphaned). The
+# scraper retries them on `--resume` but only if they still appear in the
+# (recent-pages) list — older docs are stuck. This endpoint lets an operator
+# force a single-shot re-fetch from the AlphaPai detail+storage APIs without
+# spinning up the whole crawler. Permission_denied errors (98% of failures)
+# are explicitly refused since they can't be cured by retrying.
+@router.post("/items/report/{item_id}/pdf-retry")
+async def retry_report_pdf(
+    item_id: str,
+    user: User = Depends(get_current_boss_or_admin),
+):
+    db = _mongo_db()
+    doc = await db["reports"].find_one(
+        {"_id": item_id},
+        projection={
+            "pdf_local_path": 1, "pdf_size": 1, "pdf_error": 1,
+            "pdf_flag": 1, "title": 1, "publish_time": 1, "raw_id": 1,
+            "list_item": 1,
+        },
+    )
+    if not doc:
+        raise HTTPException(404, "Report not found")
+    if not doc.get("pdf_flag"):
+        raise HTTPException(400, "This report has no PDF on the platform")
+
+    kind, _ = _classify_pdf_error(doc.get("pdf_error") or "")
+    if kind in ("permission_denied", "quota_exhausted"):
+        # Don't burn an API call (and risk the scraper account's day-quota)
+        # on something we know will fail. quota_exhausted resets nightly but
+        # since our tier is 0/day for foreign reports, retrying still fails.
+        raise HTTPException(
+            409,
+            "PDF 当前账号无访问权限 (code=10222 / 810002 — 多为外资研报 tier 限制), "
+            "重试不会成功. 文本内容已抓取并展示, 可直接阅读 (与 AlphaPai SPA 同步).",
+        )
+    if doc.get("pdf_local_path"):
+        # Nothing to do — viewer can already serve it. Refresh the response so
+        # the caller's UI flips to the success state.
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "pdf_local_path already set",
+            **_pdf_status(doc),
+        }
+
+    raw_id = doc.get("raw_id")
+    if not raw_id:
+        # Fall back to list_item.id if raw_id wasn't captured for older docs.
+        li = doc.get("list_item") or {}
+        raw_id = li.get("id") if isinstance(li, dict) else None
+    if not raw_id:
+        raise HTTPException(400, "Doc missing raw_id, can't query AlphaPai detail API")
+
+    settings = get_settings()
+    result = await _retry_pdf_download(
+        db=db,
+        item_id=item_id,
+        raw_id=str(raw_id),
+        publish_time=doc.get("publish_time") or "",
+        title=doc.get("title") or "",
+        pdf_root=settings.alphapai_pdf_dir,
+    )
+    return result
+
+
+@lru_cache(maxsize=1)
+def _load_scraper_module():
+    """Lazy-load the alphapai scraper module (file-based, since crawl/ isn't a package).
+
+    Cached so repeated retry calls don't re-exec module-level code (antibot
+    throttle init, jieba load, etc).
+    """
+    import importlib.util
+    scraper_path = Path("/home/ygwang/trading_agent_staging/crawl/alphapai_crawl/scraper.py")
+    spec = importlib.util.spec_from_file_location("alphapai_scraper_retry", scraper_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("can't load scraper.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+async def _retry_pdf_download(
+    *, db: AsyncIOMotorDatabase, item_id: str, raw_id: str,
+    publish_time: str, title: str, pdf_root: str,
+) -> dict:
+    """Single-shot re-fetch: detail/pdf → storage download → GridFS upload.
+
+    Runs in a thread executor because the underlying crawl helpers are
+    sync `requests` calls. Uses the same credentials.json the scraper does.
+    """
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    def _do_work() -> dict:
+        mod = _load_scraper_module()
+        token = mod._load_token_from_file()
+        if not token:
+            raise RuntimeError("alphapai credentials.json has no token; auto-login first")
+        session = mod.create_session(token)
+
+        relpath, err = mod.fetch_report_pdf_relpath(session, raw_id, version=1)
+        if err or not relpath:
+            return {"ok": False, "stage": "relpath", "error": err or "no relpath"}
+
+        dest = mod._pdf_dest_path(Path(pdf_root), publish_time, relpath, title)
+        # Some failures (e.g. SMB read_back_err) leave the file actually on
+        # disk but with stale empty pdf_local_path in Mongo. Detect and adopt
+        # without re-downloading.
+        if dest.exists() and dest.stat().st_size > 0:
+            with open(dest, "rb") as fh:
+                head = fh.read(4)
+            if head == b"%PDF":
+                size = dest.stat().st_size
+                derr = None
+                logger.info("alphapai pdf-retry: adopt existing file %s (%dB)",
+                            dest, size)
+            else:
+                # Bad magic — file's broken, blow it away and re-download.
+                try: dest.unlink()
+                except Exception: pass
+                size, derr = mod.download_report_pdf(session, relpath, token, dest)
+        else:
+            size, derr = mod.download_report_pdf(session, relpath, token, dest)
+        if derr:
+            return {"ok": False, "stage": "download", "error": derr,
+                    "relpath": relpath}
+
+        # Mirror to GridFS so subsequent reads via stream_pdf_or_file find it
+        # in the canonical store (not just on local disk).
+        from gridfs import GridFSBucket
+        from pymongo import MongoClient
+        settings = get_settings()
+        cli = MongoClient(settings.alphapai_mongo_uri,
+                          serverSelectionTimeoutMS=15000,
+                          socketTimeoutMS=300000)
+        try:
+            sync_db = cli[settings.alphapai_mongo_db]
+            bucket = GridFSBucket(sync_db)
+            # filename = <root_basename>/<rel-from-root>, matching the
+            # migration script's convention (see pdf_storage._filename_for_pdf).
+            root = Path(pdf_root).resolve()
+            try:
+                rel_inside_root = dest.resolve().relative_to(root.parent)
+                gridfs_name = rel_inside_root.as_posix()
+            except ValueError:
+                gridfs_name = f"{root.name}/{dest.name}"
+            existing = sync_db["fs.files"].find_one(
+                {"filename": gridfs_name}, projection={"_id": 1})
+            if not existing:
+                with dest.open("rb") as fh:
+                    bucket.upload_from_stream(
+                        filename=gridfs_name, source=fh,
+                        chunk_size_bytes=1024 * 1024,
+                        metadata={
+                            "rel_path": gridfs_name,
+                            "platform_root": root.name,
+                            "size_bytes": size,
+                            "uploaded_via": "backend_pdf_retry",
+                        },
+                    )
+
+            # Update the doc so future requests hit the success path.
+            sync_db["reports"].update_one(
+                {"_id": item_id},
+                {"$set": {
+                    "pdf_local_path": str(dest),
+                    "pdf_size": size,
+                    "pdf_error": "",
+                }},
+            )
+        finally:
+            cli.close()
+
+        return {"ok": True, "stage": "done", "size": size,
+                "pdf_local_path": str(dest)}
+
+    try:
+        result = await loop.run_in_executor(None, _do_work)
+    except Exception as exc:
+        logger.exception("alphapai PDF retry failed for %s", item_id)
+        raise HTTPException(500, f"retry failed: {exc}")
+
+    if not result.get("ok"):
+        # Surface the underlying error to the operator instead of wrapping it
+        # in a generic 500. 422 reads as "we tried, here's what broke".
+        raise HTTPException(
+            422,
+            f"retry failed at {result.get('stage')}: {result.get('error')}",
+        )
+    return result
 
 
 # ------------------------------------------------------------------ #
