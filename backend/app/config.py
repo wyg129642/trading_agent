@@ -366,6 +366,28 @@ class Settings(BaseSettings):
     app_port: int = 8000
     cors_origins: str = "http://localhost:5173,http://localhost:3000"
 
+    # ── Selective share-with-prod overrides (staging only) ──────────
+    # By default APP_ENV=staging scopes every collection away from prod so
+    # experiments can't corrupt prod data. That's right for Postgres
+    # (per-env schema) and research_sessions, but means staging's
+    # knowledge-base kernels (`kb_search` + `user_kb_search`) start with
+    # empty Milvus/Mongo collections — the AI assistant has nothing to
+    # search. These opt-in flags point the KB tools back at prod's data:
+    #
+    #   kb_share_with_prod=true      → Milvus `kb_chunks` (crawled corpus).
+    #                                  Effectively read-only since only
+    #                                  prod's ingest pipeline writes it.
+    #   user_kb_share_with_prod=true → Mongo `documents` / `chunks` /
+    #                                  `fs.*` + Milvus `user_kb_chunks`
+    #                                  (personal KB). Staging users see
+    #                                  the same upload history as prod.
+    #                                  CAUTION: a staging upload/delete
+    #                                  HITS PROD'S DATA. Acceptable for
+    #                                  internal testing; flip off for
+    #                                  anything externally accessible.
+    kb_share_with_prod: bool = False
+    user_kb_share_with_prod: bool = False
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
@@ -430,33 +452,56 @@ class Settings(BaseSettings):
 
     @property
     def effective_milvus_collection(self) -> str:
-        """Shared-KB Milvus collection (crawled corpus)."""
+        """Shared-KB Milvus collection (crawled corpus).
+
+        When `kb_share_with_prod=true` (staging testing), returns the raw
+        prod collection so the AI assistant has real data to search.
+        """
+        if self.kb_share_with_prod:
+            return self.milvus_collection
         return self._suffixed(self.milvus_collection)
 
     @property
     def effective_user_kb_milvus_collection(self) -> str:
-        """Personal-KB Milvus collection (user uploads)."""
+        """Personal-KB Milvus collection (user uploads).
+
+        When `user_kb_share_with_prod=true` staging reads/writes the prod
+        collection directly — see Settings docstring for the CAUTION.
+        """
+        if self.user_kb_share_with_prod:
+            return self.user_kb_milvus_collection
         return self._suffixed(self.user_kb_milvus_collection)
 
     # Mongo collections in shared databases. Fixed names — u_spider has no
     # permission to create new DBs on the remote cluster so prod+staging
     # must coexist inside the same DB with a name prefix.
+    # `user_kb_share_with_prod=true` also short-circuits these three so
+    # staging reads prod's uploads + GridFS directly.
 
     @property
     def user_kb_docs_collection(self) -> str:
+        if self.user_kb_share_with_prod:
+            return "documents"
         return self._prefixed("documents")
 
     @property
     def user_kb_chunks_collection(self) -> str:
+        if self.user_kb_share_with_prod:
+            return "chunks"
         return self._prefixed("chunks")
 
     @property
     def user_kb_gridfs_bucket(self) -> str:
         """GridFS bucket name — maps to `{bucket}.files` + `{bucket}.chunks`."""
+        if self.user_kb_share_with_prod:
+            return "fs"
         return self._prefixed("fs")
 
     @property
     def research_sessions_collection(self) -> str:
+        # Always env-scoped — keeping prod's audit log uncorrupted by
+        # staging traffic outweighs the convenience of seeing staging
+        # traces on the admin page with prod's.
         return self._prefixed("research_sessions")
 
     model_config = {
