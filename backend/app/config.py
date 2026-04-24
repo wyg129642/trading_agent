@@ -124,6 +124,12 @@ class Settings(BaseSettings):
     sentimentrader_mongo_uri: str = REMOTE_CRAWL_MONGO_URI
     sentimentrader_mongo_db: str = "funda"
     sentimentrader_collection: str = "sentimentrader_indicators"
+
+    # SemiAnalysis (Substack) — co-hosted in funda DB (u_spider can't create new DBs)
+    semianalysis_mongo_uri: str = REMOTE_CRAWL_MONGO_URI
+    semianalysis_mongo_db: str = "funda"
+    semianalysis_collection: str = "semianalysis_posts"
+    semianalysis_state_collection: str = "_state_semianalysis"
     # 研报 PDF 本地落盘目录 — 迁移后作为 GridFS fallback 路径保留
     alphapai_pdf_dir: str = "/home/ygwang/crawl_data/alphapai_pdfs"
 

@@ -48,6 +48,51 @@ def _safe_json(val: Any, default=None):
     return default if default is not None else []
 
 
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse a timestamp string or datetime into a UTC-aware datetime."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str):
+        return None
+    try:
+        from dateutil import parser as dateutil_parser
+        dt = dateutil_parser.parse(value, fuzzy=True)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
+def _compute_event_age_hours(analysis: dict, snapshot: dict, timeline: list) -> float | None:
+    """Derive event age in hours from the earliest known source timestamp.
+
+    Prefers the freshness_gate's pre-computed value (full_analysis.event_age_hours);
+    falls back to earliest_report_time / news_timeline for legacy rows written
+    before the gate shipped.
+    """
+    cached = analysis.get("event_age_hours")
+    if isinstance(cached, (int, float)):
+        return max(0.0, float(cached))
+
+    earliest_iso = (
+        snapshot.get("earliest_report_time")
+        or (timeline[0].get("time") if timeline and isinstance(timeline[0], dict) else None)
+    )
+    dt = _parse_iso(earliest_iso)
+    if not dt:
+        return None
+    age = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+    return max(0.0, age)
+
+
+# An event is considered stale once it exceeds this many hours with no new
+# corroborating source. Keep in sync with freshness_gate.DEFAULT_NOVELTY_HOURS.
+STALE_EVENT_AGE_HOURS = 48
+
+
 def _row_to_item(row: Any) -> dict:
     """Convert a database row to a breaking news item dict."""
     analysis = _safe_json(row.full_analysis, {})
@@ -64,6 +109,13 @@ def _row_to_item(row: Any) -> dict:
 
     scan_time = row.scan_time
     created_at = row.created_at
+
+    event_age_hours = _compute_event_age_hours(analysis, snapshot, timeline)
+    rejection_reason = analysis.get("rejection_reason")
+    is_stale_event = (
+        rejection_reason == "event_too_old"
+        or (event_age_hours is not None and event_age_hours >= STALE_EVENT_AGE_HOURS)
+    )
 
     # Sources from full_analysis (with clickable URLs)
     sources = analysis.get("sources", [])
@@ -84,6 +136,9 @@ def _row_to_item(row: Any) -> dict:
         "new_developments": _safe_json(row.new_developments, []),
         "novelty_status": snapshot.get("novelty_status", ""),
         "earliest_report_time": earliest_report_time,
+        "event_age_hours": round(event_age_hours, 2) if event_age_hours is not None else None,
+        "is_stale_event": is_stale_event,
+        "rejection_reason": rejection_reason,
         "deep_research_performed": bool(row.deep_research_performed),
         "research_iterations": row.research_iterations or 0,
         "key_findings": analysis.get("key_findings", []) or _safe_json(row.key_findings, []),
@@ -127,6 +182,14 @@ async def list_breaking_news(
     hours: int = Query(168, ge=1, le=8760, description="Lookback window in hours"),
     limit: int = Query(50, ge=1, le=200, description="Max results"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
+    hide_stale: bool = Query(
+        True,
+        description=(
+            "Suppress alerts that the freshness gate rejected as stale "
+            "(rejection_reason=event_too_old). Defaults to True; pass "
+            "false to see the historical raw scan output."
+        ),
+    ),
 ):
     """List breaking news from the proactive portfolio scanner.
 
@@ -150,6 +213,17 @@ async def list_breaking_news(
     if materiality:
         conditions.append("r.delta_magnitude = :materiality")
         params["materiality"] = materiality
+
+    if hide_stale:
+        # The freshness gate (engine/proactive/freshness_gate.py) writes
+        # rejection_reason="event_too_old" into full_analysis when it
+        # suppresses an alert. Hide those rows from the default feed so
+        # a week-old earnings story never shows up as "breaking news".
+        conditions.append(
+            "(r.full_analysis IS NULL "
+            "OR r.full_analysis->>'rejection_reason' IS NULL "
+            "OR r.full_analysis->>'rejection_reason' != 'event_too_old')"
+        )
 
     where = " AND ".join(conditions) + _SENTIMENT_FILTER
 
@@ -225,6 +299,11 @@ async def breaking_news_summary(
             WHERE r.delta_detected = true
               AND r.delta_magnitude IN ('material', 'critical')
               AND r.scan_time >= NOW() - make_interval(hours => :hours)
+              AND (
+                r.full_analysis IS NULL
+                OR r.full_analysis->>'rejection_reason' IS NULL
+                OR r.full_analysis->>'rejection_reason' != 'event_too_old'
+              )
               {_SENTIMENT_FILTER}
         )
         SELECT ticker, name_cn, news_count, scan_time,

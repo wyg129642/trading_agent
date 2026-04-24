@@ -557,6 +557,7 @@ def create_app() -> FastAPI:
     from backend.app.api.gangtise_db import router as gangtise_db_router
     from backend.app.api.acecamp_db import router as acecamp_db_router
     from backend.app.api.alphaengine_db import router as alphaengine_db_router
+    from backend.app.api.semianalysis_db import router as semianalysis_db_router
     from backend.app.api.unified import router as unified_router
     from backend.app.api.jiuqian import router as jiuqian_router
     from backend.app.api.engine import router as engine_router
@@ -602,6 +603,7 @@ def create_app() -> FastAPI:
     app.include_router(gangtise_db_router, prefix="/api/gangtise-db", tags=["Gangtise DB"])
     app.include_router(acecamp_db_router, prefix="/api/acecamp-db", tags=["AceCamp DB"])
     app.include_router(alphaengine_db_router, prefix="/api/alphaengine-db", tags=["AlphaEngine DB"])
+    app.include_router(semianalysis_db_router, prefix="/api/semianalysis-db", tags=["SemiAnalysis DB"])
     app.include_router(unified_router, prefix="/api/unified", tags=["Unified (cross-platform)"])
     app.include_router(jiuqian_router, prefix="/api/jiuqian", tags=["Jiuqian"])
     app.include_router(engine_router, prefix="/api/engine", tags=["Engine"])
