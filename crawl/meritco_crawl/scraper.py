@@ -334,27 +334,58 @@ def fetch_account_endpoint(client: httpx.Client, path: str, method: str) -> dict
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _MULTI_SPACE_RE = re.compile(r"\s+\n|\n\s+")
 
+try:
+    from markdownify import markdownify as _markdownify
+    _HAS_MARKDOWNIFY = True
+except ImportError:
+    _HAS_MARKDOWNIFY = False
+
 
 def html_to_text(html: str) -> str:
-    """把 insight/content 里的 HTML 片段扁平化为纯文本."""
+    """Convert Meritco HTML fragments to Markdown, preserving heading / list
+    hierarchy so downstream readers (kb_search body, LLM prompts, frontend render)
+    see the same structure the website displays.
+
+    The editor on research.meritco-group.com emits <h2>/<h3>/<ul>/<li>/<ol>/<strong>
+    etc.; flattening those to plain text loses the analyst's outline. We use
+    `markdownify` (ATX headings, dashes for bullets) which is a dependable
+    HTML→Markdown converter. Falls back to a simpler tag-strip pass if the lib
+    is unavailable — kept as a legacy safety net.
+    """
     if not html or not isinstance(html, str):
         return ""
-    # 保留段落换行
+
+    if _HAS_MARKDOWNIFY:
+        try:
+            md = _markdownify(html, heading_style="ATX", bullets="-",
+                              strip=["script", "style"])
+            md = re.sub(r"\n{3,}", "\n\n", md).strip()
+            return md
+        except Exception:
+            pass  # fall through to legacy path
+
+    # Legacy fallback (no markdownify installed).
     t = html.replace("</p>", "\n").replace("</P>", "\n")
     t = t.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
     t = _HTML_TAG_RE.sub("", t)
-    # unescape 基本实体
     for a, b in (("&nbsp;", " "), ("&amp;", "&"), ("&lt;", "<"),
                  ("&gt;", ">"), ("&quot;", '"'), ("&#39;", "'")):
         t = t.replace(a, b)
-    # 清理多余空白
     lines = [ln.strip() for ln in t.split("\n")]
     return "\n".join(ln for ln in lines if ln).strip()
 
 
 def pick_time(item: dict) -> str:
-    """从 item 里挑一个最贴近"发布时间"的值, 返回 'YYYY-MM-DD HH:MM' 字符串."""
-    for k in ("operationTime", "createTime", "meetingTime", "recommendTime"):
+    """Pick the closest "publish time" from the item; return 'YYYY-MM-DD HH:MM'.
+
+    Priority: createTime > meetingTime > recommendTime > operationTime.
+    operationTime is LAST because Meritco stamps it on any later re-edit / bulk
+    migration — e.g. on 2026-04-02 they retouched every SNOW research post,
+    rewriting operationTime to 2026-04-02 20:56 while the real publish date
+    stayed in createTime (2026-02-26 23:42). The old priority led to every
+    migrated post showing a fake April timestamp.
+    """
+    for k in ("createTime", "meetingTime", "recommendTime", "operationTime"):
         v = item.get(k)
         if v:
             s = str(v).strip()
