@@ -2,8 +2,8 @@
 crawl data.
 
 Backend for the `/semianalysis` frontend page. Reads `semianalysis_posts`
-collection (co-hosted inside the `funda` DB because u_spider can't create new
-remote DBs; checkpoint lives in `_state_semianalysis` alongside it).
+collection (in the `foreign-website` DB as of 2026-04-24 — previously co-hosted
+in `funda`; checkpoint lives in `_state_semianalysis` alongside it).
 
 Shape returned:
   _id (stringified "s<post_id>"), title, release_time, release_time_ms,

@@ -13,6 +13,7 @@ class StockSuggestion(BaseModel):
     code: str
     market: str
     label: str  # "英伟达(NVDA)"
+    canonical_id: str | None = None  # CODE.MARKET form matching MongoDB `_canonical_tickers`
 
 
 class SuggestResponse(BaseModel):
@@ -109,7 +110,7 @@ class KbSearchRequest(BaseModel):
     doc_types: list[str] | None = Field(None, description="Filter by doc_type enum (see /kb/meta).")
     sources: list[str] | None = Field(None, description="Filter by source platform (alphapai, jinmen, meritco, thirdbridge, funda, gangtise, acecamp).")
     date_range: KbDateRange | None = None
-    top_k: int = Field(8, ge=1, le=30)
+    top_k: int = Field(20, ge=1, le=30)
 
 
 class KbHit(BaseModel):
@@ -136,7 +137,7 @@ class KbSearchResponse(BaseModel):
 
 class KbFetchRequest(BaseModel):
     doc_id: str
-    max_chars: int = Field(8000, ge=1000, le=30000)
+    max_chars: int = Field(30000, ge=1000, le=30000)
 
 
 class KbFetchResponse(BaseModel):
@@ -189,3 +190,60 @@ class KbMetaResponse(BaseModel):
     doc_types: list[str]
     collections: list[KbCollectionInfo]
     notes: str
+
+
+# ── Personal Knowledge Base (team-shared) ──────────────────────
+# The personal-KB is shared team-wide for retrieval. /user_kb/search
+# returns hits across every team member's uploads in one call.
+
+class UserKbSearchRequest(BaseModel):
+    query: str = Field("", description="Natural-language query, CN or EN.")
+    top_k: int = Field(20, ge=1, le=30)
+    document_ids: list[str] | None = Field(
+        None,
+        description="Optional pre-filter: restrict search to specific document_ids.",
+    )
+    mode: str = Field(
+        "hybrid",
+        description="Retrieval mode: 'hybrid' (BM25+dense RRF, default), 'lexical' (BM25 only), 'semantic' (dense only).",
+    )
+
+
+class UserKbHit(BaseModel):
+    document_id: str = Field(description="Mongo ObjectId hex (24 chars). Pass to /user_kb/fetch.")
+    title: str
+    original_filename: str
+    chunk_index: int
+    text: str = Field(description="Matching chunk body (typically a few hundred chars).")
+    score: float
+    created_at: str
+    uploader_user_id: str = Field(
+        "",
+        description="The user who originally uploaded this doc — empty when unknown.",
+    )
+
+
+class UserKbSearchResponse(BaseModel):
+    query: str
+    total: int
+    hits: list[UserKbHit]
+
+
+class UserKbFetchRequest(BaseModel):
+    document_id: str = Field(description="Mongo ObjectId hex (24 chars), as returned by /user_kb/search.")
+    max_chars: int = Field(30000, ge=1000, le=30000)
+
+
+class UserKbFetchResponse(BaseModel):
+    found: bool
+    document_id: str
+    title: str | None = None
+    original_filename: str | None = None
+    doc_type: str | None = None
+    mime_type: str | None = None
+    text: str | None = None
+    full_text_len: int | None = None
+    truncated: bool | None = None
+    created_at: str | None = None
+    uploader_user_id: str | None = None
+    error: str | None = None

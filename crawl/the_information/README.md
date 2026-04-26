@@ -2,7 +2,9 @@
 
 > **状态**: 正在接入,当前阶段 = CDP 探针摸 API. 9th platform (紧随 sentimentrader).
 >
-> **DB**: 待决(u_spider 不能建新库;候选:co-host in `funda` 或申请 admin 创 `the_information`).
+> **DB**: `foreign-website.theinformation_posts` (与 SemiAnalysis 同库,本机 ta-mongo-crawl :27018).
+> 注:DB-name 决策在 2026-04 远端 Mongo 时期,因 u_spider 无 createDatabase 权限只能 co-host;
+> 2026-04-26 迁回本机后保持原布局以避免改 schema。
 
 ## 为什么 CDP 先行
 

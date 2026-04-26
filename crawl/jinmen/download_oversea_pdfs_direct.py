@@ -9,7 +9,7 @@
   2. **只 GET OSS 直链** `database.comein.cn/original-data/pdf/mndj_report/<md5>.pdf`
      — 这层 CDN 是公开的,不校验 jinmen 账号 / token / cookie。所以账号被冻
      (`code=201 已被冻结`) 也不影响。
-  3. 文件落盘到 `/mnt/share/ygwang/overseas_pdf/YYYY-MM/<release_time_ms>_<rid>.pdf`,
+  3. 文件落盘到 `/home/ygwang/crawl_data/overseas_pdf/YYYY-MM/<release_time_ms>_<rid>.pdf`,
      按月分桶避免单目录塞几十万文件。
 
 并发 / 进度:
@@ -51,14 +51,13 @@ PROGRESS_FILE = SCRIPT_DIR / "_progress_oversea_direct.json"
 
 MONGO_URI = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 MONGO_DB = os.environ.get("MONGO_DB", "jinmen-full")
 COL = "oversea_reports"
 
-# /mnt/ygwang 目前是 root-only, SMB share 下的 /mnt/share/ygwang/overseas_pdf
-# 已经被 OP 设成 drwxrwxrwx 可写,作为默认落点。
-DEFAULT_PDF_DIR = "/mnt/share/ygwang/overseas_pdf"
+# 2026-04-26: SMB 共享盘 /mnt/share/ygwang 已退役,改为本机 SSD 默认落点。
+DEFAULT_PDF_DIR = "/home/ygwang/crawl_data/overseas_pdf"
 
 BJ_TZ = timezone(timedelta(hours=8))
 

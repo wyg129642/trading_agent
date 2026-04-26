@@ -136,12 +136,6 @@ async def _send_hallucination_feishu(summary: dict[str, Any], paused: list[dict]
                     f"**verdict 分布:**\n{verdict_lines}"
                     f"{paused_section}"
                 )}},
-                {"tag": "action", "actions": [{
-                    "tag": "button",
-                    "text": {"tag": "plain_text", "content": "打开幻觉率报告"},
-                    "type": "primary",
-                    "url": "/admin/research-logs?tab=citation-audit",
-                }]},
             ],
         },
     }

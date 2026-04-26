@@ -50,6 +50,29 @@ function stripTrailingSources(content: string): string {
     .trimEnd()
 }
 
+// ── Tilde normalization (prevent number-range strikethrough) ─────
+
+/**
+ * Normalize runs of `~~` (or longer) into a single `~` when they sit next to
+ * digits. The LLM frequently uses `~~` to denote numeric ranges
+ * (`60~~75%`, `$14,000~~17,000`), but GFM parses `~~text~~` as strikethrough,
+ * which renders the range as deleted text.
+ *
+ * Three patterns are normalized:
+ *   1. digit ~~ digit  →  digit~digit       (range between two numbers)
+ *   2. boundary ~~ digit →  boundary~digit  (leading "approx" prefix)
+ *   3. digit ~~ boundary →  digit~boundary  (trailing tilde before space/punct)
+ *
+ * Combined with `singleTilde: false` on remark-gfm below, this guarantees
+ * neither single nor double tildes around numbers render as strikethrough.
+ */
+function normalizeTildeRanges(content: string): string {
+  return content
+    .replace(/(\d)\s*~{2,}\s*(\d)/g, '$1~$2')
+    .replace(/(^|[\s>([{,，。；：:、])~{2,}(?=\d)/g, '$1~')
+    .replace(/(\d)~{2,}(?=[\s,，。；：:)\]}、]|$)/g, '$1~')
+}
+
 // ── Citation processing (code-block-aware) ───────────────────────
 
 /**
@@ -114,9 +137,10 @@ function getFaviconUrl(website: string): string {
 export default function CitationRenderer({ content, sources }: CitationRendererProps) {
   if (!content) return null
 
-  // No sources → plain markdown, no stripping (preserves Gemini grounding links)
+  // No sources → plain markdown, no stripping (preserves Gemini grounding links).
+  // We still normalize tildes so numeric ranges render correctly.
   if (!sources || sources.length === 0) {
-    return <MarkdownBase content={content} />
+    return <MarkdownBase content={normalizeTildeRanges(content)} />
   }
 
   const sourceMap = useMemo(() => {
@@ -127,7 +151,8 @@ export default function CitationRenderer({ content, sources }: CitationRendererP
 
   const processedContent = useMemo(() => {
     const cleaned = stripTrailingSources(content)
-    return processCitations(cleaned, sourceMap)
+    const tildeFixed = normalizeTildeRanges(cleaned)
+    return processCitations(tildeFixed, sourceMap)
   }, [content, sourceMap])
 
   // Only show sources that are actually cited in the text
@@ -145,7 +170,7 @@ export default function CitationRenderer({ content, sources }: CitationRendererP
   return (
     <div>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[[remarkGfm, { singleTilde: false }]]}
         components={{
           a({ href, children, title, ...props }) {
             // Detect citation sentinel links: #cite-N
@@ -529,12 +554,22 @@ const markdownComponents: Record<string, React.ComponentType<any>> = {
       </td>
     )
   },
+  // Safety net: if GFM still parses something as strikethrough (e.g. user
+  // intentionally typed `~~text~~`), render without the line-through so an
+  // accidental match never silently hides text. Range tildes are already
+  // normalized upstream by `normalizeTildeRanges`.
+  del({ children }: any) {
+    return <span>{children}</span>
+  },
 }
 
 /** Plain markdown renderer (no citation handling). */
 function MarkdownBase({ content }: { content: string }) {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+    <ReactMarkdown
+      remarkPlugins={[[remarkGfm, { singleTilde: false }]]}
+      components={markdownComponents}
+    >
       {content}
     </ReactMarkdown>
   )

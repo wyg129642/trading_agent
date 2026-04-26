@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Optional
 
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
@@ -33,6 +34,50 @@ def _unproxy():
                 os.environ[k] = v
 
 
+# Cached persistent client. The handshake against 192.168.31.137:38123 is
+# 3-35s (ClickHouse server-side, not TCP — raw curl connects in 0.5ms), so
+# opening a new client per call blows past any reasonable query timeout.
+# Once the client is warm, repeat queries are ~20ms.
+# clickhouse-connect's Client uses urllib3.PoolManager internally which is
+# thread-safe, so concurrent .query() calls from different executor threads
+# share the pool safely. We only lock around create/invalidate.
+_client_lock = threading.Lock()
+_client: Optional[Client] = None
+_client_key: tuple = ()
+
+
+def _client_signature(settings) -> tuple:
+    return (
+        settings.market_ch_host, settings.market_ch_port,
+        settings.market_ch_user, settings.market_ch_db,
+    )
+
+
+def _build_client(settings) -> Client:
+    with _unproxy():
+        return clickhouse_connect.get_client(
+            host=settings.market_ch_host,
+            port=settings.market_ch_port,
+            username=settings.market_ch_user,
+            password=settings.market_ch_password,
+            database=settings.market_ch_db,
+            connect_timeout=45,
+            send_receive_timeout=60,
+        )
+
+
+def _invalidate_client() -> None:
+    """Drop the cached client so the next query rebuilds. Safe to call under error."""
+    global _client
+    with _client_lock:
+        try:
+            if _client is not None:
+                _client.close()
+        except Exception:
+            pass
+        _client = None
+
+
 def _to_ch_symbol(ticker: str, market_label: str) -> str:
     """Portfolio ticker → ClickHouse symbol (XXXXXX.XSHE/.XSHG).
 
@@ -50,16 +95,21 @@ def _to_ch_symbol(ticker: str, market_label: str) -> str:
 
 
 def _get_client(settings) -> Client:
-    with _unproxy():
-        return clickhouse_connect.get_client(
-            host=settings.market_ch_host,
-            port=settings.market_ch_port,
-            username=settings.market_ch_user,
-            password=settings.market_ch_password,
-            database=settings.market_ch_db,
-            connect_timeout=5,
-            send_receive_timeout=10,
-        )
+    """Return the cached client, lazily building it on first use or after invalidate."""
+    global _client, _client_key
+    key = _client_signature(settings)
+    with _client_lock:
+        if _client is not None and _client_key == key:
+            return _client
+        # Settings changed, or client was invalidated — rebuild.
+        try:
+            if _client is not None:
+                _client.close()
+        except Exception:
+            pass
+        _client = _build_client(settings)
+        _client_key = key
+        return _client
 
 
 def fetch_ashare_quotes_sync(tickers: list[tuple[str, str]], settings) -> dict[str, dict[str, Any]]:
@@ -129,11 +179,11 @@ def fetch_ashare_quotes_sync(tickers: list[tuple[str, str]], settings) -> dict[s
     try:
         with _unproxy():
             client = _get_client(settings)
-            try:
-                result = client.query(query, parameters={"syms": symbols})
-            finally:
-                client.close()
+        result = client.query(query, parameters={"syms": symbols})
     except Exception as e:
+        # A stale / poisoned connection survives in the pool; drop it so the
+        # next call rebuilds instead of compounding the failure.
+        _invalidate_client()
         logger.exception("ClickHouse A-share query failed: %s", e)
         return {}
 

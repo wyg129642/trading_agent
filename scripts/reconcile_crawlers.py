@@ -51,7 +51,7 @@ except ImportError:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PY_BIN = "/home/ygwang/miniconda3/envs/agent/bin/python"
-MONGO_URI = os.environ.get("CRAWLER_MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = os.environ.get("CRAWLER_MONGO_URI", os.environ.get("MONGO_URI", "mongodb://127.0.0.1:27018/"))
 AUDIT_DB = os.environ.get("CRAWLER_RECONCILE_DB", "crawler_reconcile")
 AUDIT_COLL = "audits"
 

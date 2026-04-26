@@ -61,7 +61,7 @@ COL_HOMEPAGE = "homepage"
 # body 可以是 callable(now) -> dict 支持日期参数.
 
 def _today_yyyymmdd() -> int:
-    # 港推平台是 Asia/Shanghai, 今天的日期必须按 BJ TZ 取,不然 UTC 服务器会早 8 小时.
+    # 岗底斯平台是 Asia/Shanghai, 今天的日期必须按 BJ TZ 取,不然 UTC 服务器会早 8 小时.
     return int(datetime.now(_BJ_TZ).strftime("%Y%m%d"))
 
 

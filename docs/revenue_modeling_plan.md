@@ -123,7 +123,6 @@
 │           │  • alphapai_service / jinmen_service (MCP recall)     │
 │           │  • user_kb_tools (团队共享个人库)                     │
 │           │  • CitationTracker (全局 [N] 索引)                    │
-│           │  • research_interaction_log (MongoDB 完整回放)        │
 │           │                                                        │
 └───────────┴────────────────────────────────────────────────────────┘
 ```
@@ -742,7 +741,6 @@ playbooks/
 | Citation 全局索引 | `web_search_tool.py:208` `CitationTracker` | 扩展 `add_modeling_citation(cell_id=..., ...)` 方法；index 体系与 chat 共享 |
 | SSE 推送 | `api/chat.py:870-945` | 复制该流式协议；新端点 `/api/models/{id}/stream` |
 | Phase B 向量检索 | `kb_vector_query.py` + `kb_service.py` | 建 cell 时的 `search` / `extract` 步都走 hybrid RAG |
-| MongoDB 可追溯日志 | `research_interaction_log.py` | Recipe run 同步入库一份，`/admin/research-logs` 可直接回放 |
 | 前端渲染 | `CitationRenderer.tsx` + `MarkdownRenderer.tsx` | 单元格 note / agent reasoning 渲染都用这两个 |
 | Spreadsheet 编辑 | `frontend/src/components/SpreadsheetEditor.tsx` | 生产级不够用（研究员模型可达 2000 cell）—— 弃用此组件，**新建 `ModelSpreadsheet.tsx` 基于 `@glideapps/glide-data-grid`**（虚拟滚动、键盘导航、公式提示） |
 | WebSocket 进度 | `backend/app/ws/feed.py` | 大 run 失败可走 WS 通知研究员 |
@@ -839,7 +837,6 @@ playbooks/
 - 归档 / 否决：研究员标 lesson `archived`，agent 不再注入
 - **HDD_SSD 和 半导体 Industry Pack** 同步开工（对照 Excel 里 WDC/STX/AXTI 样本反推），验证 0 骨架代码变更即可接入
 - 生产化：权限矩阵、审计日志、LLM 成本 dashboard 接入 `/api/analytics`、P0 告警接入飞书
-- `/admin/research-logs` 与建模 run 挂钩，可完整回放
 - Excel 导出：颜色 / 公式 / 批注 / 多 sheet (per company) / 源文档超链接回 doc_id
 - **交付**：生产上线，2 个以上行业同时可用，每周自动进化
 

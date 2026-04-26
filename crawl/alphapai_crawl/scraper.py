@@ -49,7 +49,7 @@ from antibot import (  # noqa: E402
     add_antibot_args, throttle_from_args, cap_from_args,
     AccountBudget, SoftCooldown, detect_soft_warning,
     headers_for_platform, log_config_stamp, budget_from_args,
-    account_id_for_alphapai,
+    account_id_for_alphapai, warmup_session,
 )
 from ticker_tag import stamp as _stamp_ticker  # noqa: E402
 
@@ -92,24 +92,22 @@ def _load_token_from_file() -> str:
 API_BASE = "https://alphapai-web.rabyte.cn/external/alpha/api"
 STORAGE_REPORT_BASE = "https://alphapai-storage.rabyte.cn/report/"
 
-# MongoDB 配置 (2026-04-23 迁移至远端)
+# MongoDB 配置 (2026-04-23 迁出至远端 192.168.31.176:35002, 2026-04-26 迁回本机 ta-mongo-crawl :27018)
 MONGO_URI_DEFAULT = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 MONGO_DB_DEFAULT = os.environ.get("MONGO_DB", "alphapai-full")
 COL_ACCOUNT = "account"
 COL_STATE = "_state"  # checkpoint / 当日统计
 
 # 研报 PDF 下载目录 (可被 --pdf-dir 或 env ALPHAPAI_PDF_DIR 覆盖).
-# 2026-04-17: 从 crawl/alphapai_crawl/pdfs 迁移到 /home/ygwang/crawl_data/alphapai_pdfs.
-# 2026-04-24: 再次迁移到 /mnt/share/ygwang/alphapai_pdfs (SMB 共享盘, 跨机可见,
-# 67T 容量). 老 /home/ygwang/crawl_data/alphapai_pdfs 仍保留历史文件供 backend
-# 后向兼容读取 (见 backend/app/services/pdf_storage.py 的 pdf_root 多 root 支持).
-# env ALPHAPAI_PDF_DIR (.env 已配) 照常覆盖默认.
+# 2026-04-26: 从 SMB 共享盘 /mnt/share/ygwang/alphapai_pdfs 退役,迁回本机
+# /home/ygwang/crawl_data/alphapai_pdfs (本地 SSD, 38T 容量, 与其他平台 PDF
+# 同盘). env ALPHAPAI_PDF_DIR (.env 已配) 照常覆盖默认.
 PDF_DIR_DEFAULT = os.environ.get(
     "ALPHAPAI_PDF_DIR",
-    "/mnt/share/ygwang/alphapai_pdfs",
+    "/home/ygwang/crawl_data/alphapai_pdfs",
 )
 
 OK_CODE = 200000  # AlphaPai 成功码 (不是 0)
@@ -378,6 +376,9 @@ def create_session(token: str) -> requests.Session:
         "platform": "web",
     })
     s.headers.update(h)
+    # Warmup: 先 GET 一次 landing HTML 再跑 XHR — 真人打开 SPA 必然的顺序,
+    # 直接干 API 是硬 bot 指纹. 幂等, 失败不影响后续.
+    warmup_session(s, "alphapai")
     return s
 
 
@@ -819,7 +820,7 @@ def classify_pdf_error_kind(err: str | None) -> str:
     # 两类同等不可重试.
     if "code=810002" in s or "上限" in s:
         return "quota_exhausted"
-    if "code=10222" in s or "无权限查看" in s:
+    if "code=10222" in s or "无权限查看" in s or "hasPermission=false" in s:
         return "permission_denied"
     if "file name too long" in low or "errno 36" in low:
         return "filename_too_long"
@@ -828,7 +829,12 @@ def classify_pdf_error_kind(err: str | None) -> str:
             "ssl", "eof", "timeout", "timed out",
             "connection reset", "remote disconnected")):
         return "transient_network"
-    if "code=404" in s or "code=400404" in s or "empty_data" in s:
+    # 2026-04-24: empty_data_type=str 实测 258/286 来自 hasPermission=false 的条目
+    # (外资研报付费墙: 服务端降级返回 data="" 而不是 code=10222). 历史 286 条全部
+    # 是非付费条目也拿不到 PDF → 等同 permission_denied 不自动重试.
+    if "empty_data" in s:
+        return "permission_denied"
+    if "code=404" in s or "code=400404" in s:
         return "not_found"
     if s.startswith("relpath_err"):
         return "relpath_unknown"
@@ -985,6 +991,14 @@ def enrich_report_doc(session, doc: dict, item: dict, pdf_dir: Path,
         doc["pdf_flag"] = False
         return
     doc["pdf_flag"] = True
+    # 2026-04-24: list 里已显式标 hasPermission=False (外资研报 / 独立研究付费墙)
+    # 的条目, 直接标 permission_denied 而不打 detail/pdf 端点 —— 实测这些条目
+    # 服务端返回 data="" 而不是 code=10222, scraper 原先分类成 empty_data_type=str
+    # 的 "not_found", 触发每次 --resume 都重新打 API 浪费配额. 现在短路跳过.
+    if item.get("hasPermission") is False:
+        doc["pdf_error"] = "relpath_err: hasPermission=false (list 无权限)"
+        doc["pdf_error_kind"] = "permission_denied"
+        return
     raw_id = item.get("id")
     version = item.get("version") or item.get("originalVersion") or 1
     relpath, err = fetch_report_pdf_relpath(session, raw_id, version)

@@ -521,8 +521,8 @@ def _build_data_sources() -> dict[str, tuple[str, tuple[str, ...]]]:
         # 合并: sentimentrader_indicators 在 funda DB 下
         "sentimentrader": (s.sentimentrader_mongo_db,
                           (getattr(s, "sentimentrader_collection", "indicators"),)),
-        # 合并: semianalysis_posts 在 funda DB 下 (u_spider 不能建新 DB)
-        "semianalysis": (getattr(s, "semianalysis_mongo_db", s.funda_mongo_db),
+        # 2026-04-24 迁到独立 foreign-website DB (之前 co-host 在 funda)
+        "semianalysis": (getattr(s, "semianalysis_mongo_db", "foreign-website"),
                         (getattr(s, "semianalysis_collection", "semianalysis_posts"),)),
     }
 

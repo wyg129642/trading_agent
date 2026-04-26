@@ -71,7 +71,8 @@ def test_specs_by_lookup_tables():
     ("nvda", ["NVDA.US"]),
     ("0700", ["00700.HK"]),
     ("00700", ["00700.HK"]),
-    ("600519", ["600519.SH", "600519.SZ", "600519.BJ"]),
+    # 6-digit code → precise prefix classification (600 → SH)
+    ("600519", ["600519.SH"]),
     ("", []),
     ("   ", []),
 ])
@@ -94,6 +95,172 @@ def test_normalize_ticker_hk_already_padded_stays():
 def test_normalize_ticker_input_preserves_case_for_canonical():
     # Mixed case input that IS canonical format should be upper-cased
     assert normalize_ticker_input("nvda.us") == ["NVDA.US"]
+
+
+def test_normalize_ticker_chinese_name_resolves():
+    """Curated alias table maps Chinese company names to canonical tickers."""
+    assert normalize_ticker_input("英伟达") == ["NVDA.US"]
+    assert normalize_ticker_input("腾讯") == ["00700.HK"]
+    assert normalize_ticker_input("苹果") == ["AAPL.US"]
+
+
+def test_normalize_ticker_english_company_name_resolves():
+    """English company names also hit the alias table; case-insensitive."""
+    assert normalize_ticker_input("Intel") == ["INTC.US"]
+    assert normalize_ticker_input("Apple") == ["AAPL.US"]
+    assert normalize_ticker_input("NVIDIA") == ["NVDA.US"]
+    # Case-insensitive — lower / mixed should still hit the alias.
+    assert normalize_ticker_input("intel") == ["INTC.US"]
+
+
+def test_normalize_ticker_composite_cn_en_form():
+    """Crawler tag1 / alphapai labels often pack CN+EN: '谷歌/Google'."""
+    assert normalize_ticker_input("谷歌/Google") == ["GOOGL.US"]
+
+
+def test_normalize_ticker_a_share_classified_to_single_market():
+    """6-digit A-share codes resolve via prefix classification (matches corpus
+    ingestion logic), not multi-variant brute force."""
+    assert normalize_ticker_input("600519") == ["600519.SH"]    # SH (600 prefix)
+    assert normalize_ticker_input("000001") == ["000001.SZ"]    # SZ (000 prefix)
+    assert normalize_ticker_input("300750") == ["300750.SZ"]    # ChiNext under SZ
+    assert normalize_ticker_input("688981") == ["688981.SH"]    # STAR under SH
+
+
+def test_normalize_ticker_unknown_six_digit_falls_back():
+    """6-digit code with no recognized A-share prefix → defensive multi-variant."""
+    out = normalize_ticker_input("999999")
+    assert "999999.SH" in out
+    assert "999999.SZ" in out
+    assert "999999.BJ" in out
+
+
+def test_normalize_ticker_unknown_letters_default_to_us():
+    """Alphanumeric input that's not in alias table still defaults to .US."""
+    out = normalize_ticker_input("NVDA1")
+    assert out == ["NVDA1.US"]
+
+
+def test_kb_search_tool_description_mentions_name_aliases():
+    """Tool description must tell the LLM that company names are accepted, so
+    it doesn't silently fall back to passing only canonical codes."""
+    schema = next(t for t in KB_TOOLS if t["function"]["name"] == "kb_search")
+    desc = schema["function"]["parameters"]["properties"]["tickers"]["description"]
+    assert "中文" in desc, "tickers description should mention Chinese name support"
+    assert "英文" in desc, "tickers description should mention English name support"
+    # The misleading '0700.HK' example must have been corrected to padded form.
+    assert "00700.HK" in desc
+    assert "'0700.HK'" not in desc
+
+
+# ── Bulk alias table (auto-generated from Tushare + prod CSV) ──────
+
+
+def test_bulk_alias_table_loaded():
+    """aliases_bulk.json should be present and contribute thousands of entries."""
+    from backend.app.services.ticker_normalizer import _alias_table
+    table = _alias_table()
+    # Curated alone is ≈260 entries. Bulk should push us well past 10k.
+    assert len(table) > 10_000, f"alias table only has {len(table)} entries — bulk file missing?"
+
+
+def test_bulk_resolves_a_share_chinese_names():
+    """A-share companies whose Chinese names live only in bulk (not curated)."""
+    cases = [
+        ("贵州茅台", "600519.SH"),
+        ("招商银行", "600036.SH"),
+        ("中国平安", "601318.SH"),
+        ("工商银行", "601398.SH"),
+        ("中信证券", "600030.SH"),
+        ("宁德时代", "300750.SZ"),
+        ("中芯国际", "688981.SH"),
+    ]
+    for name, expected in cases:
+        assert normalize_ticker_input(name) == [expected], f"{name} → expected {expected}"
+
+
+def test_bulk_resolves_hk_chinese_and_class_indicator():
+    """HK names from Tushare hk_basic, plus -W/-SW class indicator stripping."""
+    cases = [
+        ("腾讯控股",   "00700.HK"),
+        ("腾讯",       "00700.HK"),   # stem-stripped from 腾讯控股
+        ("阿里巴巴-W", "09988.HK"),   # -W suffix preserved from Tushare
+        ("阿里巴巴",   "09988.HK"),   # -W stripped via stem
+        ("美团-W",     "03690.HK"),
+        ("美团",       "03690.HK"),
+        ("京东集团-SW", "09618.HK"),
+    ]
+    for name, expected in cases:
+        assert normalize_ticker_input(name) == [expected], f"{name} → expected {expected}"
+
+
+def test_bulk_resolves_us_names_via_intersection():
+    """US names: Chinese (from prod CSV) + English (from Tushare) intersection."""
+    cases = [
+        ("苹果",      "AAPL.US"),
+        ("微软",      "MSFT.US"),
+        ("谷歌",      "GOOG.US"),    # could be GOOG or GOOGL — accept both
+        ("Walmart",   "WMT.US"),
+        ("Coca Cola", "KO.US"),
+    ]
+    for name, expected in cases:
+        out = normalize_ticker_input(name)
+        if name == "谷歌":
+            # Prod CSV maps both GOOG and GOOGL to "谷歌" — first-write-wins
+            assert out and out[0] in {"GOOG.US", "GOOGL.US"}, f"谷歌 → {out}"
+        else:
+            assert out == [expected], f"{name} → expected {expected}, got {out}"
+
+
+def test_bulk_handles_legal_suffix_stems():
+    """Tushare full forms with legal suffixes should resolve at every peel."""
+    cases = [
+        # Tencent Holdings Ltd. → Tencent Holdings → Tencent  (all → 00700.HK)
+        ("Tencent Holdings Ltd.", "00700.HK"),
+        ("Tencent Holdings",      "00700.HK"),
+        ("Tencent",               "00700.HK"),
+        # Long-form Alibaba bulk-stems still hit HK primary
+        ("Alibaba Group Holding Limited", "09988.HK"),
+        ("Alibaba Group Holding",         "09988.HK"),
+        ("Alibaba Group",                 "09988.HK"),
+        # but the short brand "Alibaba" alone is curated → US ADR (see next test)
+    ]
+    for name, expected in cases:
+        assert normalize_ticker_input(name) == [expected], f"{name} → expected {expected}"
+
+
+def test_curated_short_brand_routes_us_adr_for_dual_listed():
+    """For dual-listed names, curated prefers ADR for English brand and HK for
+    Chinese name. Alibaba is the canonical example of this divergence."""
+    assert normalize_ticker_input("Alibaba") == ["BABA.US"]    # English short → ADR
+    assert normalize_ticker_input("阿里巴巴")  == ["09988.HK"]   # Chinese name → HK
+    # Long forms — curated has no entry, bulk wins → HK primary.
+    assert normalize_ticker_input("Alibaba Group") == ["09988.HK"]
+
+
+def test_curated_overrides_bulk_on_conflict():
+    """If aliases.json has a different mapping than aliases_bulk.json for the
+    same key, the curated one must win. NVDA is in both — curated says NVDA.US."""
+    from backend.app.services.ticker_normalizer import _alias_table
+    table = _alias_table()
+    # NVDA itself is keyed by both curated and bulk; result should match curated.
+    assert table.get("英伟达") == "NVDA.US"
+    # Curated has Apple → AAPL.US; bulk would also provide it. Either way: AAPL.US.
+    assert normalize_ticker_input("Apple") == ["AAPL.US"]
+
+
+def test_bulk_skips_unsafe_keys():
+    """Single/double-letter latin keys must NOT be hijacked by bulk so that
+    'A', 'BP', 'GE' (all real US tickers) still resolve via the bare-code
+    fallback rather than mapping to whatever Tushare's first-row enname was."""
+    # 'A' is the literal Agilent ticker. Bulk should not have 'A' as a key.
+    from backend.app.services.ticker_normalizer import _alias_table
+    table = _alias_table()
+    assert "A" not in table or table["A"] == "A.US"
+    assert "BP" not in table or table["BP"] == "BP.US"
+    # Bare 'NVDA' goes through alias table (curated) → NVDA.US. Same outcome
+    # as the bare-code fallback would produce.
+    assert normalize_ticker_input("NVDA") == ["NVDA.US"]
 
 
 # ── Date parsing ────────────────────────────────────────────────
@@ -610,7 +777,7 @@ def test_jinmen_stub_redirects_to_kb_search():
 def test_kb_system_prompt_mentions_all_eight_platforms():
     """The prompt must enumerate all 8 platforms so the LLM knows the scope."""
     for kw in ["Alpha派", "进门财经", "久谦", "第三方桥", "Funda",
-               "港推", "峰会", "阿尔法引擎"]:
+               "岗底斯", "峰会", "阿尔法引擎"]:
         assert kw in KB_SYSTEM_PROMPT, f"missing platform mention: {kw}"
 
 

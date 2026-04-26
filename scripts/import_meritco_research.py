@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,8 +27,8 @@ from pathlib import Path
 from pymongo import MongoClient, ASCENDING, DESCENDING
 
 RESEARCH_ROOT = Path("/home/ygwang/trading_agent/meritco_crawl/data/research")
-MONGO_URI_DEFAULT = "mongodb://localhost:27017"
-MONGO_DB_DEFAULT = "meritco"
+MONGO_URI_DEFAULT = os.environ.get("MONGO_URI", "mongodb://127.0.0.1:27018/")
+MONGO_DB_DEFAULT = "jiuqian-full"
 COLLECTION = "research"
 
 

@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Migrate local MongoDB (8 crawler DBs + sentimentrader) + PDF files
-to remote MongoDB at 192.168.31.176:35002.
+"""Generic Mongo→Mongo migrator (8 crawler DBs + sentimentrader + PDFs).
 
-Source: mongodb://localhost:27017 (Docker container `crawl_data`)
-Target: mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin
+History
+-------
+Originally written 2026-04-23 to push local Mongo → remote ops cluster
+(192.168.31.176:35002, u_spider auth). On 2026-04-26 it was repurposed
+in the reverse direction (remote → local `ta-mongo-crawl` :27018) by
+overriding ``--src-uri`` and ``--dst-uri`` at invocation time. The
+defaults below now point at local; pass ``--src-uri`` / ``--dst-uri``
+explicitly for any other direction.
+
+Default Source: mongodb://localhost:27017 (legacy local Mongo container)
+Default Target: mongodb://127.0.0.1:27018/ (current ta-mongo-crawl)
 
 Mapping (source DB -> target DB):
   alphapai       -> alphapai-full
@@ -68,7 +76,7 @@ STATE_FILE = REPO / "logs" / "migration_state.json"
 LOG_FILE = REPO / "logs" / "migration.log"
 
 SRC_URI = "mongodb://localhost:27017"
-DST_URI = "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin"
+DST_URI = "mongodb://127.0.0.1:27018/"
 
 # Source DB -> (target DB, pdf root dir or None, sentimentrader merge prefix)
 DB_MAP: dict[str, tuple[str, Optional[str]]] = {

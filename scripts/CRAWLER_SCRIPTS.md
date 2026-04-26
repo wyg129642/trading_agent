@@ -82,7 +82,7 @@ bash scripts/start_crawler_realtime.sh --stop    # 停 watcher + 停 monitor
 | jinmen_oversea | 进门外资研报 | `--oversea-reports --skip-pdf` | `jinmen_oversea_reports.log` |
 | meritco | 久谦 type 2+3 | `--type 2,3 --skip-pdf` | `meritco.log` |
 | funda | Funda 3 分类串行 | `--category all` | `funda.log` |
-| gangtise | 港推 3 分类串行 | `--type all --skip-pdf` | `gangtise_summary.log` |
+| gangtise | 岗底斯 3 分类串行 | `--type all --skip-pdf` | `gangtise_summary.log` |
 | acecamp | AceCamp | `--type all --skip-detail`(避开 10/session 额度) | `acecamp.log` |
 
 通用参数:

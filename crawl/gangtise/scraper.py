@@ -57,6 +57,7 @@ from antibot import (  # noqa: E402
     add_antibot_args, throttle_from_args, cap_from_args,
     AccountBudget, SoftCooldown, detect_soft_warning,
     headers_for_platform, log_config_stamp, budget_from_args,
+    warmup_session,
 )
 from ticker_tag import stamp as _stamp_ticker  # noqa: E402
 
@@ -93,7 +94,7 @@ API_BASE = "https://open.gangtise.com"
 # MongoDB 配置
 MONGO_URI_DEFAULT = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 MONGO_DB_DEFAULT = os.environ.get("MONGO_DB", "gangtise-full")
 COL_ACCOUNT = "account"
@@ -123,6 +124,8 @@ def create_session(token: str) -> requests.Session:
         "access_token": token,
     })
     s.headers.update(h)
+    # Warmup: 先 GET /research SPA landing 再调 API
+    warmup_session(s, "gangtise")
     return s
 
 
@@ -293,6 +296,47 @@ def _strip_html(s: str) -> str:
     s = re.sub(r"<[^>]+>", "", s)
     s = html.unescape(s)
     return s.strip()
+
+
+try:
+    from markdownify import markdownify as _markdownify
+    _HAS_MARKDOWNIFY = True
+except ImportError:
+    _HAS_MARKDOWNIFY = False
+
+_BLOCK_HTML_RE = re.compile(
+    r"<\s*(h[1-6]|p|ul|ol|li|table|tr|td|th|div|section|article|blockquote|strong|em|span)\b",
+    re.I,
+)
+# 纪要正文里的时间戳锚点 (跳转到对应音频段) — 渲染时就是噪声, 转成简洁的 [N] 标记.
+_MEETING_NUM_RE = re.compile(
+    r"<span\s+class=['\"]meeting_summary_num['\"][^>]*>\s*(\d+)\s*</span>",
+    re.I,
+)
+
+
+def _summary_text_to_md(text: str) -> str:
+    """Normalize Gangtise summary body to clean Markdown.
+
+    Since 2026-04-21 the `summary/download` endpoint started returning HTML
+    fragments (<h1>/<p>/<ul>/<li>/<span>) for newer docs while older ones stay
+    as plain text. Pass HTML through markdownify so MarkdownRenderer doesn't
+    show raw tags. Plain text passes through untouched.
+    """
+    if not text:
+        return ""
+    if not _BLOCK_HTML_RE.search(text):
+        return text  # 旧格式: 纯文本, 不动
+    s = _MEETING_NUM_RE.sub(r"[\1]", text)
+    if _HAS_MARKDOWNIFY:
+        try:
+            md = _markdownify(s, heading_style="ATX", bullets="-",
+                              strip=["script", "style"])
+            md = re.sub(r"\n{3,}", "\n\n", md).strip()
+            return md
+        except Exception:
+            pass
+    return _strip_html(s)
 
 
 _SAFE_FNAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
@@ -708,7 +752,7 @@ def dump_summary(session, db, item: dict, force: bool = False,
             if url and ext in ("", ".txt"):
                 full_text = fetch_summary_text(session, item.get("id"), url, token=token)
                 break
-    content = full_text or brief
+    content = _summary_text_to_md(full_text or brief)
     full_text_ok = bool(full_text)
     truncated = _looks_truncated(content, brief, full_text_ok)
 
@@ -779,7 +823,29 @@ def dump_research(session, db, item: dict, pdf_dir: Path,
     release_ms = item.get("pubTime") or detail.get("pubTime") or 0
     release_time = _ms_to_str(release_ms)
 
-    rel_path = item.get("file") or detail.get("file") or ""
+    rel_path_raw = item.get("file") or detail.get("file") or ""
+    # 2026-04-26 schema fix: gangtise 平台对部分 "research" 把外链 URL (主要是
+    # 公众号 mp.weixin.qq.com/...) 也塞到 file 字段, 以前直接落到 pdf_rel_path
+    # 跟真正的 CDN 相对路径混淆 (4016/41994 ≈ 10% 是 WeChat URL, pdf_local_path
+    # 全空). 现在拆开:
+    #   - 真 PDF (相对路径 + .pdf 扩展) → pdf_rel_path
+    #   - 任何 http(s):// URL → external_url
+    # 同时 user 要求暂时不抓公众号文章 (低质量), 直接 skip 不入库.
+    is_external_url = bool(rel_path_raw) and rel_path_raw.startswith(("http://", "https://"))
+    is_wechat = is_external_url and "mp.weixin.qq.com" in rel_path_raw
+    if is_wechat:
+        # 完全跳过, 不入库 (避免污染 researches 集合).
+        # 返回 "skipped" 让上游 page-counter 把它算进 skipped (line 1311 严等于检查).
+        return "skipped", {"brief_chars": 0, "pages": 0, "pdf_size": 0, "skip_reason": "wechat_url"}
+
+    if is_external_url:
+        # 非微信外链 — 保留但放到 external_url, 不再借 pdf_rel_path
+        rel_path = ""
+        external_url = rel_path_raw
+    else:
+        rel_path = rel_path_raw
+        external_url = ""
+
     pdf_local = ""
     pdf_size = 0
     pdf_err = ""
@@ -829,6 +895,7 @@ def dump_research(session, db, item: dict, pdf_dir: Path,
         "pdf_local_path": pdf_local,
         "pdf_size_bytes": pdf_size,
         "pdf_download_error": pdf_err,
+        "external_url": external_url,  # 非 PDF 外链 (WeChat 已 skip; 其它外链放这)
         "list_item": item,
         "detail_result": detail,
         "web_url": f"https://open.gangtise.com/research/?id={item.get('rptId')}#/ResearchDetails",
@@ -1422,7 +1489,7 @@ _BJ_TZ = timezone(timedelta(hours=8))
 
 
 def count_today(session, db, args) -> dict:
-    # 港推 release_time 是 Asia/Shanghai 壁钟,--today 必须用 BJ TZ 对齐.
+    # 岗底斯 release_time 是 Asia/Shanghai 壁钟,--today 必须用 BJ TZ 对齐.
     if args.date:
         day_start = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=_BJ_TZ)
         target = args.date
@@ -1567,9 +1634,9 @@ def parse_args():
                    help=f"MongoDB URI (默认 {MONGO_URI_DEFAULT})")
     p.add_argument("--mongo-db", default=MONGO_DB_DEFAULT,
                    help=f"MongoDB 数据库名 (默认 {MONGO_DB_DEFAULT})")
-    # 反爬节流
+    # 反爬节流 — default_cap 2026-04-25 500→0: 实时档不再数量闸
     add_antibot_args(p, default_base=3.0, default_jitter=2.0,
-                     default_burst=40, default_cap=500, platform="gangtise")
+                     default_burst=40, default_cap=0, platform="gangtise")
     return p.parse_args()
 
 

@@ -10,13 +10,35 @@ from fastapi import Depends, Header, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from backend.app.config import Settings, get_settings
-from backend.app.core.database import async_session_factory
+from backend.app.core.database import async_session_factory, get_prod_session_factory
 from backend.app.core.security import decode_access_token
 
 security_scheme = HTTPBearer()
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with async_session_factory() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+
+
+async def get_portfolio_scan_db() -> AsyncGenerator[AsyncSession, None]:
+    """Yield a session against prod's scan tables when the share flag is on.
+
+    The proactive scanner (run_proactive.py) is gated to prod by
+    _prod_only_guard, so portfolio_scan_results / portfolio_scan_baselines
+    on staging's per-env DB are guaranteed empty. This dependency lets
+    breaking-news endpoints transparently read prod's tables on staging
+    while staying on the local DB for prod.
+    """
+    settings = get_settings()
+    factory = (
+        get_prod_session_factory()
+        if settings.portfolio_scan_share_with_prod and settings.is_staging
+        else async_session_factory
+    )
+    async with factory() as session:
         try:
             yield session
         finally:
@@ -47,6 +69,20 @@ async def get_current_admin(user = Depends(get_current_user)):
 async def get_current_boss_or_admin(user = Depends(get_current_user)):
     if user.role not in ("admin", "boss"):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Boss or admin access required")
+    return user
+
+
+async def get_current_non_boss(user = Depends(get_current_user)):
+    """Allow any authenticated user except ``boss``.
+
+    Used by the AI-chat audit log endpoints: regular users see their own
+    runs, admins see everyone's, but boss accounts are blocked entirely.
+    """
+    if user.role == "boss":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This view is unavailable for boss accounts",
+        )
     return user
 
 

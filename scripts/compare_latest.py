@@ -11,11 +11,12 @@ from pymongo import MongoClient
 
 ROOT = Path("/home/ygwang/trading_agent/crawl")
 
-# 2026-04-23 migration — data moved to remote 192.168.31.176:35002 (u_spider).
-# Fall back to remote URI when env MONGO_URI not set.
+# 2026-04-23 migration → remote 192.168.31.176:35002 (u_spider).
+# 2026-04-26 → migrated back to local `ta-mongo-crawl` :27018. The
+# `-full` DB-name suffixes carried over from the remote era.
 MONGO_URI = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 
 # DB name translations matching the migration.

@@ -23,7 +23,11 @@ import pymysql
 logger = logging.getLogger(__name__)
 
 CACHE_TTL_SECONDS = 1800  # 30 min
-QUERY_TIMEOUT_SECONDS = 30.0  # Wind tables have no secondary indexes — full scan is slow
+# Wind tables have no secondary indexes; 35 A-share tickers against
+# ASHARECONSENSUSROLLINGDATAHIS is a 20-45s full scan. The previous 30s cap
+# timed out under load; the warmer runs every 25min with a 30min cache TTL,
+# so the ceiling can be generous without hurting any user request.
+QUERY_TIMEOUT_SECONDS = 60.0
 LOOKBACK_DAYS = 180  # how far back to search for latest consensus row per ticker
 RATING_CYCLE_180D = "263003000"  # Wind code: 30d=263001000, 90d=263002000, 180d=263003000
 

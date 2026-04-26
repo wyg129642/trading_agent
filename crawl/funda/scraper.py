@@ -54,6 +54,7 @@ from antibot import (  # noqa: E402
     add_antibot_args, throttle_from_args, cap_from_args,
     AccountBudget, SoftCooldown, detect_soft_warning,
     headers_for_platform, log_config_stamp, budget_from_args,
+    warmup_session,
 )
 from ticker_tag import stamp as _stamp_ticker  # noqa: E402
 
@@ -83,7 +84,7 @@ DEFAULT_HEADERS = {
 
 MONGO_URI_DEFAULT = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 MONGO_DB_DEFAULT = os.environ.get("MONGO_DB", "funda")
 COL_ACCOUNT = "account"
@@ -251,7 +252,7 @@ def create_client(cookie: str, user_agent: str,
         headers["User-Agent"] = user_agent
     # Funda 特定头 (referer/origin 已由 platform 设, x-trpc-source 是它独有的)
     headers["x-trpc-source"] = "nextjs-react"
-    return httpx.Client(
+    c = httpx.Client(
         base_url=BASE_URL,
         cookies=parse_cookies(cookie),
         headers=headers,
@@ -259,6 +260,9 @@ def create_client(cookie: str, user_agent: str,
         timeout=timeout,
         follow_redirects=True,
     )
+    # Warmup: 先 GET funda.ai landing 再发 tRPC
+    warmup_session(c, "funda")
+    return c
 
 
 def _enc_input(inp: dict) -> str:
@@ -1122,8 +1126,10 @@ def parse_args():
     # 2026-04-24 默认从 3.0/2.0 上调到 3.5/2.5, burst_cd 的默认 (30-60s) 保持,
     # daily_cap 500 / acct_budget 2500 由 antibot.py 负责. 实时档通过 crawler_manager
     # 的 _RT 显式传 --throttle-base 1.5 --throttle-jitter 1.0 覆盖, 不受影响.
+    # 2026-04-25 default_cap 500→0: 实时档不再数量闸. 实时档通过 crawler_manager
+    # _RT 显式传 --throttle-base 1.5 --throttle-jitter 1.0 覆盖节奏, 不受影响.
     add_antibot_args(p, default_base=3.5, default_jitter=2.5,
-                     default_burst=40, default_cap=500, platform="funda")
+                     default_burst=40, default_cap=0, platform="funda")
     return p.parse_args()
 
 

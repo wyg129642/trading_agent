@@ -2,8 +2,16 @@
 
 **Author:** Claude (design) / yugang (approver)
 **Date:** 2026-04-20 (v1 full-RAG draft) / 2026-04-20 (v2 addendum below)
-**Status:** Draft for review — **read the addendum first**
+**Status:** Historical planning doc — current state diverges from the body
 **Scope:** Build a production knowledge-base layer that the chat assistant uses through its existing multi-round tool loop, so subjective researchers can ask deep questions and the LLM iteratively pulls evidence from proprietary crawler data.
+
+> **Note (2026-04-26):** Sections referring to "remote Mongo" or
+> `192.168.31.176:35002` are historical. The crawler corpus + personal KB
+> were migrated to the remote ops cluster on 2026-04-23 and migrated back
+> to the local `ta-mongo-crawl` container (`mongodb://127.0.0.1:27018/`)
+> on 2026-04-26. Schema and DB names (`-full` suffixes, `ti-user-knowledge-base`)
+> carried over both moves. Read CLAUDE.md "Database Architecture" for the
+> current truth.
 
 ---
 

@@ -32,8 +32,7 @@ import GangtiseDB from './pages/GangtiseDB'
 import AceCampDB from './pages/AceCampDB'
 import AceCampPlatformInfo from './pages/AceCampPlatformInfo'
 import AlphaEngineDB from './pages/AlphaEngineDB'
-// SemiAnalysis page disabled — feature wired but hidden from users pending launch.
-// import SemiAnalysisDB from './pages/SemiAnalysisDB'
+import SemiAnalysisDB from './pages/SemiAnalysisDB'
 import JiuqianForum from './pages/JiuqianForum'
 import JiuqianMinutes from './pages/JiuqianMinutes'
 import JiuqianWechat from './pages/JiuqianWechat'
@@ -50,7 +49,6 @@ import PredictionSubmit from './pages/PredictionSubmit'
 import PredictionList from './pages/PredictionList'
 import PredictionBacktest from './pages/PredictionBacktest'
 import DataSources from './pages/DataSources'
-import ResearchLogs from './pages/ResearchLogs'
 import DatabaseOverview from './pages/DatabaseOverview'
 import RevenueModelList from './pages/RevenueModelList'
 import RevenueModel from './pages/RevenueModel'
@@ -63,6 +61,8 @@ import CostDashboard from './pages/CostDashboard'
 import FeedbackDashboard from './pages/FeedbackDashboard'
 import KbDocViewer from './pages/KbDocViewer'
 import PackEditor from './pages/PackEditor'
+import ChatAudit from './pages/ChatAudit'
+import ChatAuditDetail from './pages/ChatAuditDetail'
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token)
@@ -79,6 +79,12 @@ function AdminRoute({ children }: { children: React.ReactNode }) {
 function BossOrAdminRoute({ children }: { children: React.ReactNode }) {
   const user = useAuthStore((s) => s.user)
   if (user?.role !== 'admin' && user?.role !== 'boss') return <Navigate to="/" replace />
+  return <>{children}</>
+}
+
+function NonBossRoute({ children }: { children: React.ReactNode }) {
+  const user = useAuthStore((s) => s.user)
+  if (user?.role === 'boss') return <Navigate to="/" replace />
   return <>{children}</>
 }
 
@@ -152,19 +158,21 @@ export default function App() {
           <Route path="acecamp/platform-info" element={<AceCampPlatformInfo />} />
           <Route path="acecamp/:category" element={<AceCampDB />} />
           <Route path="alphaengine/:category" element={<AlphaEngineDB />} />
-          {/* <Route path="semianalysis" element={<SemiAnalysisDB />} /> */}
+          <Route path="semianalysis" element={<SemiAnalysisDB />} />
           <Route path="jiuqian/forum" element={<JiuqianForum />} />
           <Route path="jiuqian/minutes" element={<JiuqianMinutes />} />
           <Route path="jiuqian/wechat" element={<JiuqianWechat />} />
+          {/* AI chat audit (regular users see only their own runs; boss is blocked) */}
+          <Route path="chat-audit" element={<NonBossRoute><ChatAudit /></NonBossRoute>} />
+          <Route path="chat-audit/:runId" element={<NonBossRoute><ChatAuditDetail /></NonBossRoute>} />
           {/* Admin-only routes */}
           <Route path="admin" element={<AdminRoute><Admin /></AdminRoute>} />
           <Route path="admin/feed" element={<AdminRoute><AdminFeed /></AdminRoute>} />
           <Route path="admin/sources" element={<AdminRoute><Sources /></AdminRoute>} />
-          <Route path="admin/research-logs" element={<AdminRoute><ResearchLogs /></AdminRoute>} />
-          <Route path="data-sources" element={<DataSources />} />
+          <Route path="data-sources" element={<AdminRoute><DataSources /></AdminRoute>} />
           <Route path="engine" element={<AdminRoute><EngineStatus /></AdminRoute>} />
           <Route path="analytics" element={<AdminRoute><Analytics /></AdminRoute>} />
-          <Route path="database-overview" element={<DatabaseOverview />} />
+          <Route path="database-overview" element={<AdminRoute><DatabaseOverview /></AdminRoute>} />
           {/* ── Revenue Modeling ── */}
           <Route path="modeling" element={<RevenueModelList />} />
           <Route path="modeling/recipes" element={<RecipeEditor />} />

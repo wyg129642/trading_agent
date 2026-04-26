@@ -38,6 +38,7 @@ class _Ctx:
         self.total_tokens = 0
         self.total_latency_ms = 0
         self.model = None
+        self.step_config = None
 
     async def emit(self, *_args, **_kw):  # no-op for the helper
         pass

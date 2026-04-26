@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sys
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,9 +20,9 @@ from pymongo import MongoClient, ASCENDING
 from pypdf import PdfReader
 
 PDF_ROOT = Path("/home/ygwang/crawl_data/semianalysis_pdfs")
-MONGO_URI = "mongodb://localhost:27017/"
-DB_NAME = "semianalysis"
-COLL_NAME = "semianalysis"
+MONGO_URI = os.environ.get("MONGO_URI", "mongodb://127.0.0.1:27018/")
+DB_NAME = "foreign-website"
+COLL_NAME = "semianalysis_posts"
 
 
 def sha256_of(path: Path) -> str:

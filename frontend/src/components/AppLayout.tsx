@@ -42,6 +42,7 @@ interface StockSuggestion {
   code: string
   market: string
   label: string
+  canonical_id?: string | null
 }
 
 const MARKET_COLORS: Record<string, string> = {
@@ -70,6 +71,7 @@ export default function AppLayout() {
   }, [user, fetchProfile])
 
   const isAdmin = user?.role === 'admin'
+  const isBoss = user?.role === 'boss'
   const isBossOrAdmin = user?.role === 'admin' || user?.role === 'boss'
 
   // Header search: fetch suggestions
@@ -101,14 +103,39 @@ export default function AppLayout() {
     const stock = option.stock as StockSuggestion
     setHeaderInput('')
     setHeaderSuggestions([])
+    if (stock.canonical_id) {
+      const url = `/stock/${stock.canonical_id}?name=${encodeURIComponent(stock.name)}`
+      window.open(url, '_blank', 'noopener,noreferrer')
+      return
+    }
+    // Suggestion has no canonical (rare — non-portfolio custom market): legacy fallback
     navigate(`/stock-search?q=${encodeURIComponent(stock.label)}`)
   }
 
-  const onHeaderEnter = () => {
+  const onHeaderEnter = async () => {
     const val = headerInput.trim()
     if (!val) return
     setHeaderInput('')
     setHeaderSuggestions([])
+    // Resolve free-text via the same normalizer that wrote `_canonical_tickers`
+    // so an alias hit ("英伟达" / "贵州茅台") routes straight to the Mongo hub.
+    try {
+      const res = await api.get<{ matched: string[]; unmatched: string[] }>(
+        '/unified/normalize',
+        { params: { q: val } },
+      )
+      const canonical = res.data.matched?.[0]
+      if (canonical) {
+        window.open(
+          `/stock/${canonical}?name=${encodeURIComponent(val)}`,
+          '_blank',
+          'noopener,noreferrer',
+        )
+        return
+      }
+    } catch {
+      /* fall through to legacy text search */
+    }
     navigate(`/stock-search?q=${encodeURIComponent(val)}`)
   }
 
@@ -140,6 +167,9 @@ export default function AppLayout() {
       children: [
         { key: '/', icon: <DashboardOutlined />, label: t('nav.dashboard') },
         { key: '/ai-chat', icon: <RobotOutlined />, label: 'AI 研究助手' },
+        ...(isBoss
+          ? []
+          : [{ key: '/chat-audit', icon: <ProfileOutlined />, label: t('nav.chatAudit') }]),
         {
           key: '/modeling',
           icon: <FileTextOutlined />,
@@ -288,8 +318,12 @@ export default function AppLayout() {
       label: '配置',
       children: [
         { key: '/sources', icon: <LinkOutlined />, label: t('nav.sources') },
-        { key: '/data-sources', icon: <DatabaseOutlined />, label: t('nav.dataSources') },
-        { key: '/database-overview', icon: <DatabaseOutlined />, label: t('nav.databaseOverview') },
+        ...(isAdmin
+          ? [
+              { key: '/data-sources', icon: <DatabaseOutlined />, label: t('nav.dataSources') },
+              { key: '/database-overview', icon: <DatabaseOutlined />, label: t('nav.databaseOverview') },
+            ]
+          : []),
       ],
     },
   ]
@@ -303,7 +337,6 @@ export default function AppLayout() {
         { key: '/admin', icon: <TeamOutlined />, label: t('nav.adminUsers') },
         { key: '/admin/feed', icon: <DatabaseOutlined />, label: t('nav.adminFeed') },
         { key: '/admin/sources', icon: <AppstoreOutlined />, label: t('nav.adminSources') },
-        { key: '/admin/research-logs', icon: <ProfileOutlined />, label: t('nav.adminResearchLogs') },
         { key: '/engine', icon: <RocketOutlined />, label: t('nav.adminEngine') },
         { key: '/analytics', icon: <BarChartOutlined />, label: t('nav.adminAnalytics') },
       ],

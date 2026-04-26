@@ -8,14 +8,15 @@ reliable source of truth. ClickHouse is used for long-term analytics only.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.deps import get_db, get_current_boss_or_admin
+from backend.app.deps import get_current_boss_or_admin, get_portfolio_scan_db
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +176,7 @@ _SENTIMENT_FILTER = """
 @router.get("/breaking-news")
 async def list_breaking_news(
     user=Depends(get_current_boss_or_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_portfolio_scan_db),
     ticker: str | None = Query(None, description="Filter by ticker"),
     market: str | None = Query(None, description="Filter by market (us, china, hk, kr, jp)"),
     materiality: str | None = Query(None, description="Filter by materiality (material, critical)"),
@@ -276,7 +277,7 @@ async def list_breaking_news(
 @router.get("/breaking-news/summary")
 async def breaking_news_summary(
     user=Depends(get_current_boss_or_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_portfolio_scan_db),
     hours: int = Query(168, ge=1, le=8760, description="Lookback window in hours"),
 ):
     """Per-ticker summary of breaking news counts and latest materiality.
@@ -338,13 +339,23 @@ async def breaking_news_summary(
 @router.get("/scanner-status")
 async def scanner_status(
     user=Depends(get_current_boss_or_admin),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_portfolio_scan_db),
 ):
-    """Scanner health: last scan times, active stock count, recent alert count."""
-    sql = text("""
+    """Scanner health: last scan times, active stock count, recent alert count.
+
+    The "offline" threshold has to accommodate the *longest* configured
+    scan interval. Engine settings.yaml uses scan_interval_weekend_min=240
+    (4h on weekends) and scan_interval_closed_min=120 (2h weekday-closed)
+    — so any threshold under ~5h fires false "可能离线" alarms during
+    normal operation. The 5h default = 240min weekend + 60min cycle
+    execution + grace. Override via SCANNER_OFFLINE_THRESHOLD_MIN env var.
+    """
+    threshold_min = int(os.environ.get("SCANNER_OFFLINE_THRESHOLD_MIN", "300"))
+    interval_clause = f"INTERVAL '{threshold_min} minutes'"
+    sql = text(f"""
         SELECT
             COUNT(*) AS total_stocks,
-            COUNT(*) FILTER (WHERE last_scan_at >= NOW() - INTERVAL '2 hours') AS active_stocks,
+            COUNT(*) FILTER (WHERE last_scan_at >= NOW() - {interval_clause}) AS active_stocks,
             MAX(last_scan_at) AS last_scan_at,
             SUM(scan_count) AS total_scans,
             SUM(alert_count) AS total_alerts,
@@ -368,10 +379,17 @@ async def scanner_status(
             "total_scans": 0,
             "total_alerts": 0,
             "stocks_alerted_24h": 0,
+            "threshold_min": threshold_min,
         }
 
     last_scan = row.last_scan_at
-    is_active = row.active_stocks > 0
+    # Liveness check: did MAX(last_scan_at) advance within the threshold?
+    # Falling back from active_stocks > 0 to MAX comparison so a single
+    # successful scan in the cycle keeps us "active" even when most
+    # stocks lag (typical on weekends with the 4h cycle).
+    is_active = bool(
+        last_scan and last_scan >= datetime.now(last_scan.tzinfo) - timedelta(minutes=threshold_min)
+    )
 
     return {
         "status": "active" if is_active else "stale",
@@ -381,4 +399,5 @@ async def scanner_status(
         "total_scans": row.total_scans or 0,
         "total_alerts": row.total_alerts or 0,
         "stocks_alerted_24h": row.stocks_alerted_24h or 0,
+        "threshold_min": threshold_min,
     }

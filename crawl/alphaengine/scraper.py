@@ -64,7 +64,7 @@ from antibot import (  # noqa: E402
     add_antibot_args, throttle_from_args, cap_from_args,
     AccountBudget, SoftCooldown, detect_soft_warning,
     headers_for_platform, log_config_stamp, budget_from_args,
-    account_id_for_alphaengine,
+    account_id_for_alphaengine, warmup_session,
 )
 from ticker_tag import stamp as _stamp_ticker  # noqa: E402
 try:
@@ -240,7 +240,7 @@ DETAIL_PATH = "/api/v1/kmpsummary/summary/detail"
 
 MONGO_URI_DEFAULT = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 MONGO_DB_DEFAULT = os.environ.get("MONGO_DB", "alphaengine")
 COL_ACCOUNT = "account"
@@ -316,6 +316,8 @@ def create_session(token: str) -> requests.Session:
         "Authorization": f"Bearer {token}",
     })
     s.headers.update(h)
+    # Warmup: 先 GET alphaengine.top landing 再调 streamSearch / detail
+    warmup_session(s, "alphaengine")
     return s
 
 
@@ -1766,8 +1768,9 @@ def parse_args():
                    help=f"MongoDB URI (默认 {MONGO_URI_DEFAULT})")
     p.add_argument("--mongo-db", default=MONGO_DB_DEFAULT,
                    help=f"MongoDB 数据库名 (默认 {MONGO_DB_DEFAULT})")
+    # 2026-04-25 default_cap 500→0: 实时档不再数量闸 (antibot.py 顶部 §5).
     add_antibot_args(p, default_base=3.0, default_jitter=2.0,
-                     default_burst=40, default_cap=500, platform="alphaengine")
+                     default_burst=40, default_cap=0, platform="alphaengine")
     return p.parse_args()
 
 

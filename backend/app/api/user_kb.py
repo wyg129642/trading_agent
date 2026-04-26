@@ -342,6 +342,27 @@ class PingResponse(BaseModel):
     message: str
 
 
+class AsrPingResponse(BaseModel):
+    """Rich ASR health snapshot for the personal-KB banner + status pill.
+
+    Fields beyond ``ok``/``message`` let the frontend distinguish a genuine
+    outage from a single tunnel blip, and surface live queue depth + GPU
+    state so the user can see why a transcription is slow rather than
+    staring at a stuck progress bar.
+    """
+    ok: bool
+    message: str
+    classification: str  # ok | loading | transient | unreachable | misconfigured
+    latency_ms: Optional[int] = None
+    model_loaded: Optional[bool] = None
+    model_error: Optional[str] = None
+    model_path: Optional[str] = None
+    gpu: Optional[bool] = None
+    gpu_count: Optional[int] = None
+    queue_size: Optional[int] = None
+    jobs_in_memory: Optional[int] = None
+
+
 # ── Ping / stats ──────────────────────────────────────────────
 
 
@@ -352,17 +373,30 @@ async def ping(_user: User = Depends(get_current_user)):
     return PingResponse(ok=ok, message=reason)
 
 
-@router.get("/asr/ping", response_model=PingResponse)
+@router.get("/asr/ping", response_model=AsrPingResponse)
 async def asr_ping(_user: User = Depends(get_current_user)):
     """ASR service reachability check via the supervised SSH tunnel.
 
-    The frontend uses this to show a banner ("语音转写服务不可用") on the
-    upload page when the jumpbox tunnel is down — so a user doesn't stare
-    at a stuck progress bar for 12 minutes while the backend's retry loop
-    exhausts itself.
+    The frontend uses this to drive the personal-KB banner + status pill:
+    green when everything's healthy (model loaded, GPU present, queue
+    drained), amber when the model is still warming up, red only after the
+    retry-hardened probe has failed, so a fleeting tunnel blip doesn't
+    blank the page for the rest of the session.
     """
-    ok, reason = await user_kb_asr_client.probe()
-    return PingResponse(ok=ok, message=reason)
+    r = await user_kb_asr_client.probe_detailed()
+    return AsrPingResponse(
+        ok=r.ok,
+        message=r.reason,
+        classification=r.classification,
+        latency_ms=r.latency_ms,
+        model_loaded=r.model_loaded,
+        model_error=r.model_error,
+        model_path=r.model_path,
+        gpu=r.gpu,
+        gpu_count=r.gpu_count,
+        queue_size=r.queue_size,
+        jobs_in_memory=r.jobs_in_memory,
+    )
 
 
 @router.get("/stats", response_model=StatsResponse)
@@ -429,6 +463,10 @@ async def upload_document(
             )
         resolved_scope = scope
 
+    logger.info(
+        "user_kb upload body-read done user=%s file=%r bytes=%d scope=%s",
+        user.id, filename, len(data), resolved_scope,
+    )
     try:
         outcome = await svc.create_document(
             user_id=str(user.id),
@@ -441,6 +479,10 @@ async def upload_document(
             scope=resolved_scope,
         )
     except ValueError as e:
+        logger.warning(
+            "user_kb upload 400 user=%s file=%r size=%d: %s",
+            user.id, filename, len(data), e,
+        )
         raise HTTPException(400, str(e))
     except Exception as e:
         logger.exception("user_kb upload failed for %s", user.id)

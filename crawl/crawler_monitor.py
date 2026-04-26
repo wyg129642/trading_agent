@@ -37,7 +37,7 @@ from pymongo import MongoClient, DESCENDING
 ROOT = Path(__file__).resolve().parent
 MONGO_URI = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 
 # 2026-04-23 迁移: 本地 -> 远端 DB 名映射 (源端硬编码 "meritco" 等 → 远端 "jiuqian-full").
@@ -51,8 +51,9 @@ DB_MAP_LOCAL_TO_REMOTE = {
     "gangtise":       "gangtise-full",
     "acecamp":        "acecamp",
     "alphaengine":    "alphaengine",
-    "sentimentrader": "funda",  # 合并到 funda.sentimentrader_indicators
-    "semianalysis":   "funda",  # 合并到 funda.semianalysis_posts (u_spider 不能建新 DB)
+    "sentimentrader":  "funda",  # 合并到 funda.sentimentrader_indicators
+    "semianalysis":    "foreign-website",  # 2026-04-24 迁出 funda → foreign-website.semianalysis_posts
+    "the_information": "foreign-website",  # 2026-04-25 新平台, 落 foreign-website.theinformation_posts
 }
 
 # 加载 .env (可选)
@@ -90,6 +91,7 @@ PLATFORMS = [
     {"key": "acecamp",     "label": "AceCamp",               "color": "#ff6b9d"},
     {"key": "alphaengine", "label": "AlphaEngine · 阿尔法引擎", "color": "#b388ff"},
     {"key": "semianalysis","label": "SemiAnalysis",           "color": "#ffd166"},
+    {"key": "the_information", "label": "The Information",    "color": "#7dd3fc"},
 ]
 
 SOURCES = [
@@ -206,6 +208,10 @@ SOURCES = [
         "log": ROOT / "alphapai_crawl" / "logs" / "watch_wechat.log",
         "proc_match": r"alphapai_crawl.*scraper\.py.*--category\s+wechat",
         "item_fields": ["title", "publishDate", "release_time"],
+        # 永久停用 (见 ALL_SCRAPERS 旁的注释). 标 disabled=True 让平台健康聚合
+        # 把这个 tab 当作"不参与健康统计"的归档视图, 否则 wechat 的 proc_alive=False
+        # 会把整个 alphapai 平台健康度拖到 stopped (页面变红, 误以为整站挂了).
+        "disabled": True,
     },
     # --- thirdbridge ---
     {
@@ -447,7 +453,7 @@ SOURCES = [
         "platform": "semianalysis",
         "key": "semianalysis_posts",
         "label": "SemiAnalysis newsletter",
-        "db": "semianalysis",            # remapped to "funda" via DB_MAP below
+        "db": "semianalysis",            # remapped to "foreign-website" via DB_MAP below
         "collection": "semianalysis_posts",
         "state_id": "crawler_semianalysis",
         "state_collection": "_state_semianalysis",
@@ -455,6 +461,24 @@ SOURCES = [
         "log": ROOT / "semianalysis" / "logs" / "watch.log",
         "proc_match": r"semianalysis.*scraper\.py",
         "item_fields": ["title", "organization", "release_time"],
+        "time_field": "release_time",
+    },
+    # --- the_information (theinformation.com) — 2026-04-25 ---
+    # 列表 SSR HTML 抓 6100+ 历史归档卡片 (title / authors / date / category /
+    # excerpt / image), 匿名模式. 详情页全文在付费墙后, 默认 isContentPaywalled=True.
+    # _id 用 slug, article_id 是 numeric (单调). DB 落 foreign-website.theinformation_posts.
+    {
+        "platform": "the_information",
+        "key": "theinformation_articles",
+        "label": "Articles",
+        "db": "the_information",          # remapped to "foreign-website" via DB_MAP below
+        "collection": "theinformation_posts",
+        "state_id": "crawler_articles",
+        "state_collection": "_state_theinformation",
+        "doc_filter": {},
+        "log": ROOT / "the_information" / "logs" / "watch.log",
+        "proc_match": r"the_information.*scraper\.py",
+        "item_fields": ["title", "category", "release_time"],
         "time_field": "release_time",
     },
 ]
@@ -747,10 +771,17 @@ def _last_round_ts(log_lines: list[str]) -> datetime | None:
 
 
 def classify_health(log_lines: list[str], proc_alive: bool,
-                    interval_s: int = 300) -> dict:
+                    interval_s: int = 300,
+                    disabled: bool = False) -> dict:
     """根据日志尾 + 进程状态给出健康度.
-    ok / warn / stopped
+    ok / warn / stopped / disabled (永久停用, 不参与平台健康聚合)
     """
+    # 永久停用 (source.disabled=True) — 进程本来就不该在跑, 不报红.
+    # 只在进程还活着时降级到 warn, 提醒操作员: 停用闸门被绕过了.
+    if disabled:
+        if proc_alive:
+            return {"state": "warn", "reason": "已停用但进程仍在运行"}
+        return {"state": "disabled", "reason": "永久停用 (只读归档)"}
     # 先扫 tail: 如果是"掉线"级别的错误(认证/session 死), 无论进程死活都报红并给出具体原因;
     # 进程死 + 非认证错误 → stopped 但 reason 比 "进程未运行" 更具体.
     # 只看最后 20 行 —— 跑了好几天的 watcher 日志里更早的 401 不代表现在还 401.
@@ -867,7 +898,8 @@ def collect(source: dict, client: MongoClient, procs: list[dict]) -> dict:
 
     log_path = effective_log_path(source)
     log_tail_50 = tail_log(log_path, lines=80)
-    health = classify_health(log_tail_50, bool(proc))
+    health = classify_health(log_tail_50, bool(proc),
+                             disabled=bool(source.get("disabled")))
 
     # 内容空检测 (OTP 锁侦测): 只对 jinmen 纪要生效 —— 平台对 aiSummaryAuth=0
     # 的条目要求 WAF 短信 OTP, scraper 访问到会存下 stats 全 0 的壳.
@@ -905,6 +937,7 @@ def collect(source: dict, client: MongoClient, procs: list[dict]) -> dict:
         "label": source["label"],
         "db": source["db"],
         "collection": source["collection"],
+        "disabled": bool(source.get("disabled")),
         "total": total,
         "today_added": today_added,
         "time_range": time_range,  # {oldest_ms, newest_ms, span_days} 或 {}
@@ -1042,15 +1075,19 @@ def snapshot(with_feed: bool = True, feed_limit: int = 30) -> dict:
                       if "error" not in r and r.get("latest_crawled_at")]
         latest = max(latest_dts) if latest_dts else None
 
-        # 平台级健康度 = (子分类里最差的) + (backend 认证状态)
-        # severity: stopped > warn > ok
-        severity = {"stopped": 2, "warn": 1, "ok": 0}
+        # 平台级健康度 = (子分类里最差的 — 跳过永久停用 tab) + (backend 认证状态)
+        # severity: stopped > warn > ok. disabled 不参与聚合 (归档视图).
+        severity = {"stopped": 2, "warn": 1, "ok": 0, "disabled": -1}
         worst = {"state": "ok", "reason": ""}
         for r in tabs:
+            if r.get("disabled"):
+                continue  # 永久停用 tab 不拖平台红
             if "error" in r:
                 worst = {"state": "stopped", "reason": r.get("error", "")}
                 continue
             h = r.get("health") or {"state": "ok", "reason": ""}
+            if h.get("state") == "disabled":
+                continue
             if severity.get(h["state"], 0) > severity.get(worst["state"], 0):
                 worst = h
 
@@ -1399,6 +1436,20 @@ RESTART_CONFIG: dict[str, dict] = {
         "desc": "SemiAnalysis Substack cookie (可选, 整串 document.cookie 含 substack.sid=...). "
                 "留空即匿名模式 — free 内容可抓, paid 只拿 preview.",
     },
+    "the_information": {
+        "dir": ROOT / "the_information",
+        "log": ROOT / "the_information" / "logs" / "watch.log",
+        "proc_match": r"the_information.*scraper\.py",
+        "args": ["--watch", "--resume", "--interval", "1800",
+                 "--throttle-base", "5.0", "--throttle-jitter", "3.0",
+                 "--burst-size", "20", "--daily-cap", "200"],
+        "creds_file": ROOT / "the_information" / "credentials.json",
+        "token_field": "cookie",
+        "token_check": lambda s: (s == "") or ("session" in s.lower()) or ("cf_clearance" in s),
+        "desc": "The Information cookie (可选, 整串 document.cookie 含 Rails session + cf_clearance). "
+                "留空即匿名模式 — 可抓列表卡片 (title/authors/date/excerpt/image), "
+                "全文体在付费墙后默认 isContentPaywalled=True.",
+    },
 }
 
 
@@ -1520,14 +1571,14 @@ ALL_SCRAPERS: list[tuple] = [
                      "--interval", "120",
                      "--throttle-base", "3.0", "--throttle-jitter", "2.0",
                      "--burst-size", "20",
-                     "--burst-cooldown-min", "15", "--burst-cooldown-max", "40",
-                     "--daily-cap", "300"],                "watch_articles.log"),
+                     "--burst-cooldown-min", "15", "--burst-cooldown-max", "40"],
+                                                           "watch_articles.log"),
     ("acecamp",     ["--type", "opinions",
                      "--interval", "180",
                      "--throttle-base", "3.0", "--throttle-jitter", "2.0",
                      "--burst-size", "20",
-                     "--burst-cooldown-min", "15", "--burst-cooldown-max", "40",
-                     "--daily-cap", "200"],                "watch_opinions.log"),
+                     "--burst-cooldown-min", "15", "--burst-cooldown-max", "40"],
+                                                           "watch_opinions.log"),
 
     # alphaengine: 4 分类并行 + 1 独立 PDF 回填 worker.
     # 所有 list watcher 都加 --skip-pdf + --interval 1200 (20 min) 覆盖
@@ -1544,15 +1595,20 @@ ALL_SCRAPERS: list[tuple] = [
     # 配额绕过 enrich worker — 用 detail 端点 + 签名 COS URL 绕开 REFRESH_LIMIT
     # 和 PDF 下载双重配额. 每小时补 100/category 正文+PDF. 即使 list 被锁也能跑.
     # (CRAWLERS.md §9.5.8 list-vs-detail 配额不对称, 2026-04-22 AlphaEngine 验证)
-    # daily-cap 200 在这里 *特意* 保留 (区别于 mode_args 默认), 因为 enrich 走
-    # detail bypass quota, 单进程上限自定一个稍紧的数.
+    # --backfill-max 100 是业务参数 (每 tick 补多少条), 保留; 反爬数量闸靠
+    # 节奏 + SoftCooldown, 不设 --daily-cap (2026-04-25 v2.2).
     ("alphaengine", ["--enrich-via-detail", "--enrich-watch", "--category", "all",
-                     "--interval", "3600", "--daily-cap", "200", "--backfill-max", "100"],
+                     "--interval", "3600", "--backfill-max", "100"],
                                                                     "watch_detail_enrich.log"),
 
     # semianalysis (Substack) — low velocity (~3-5 posts/week), single watcher.
     # 30-min interval, anonymous by default, cookie unlocks paid bodies.
     ("semianalysis", ["--interval", "1800"],                        "watch.log"),
+
+    # the_information — 列表 SSR 卡片抓取, 匿名模式 (~9 cards/page * ~678 pages),
+    # 节奏慢 (FINDINGS: 4 URL 40s 内触发 403). 30-min 轮询, 增量到已知 article_id 即停.
+    ("the_information", ["--interval", "1800",
+                         "--start-page", "1", "--max-page", "700"], "watch.log"),
 
     # ("thirdbridge", [],                None),  # token expired, 先不拉
 ]
@@ -1565,16 +1621,22 @@ def _mode_args(mode: str) -> list[str]:
     dawn: 凌晨低峰档, cron 02:00-06:00 触发."""
     base = ["--watch", "--resume"]
     if mode == "realtime":
-        # 关键修正:
-        # - 不再 --burst-size 0 (旧值): 实时档每 80 条仍喘息一次, 异常有人接
-        # - --daily-cap 600 (旧 0): 单进程每轮上限, 防跑飞
-        # - --account-budget 由 antibot 默认值兜底, 不再覆盖 (各平台不同)
+        # 2026-04-25 (v2.2): 实时档不再传数量闸 (--daily-cap / --account-budget)
+        # 旧值 600 / 平台字典默认实际反爬价值≈0, 撞顶就漏抓增量 (alphapai
+        # report 单日 881 条撞 3000 的顶). 反爬靠:
+        #   - 节奏: --throttle-base/jitter (Gaussian), --burst-size 80 喘息保险
+        #   - 指纹: UA 池 + headers_for_platform (sec-ch-ua / Referer / locale)
+        #   - 联动: SoftCooldown (任一 watcher 撞警告 → 全平台静默 30~60min)
+        #   - 时段: time_of_day_multiplier (夜/周末自动放慢)
+        #   - 新: --idle-window-prob 0.03 — 3% 概率 60-180s 切 tab 停留
+        # --burst-size 80 保留 (跟"数量闸"不同, 这是"喘息节奏", 模拟真人
+        # 连续翻一会儿就停一下, 是浏览器行为模拟的一部分).
         return base + ["--since-hours", "24", "--interval", "30",
                        "--throttle-base", "1.5", "--throttle-jitter", "1.0",
                        "--burst-size", "80",
                        "--burst-cooldown-min", "10",
                        "--burst-cooldown-max", "25",
-                       "--daily-cap", "600"]
+                       "--idle-window-prob", "0.03"]
     if mode == "backfill":
         # 推荐回填档 — 跟 historical 区别:
         #  • --account-role bg     →  走后台桶, realtime 主桶 ≥70% 时 bg 自动停
@@ -1623,12 +1685,12 @@ def _source_args_clean(cfg: dict) -> list[str]:
     drop = {"--watch", "--resume", "--since-hours", "--interval",
             "--throttle-base", "--throttle-jitter",
             "--burst-size", "--burst-cooldown-min", "--burst-cooldown-max",
-            "--daily-cap", "--account-budget",
+            "--daily-cap", "--account-budget", "--idle-window-prob",
             "--category", "--type", "--reports"}
     drop_pair = {"--since-hours", "--interval",
                  "--throttle-base", "--throttle-jitter",
                  "--burst-size", "--burst-cooldown-min", "--burst-cooldown-max",
-                 "--daily-cap", "--account-budget",
+                 "--daily-cap", "--account-budget", "--idle-window-prob",
                  "--category", "--type"}  # 这些带值; --reports 是 flag 不带值
     args = list(cfg["args"])
     i = 0
@@ -2306,6 +2368,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .status-dot.dot-ok   { background:#5dd39e; box-shadow:0 0 4px rgba(93,211,158,0.35); }
   .status-dot.dot-warn { background:#f0c674; box-shadow:0 0 4px rgba(240,198,116,0.35); }
   .status-dot.dot-stop { background:#ef6f6c; box-shadow:0 0 4px rgba(239,111,108,0.4); }
+  .status-dot.dot-dis  { background:#6b7688; box-shadow:none; opacity:0.55; }
   .auth-pill {
     display:inline-block; padding:2px 10px; border-radius:10px;
     font-size:11px; font-weight:500; cursor:help;
@@ -2581,7 +2644,9 @@ def render_html(snap: dict) -> str:
         for t in p.get("tabs", []):
             th = t.get("health") or {}
             tstate = th.get("state", "ok")
-            dot_cls = {"ok": "dot-ok", "warn": "dot-warn", "stopped": "dot-stop"}.get(tstate, "dot-ok")
+            dot_cls = {"ok": "dot-ok", "warn": "dot-warn",
+                       "stopped": "dot-stop",
+                       "disabled": "dot-dis"}.get(tstate, "dot-ok")
             tproc = t.get("process") or {}
             tip_parts = [str(t.get("label") or t.get("key"))]
             if tproc.get("pid"):
@@ -2596,9 +2661,10 @@ def render_html(snap: dict) -> str:
             )
         dots_bar = "".join(dots_html) or "<span class='dim'>(无 variant)</span>"
 
-        # 汇总: N/M 活跃, 加上平台级 reason (若非 ok)
-        tab_total = len(p.get("tabs", []))
-        tab_ok = sum(1 for t in p.get("tabs", [])
+        # 汇总: N/M 活跃 (不计 disabled tab — 它们是归档视图, 永久不跑)
+        tab_visible = [t for t in p.get("tabs", []) if not t.get("disabled")]
+        tab_total = len(tab_visible)
+        tab_ok = sum(1 for t in tab_visible
                       if (t.get("health") or {}).get("state") == "ok")
         h = p.get("health") or {}
         summary_cls = "ok" if h.get("state") == "ok" else (

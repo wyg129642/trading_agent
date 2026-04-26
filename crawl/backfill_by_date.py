@@ -74,7 +74,7 @@ CST = timezone(timedelta(hours=8))
 # from env (crawler_monitor + .env already set MONGO_URI) with remote fallback.
 MONGO_URI = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 
 # Remote DB names differ from the old local short names. Target.mongo_db keeps

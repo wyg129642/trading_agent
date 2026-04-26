@@ -54,6 +54,7 @@ from antibot import (  # noqa: E402
     add_antibot_args, throttle_from_args, cap_from_args,
     AccountBudget, SoftCooldown, detect_soft_warning,
     headers_for_platform, log_config_stamp, budget_from_args,
+    warmup_session,
 )
 from ticker_tag import stamp as _stamp_ticker  # noqa: E402
 
@@ -95,7 +96,7 @@ ACCOUNT_ENDPOINTS = [
 
 MONGO_URI_DEFAULT = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 MONGO_DB_DEFAULT = os.environ.get("MONGO_DB", "jiuqian-full")
 COL_FORUM = "forum"
@@ -205,13 +206,16 @@ def create_client(token: str, user_agent: str, timeout: float = 30.0) -> httpx.C
     })
     # Lower-case some headers httpx is happy with both cases — meritco's
     # X-My-Header signing checks lowercase, so normalize here.
-    return httpx.Client(
+    c = httpx.Client(
         base_url=API_BASE,
         timeout=timeout,
         http2=False,
         trust_env=False,
         headers=h,
     )
+    # Warmup: landing HTML 先访问一次, 停 2-5s, 再发 XHR (参见 antibot.warmup_session).
+    warmup_session(c, "meritco")
+    return c
 
 
 def _raise_auth_or_http(resp: httpx.Response) -> None:
@@ -1294,9 +1298,9 @@ def parse_args():
                    help="强制重下本地已存在的 PDF")
     p.add_argument("--pdf-only", action="store_true",
                    help="backfill 模式: 不抓列表, 只扫已入库文档, 补齐缺失 PDF")
-    # 反爬节流 (crawl/antibot.py)
+    # 反爬节流 (crawl/antibot.py) — default_cap 2026-04-25 500→0: 实时档不再数量闸
     add_antibot_args(p, default_base=3.0, default_jitter=2.0,
-                     default_burst=40, default_cap=500, platform="meritco")
+                     default_burst=40, default_cap=0, platform="meritco")
     return p.parse_args()
 
 

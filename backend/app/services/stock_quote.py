@@ -278,9 +278,13 @@ async def _fetch_ashare_batch(
         for t, m in pairs
     }
     try:
+        # clickhouse_provider now caches a persistent client, so the warm path
+        # is ~20ms. The cold path still pays a server-side 3-35s handshake
+        # (not TCP — raw curl is 0.5ms); budget 75s so the first warmer call
+        # after restart always primes the cache instead of aborting empty.
         ch_data = await asyncio.wait_for(
             loop.run_in_executor(None, fetch_ashare_quotes_sync, pairs, settings),
-            timeout=6.0,
+            timeout=75.0,
         )
     except asyncio.TimeoutError:
         logger.warning("ClickHouse A-share query timed out")

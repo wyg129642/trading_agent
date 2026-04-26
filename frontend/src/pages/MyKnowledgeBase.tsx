@@ -34,6 +34,8 @@ import {
   SoundOutlined, FolderOutlined, FolderOpenOutlined,
   PlusOutlined, TagOutlined, LineChartOutlined, FolderAddOutlined,
   SearchOutlined, AppstoreOutlined, ThunderboltOutlined,
+  CheckCircleFilled, ExclamationCircleFilled, SyncOutlined,
+  LoadingOutlined, WarningFilled, AudioOutlined,
 } from '@ant-design/icons'
 import api from '../services/api'
 import { useAuthStore } from '../store/auth'
@@ -138,6 +140,22 @@ interface UploadProgressRow {
   error?: string
 }
 
+// Mirror of AsrPingResponse in backend/app/api/user_kb.py. Classification drives
+// banner severity so a single tunnel blip doesn't show the user a red wall.
+export interface AsrHealth {
+  ok: boolean
+  message: string
+  classification: 'ok' | 'loading' | 'transient' | 'unreachable' | 'misconfigured'
+  latency_ms?: number | null
+  model_loaded?: boolean | null
+  model_error?: string | null
+  model_path?: string | null
+  gpu?: boolean | null
+  gpu_count?: number | null
+  queue_size?: number | null
+  jobs_in_memory?: number | null
+}
+
 // ── Theme scoped to this page ───────────────────────────────────
 
 const workspaceTheme = {
@@ -147,6 +165,276 @@ const workspaceTheme = {
     colorLinkHover: '#23b579',
     borderRadius: 6,
   },
+}
+
+// ── ASR health banner ───────────────────────────────────────────
+//
+// Renders the personal-KB ASR status in one compact strip. Four visual
+// states driven by ``health.classification``:
+//
+//   ok           → green pill with "就绪 · 1 GPU · 队列 0 · 12ms"
+//   loading      → amber banner with a spinner ("模型加载中…")
+//   transient    → info banner, auto-healing ("暂时无法连接，正在重试")
+//   unreachable  → warning (not error) banner with a manual 重新检查 button
+//   misconfigured → error banner (config bug, user can't self-heal)
+//
+// Banner is only hidden when health === null (initial fetch in flight) — so
+// the pill is always visible to reassure the user that transcription is live.
+
+function formatAgo(ts: number | null): string {
+  if (!ts) return ''
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000))
+  if (s < 60) return `${s}s 前`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}分钟前`
+  return `${Math.floor(m / 60)}小时前`
+}
+
+interface AsrHealthBannerProps {
+  health: AsrHealth | null
+  checkedAt: number | null
+  checking: boolean
+  onRetry: () => void
+}
+
+function AsrHealthBanner({
+  health, checkedAt, checking, onRetry,
+}: AsrHealthBannerProps) {
+  // Re-render "Xs 前" label on a 5s cadence. Cheap, and keeps the UI honest
+  // about how stale the last check is if the auto-poll ever hangs.
+  const [, forceTick] = useState(0)
+  useEffect(() => {
+    const timer = window.setInterval(() => forceTick((n) => n + 1), 5000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  if (!health) return null
+
+  const ago = checkedAt ? formatAgo(checkedAt) : ''
+
+  // ── Healthy: compact status pill (green bar with live stats) ──
+  if (health.classification === 'ok') {
+    const queue = health.queue_size ?? 0
+    const jobs = health.jobs_in_memory ?? 0
+    const gpu = health.gpu_count ?? (health.gpu ? 1 : 0)
+    const lat = health.latency_ms
+    return (
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: 8,
+        padding: '6px 10px',
+        background: 'linear-gradient(90deg, #ecfdf5 0%, #f0fdf4 100%)',
+        borderBottom: '1px solid #bbf7d0',
+        fontSize: 11,
+      }}>
+        <CheckCircleFilled style={{ color: '#10b981', fontSize: 13 }} />
+        <AudioOutlined style={{ color: '#10b981' }} />
+        <Text style={{ color: '#065f46', fontWeight: 500 }}>
+          语音转写就绪
+        </Text>
+        <Text type="secondary" style={{ fontSize: 11 }}>·</Text>
+        <Tag
+          color={queue > 0 ? 'orange' : 'green'}
+          style={{ margin: 0, fontSize: 10, padding: '0 6px', lineHeight: '16px' }}
+        >
+          队列 {queue}{jobs > queue ? ` / ${jobs}` : ''}
+        </Tag>
+        {gpu > 0 && (
+          <Tag color="blue" style={{
+            margin: 0, fontSize: 10, padding: '0 6px', lineHeight: '16px',
+          }}>
+            {gpu} GPU
+          </Tag>
+        )}
+        {typeof lat === 'number' && (
+          <Text type="secondary" style={{ fontSize: 10 }}>{lat}ms</Text>
+        )}
+        <div style={{ flex: 1 }} />
+        {checking ? (
+          <LoadingOutlined style={{ color: '#10b981', fontSize: 11 }} />
+        ) : ago ? (
+          <Tooltip title={`上次检查: ${ago}`}>
+            <Text type="secondary" style={{ fontSize: 10 }}>{ago}</Text>
+          </Tooltip>
+        ) : null}
+        <Tooltip title="重新检查">
+          <Button
+            type="text" size="small" icon={<SyncOutlined spin={checking} />}
+            onClick={onRetry} disabled={checking}
+            style={{ color: '#10b981' }}
+          />
+        </Tooltip>
+      </div>
+    )
+  }
+
+  // ── Unhealthy: Alert banner, severity keyed by classification ──
+  let type: 'warning' | 'info' | 'error' = 'warning'
+  let icon: React.ReactNode = <ExclamationCircleFilled />
+  let message = '语音转写服务不可用'
+  let description: React.ReactNode = health.message
+
+  if (health.classification === 'loading') {
+    type = 'info'
+    icon = <LoadingOutlined spin />
+    message = '语音模型加载中'
+    description = '服务已连接，GPU 上的模型还在 warmup。稍等即可开始上传。'
+  } else if (health.classification === 'transient') {
+    type = 'info'
+    icon = <SyncOutlined spin />
+    message = '语音转写连接暂时不稳'
+    description = '单次探测失败，正在自动重试。已入队的文件会由后台继续处理。'
+  } else if (health.classification === 'unreachable') {
+    type = 'warning'
+    icon = <WarningFilled />
+    message = '语音转写服务暂不可用'
+    description = (
+      <>
+        <div>{health.message || 'SSH 隧道似乎掉线了。'}</div>
+        <Text type="secondary" style={{ fontSize: 11 }}>
+          已上传的音频会自动放入待解析队列，服务恢复后无需重传。
+        </Text>
+      </>
+    )
+  } else if (health.classification === 'misconfigured') {
+    type = 'error'
+    icon = <ExclamationCircleFilled />
+    message = '语音转写配置缺失'
+    description = health.message || '管理员需要在 backend/app/config.py 配置 asr_service_url。'
+  }
+
+  return (
+    <Alert
+      type={type} showIcon banner icon={icon}
+      message={<span style={{ fontSize: 12 }}>{message}</span>}
+      description={
+        <Space direction="vertical" size={2} style={{ width: '100%' }}>
+          <Text type="secondary" style={{ fontSize: 11, whiteSpace: 'pre-wrap' }}>
+            {description}
+          </Text>
+          <Space size={8} style={{ fontSize: 10, color: 'var(--ws-text-secondary, #6b7280)' }}>
+            {ago && <span>上次检查 {ago}</span>}
+            {typeof health.latency_ms === 'number' && (
+              <span>· 延迟 {health.latency_ms}ms</span>
+            )}
+          </Space>
+        </Space>
+      }
+      action={
+        <Button
+          size="small" icon={<SyncOutlined spin={checking} />}
+          onClick={onRetry} disabled={checking}
+        >
+          重新检查
+        </Button>
+      }
+    />
+  )
+}
+
+// ── Audio parse-state card ──────────────────────────────────────
+//
+// Replaces the bland "等待解析完成后可查看正文" placeholder for audio docs
+// that are still in flight. Shows:
+//   - a live progress bar (from parse_progress_percent)
+//   - the current phase (upload / ASR / chunking / embedding / ...)
+//   - live ASR queue depth so a "stuck at 0%" bar makes sense to the user
+//   - failure detail + inline 重试转写 button when parse_status=failed
+//   - a "tunnel down" hint when the ASR health says so
+
+interface AudioParseStateCardProps {
+  doc: DocumentRow
+  asrHealth: AsrHealth | null
+  canEdit: boolean
+  onReparse: () => void
+}
+
+function AudioParseStateCard({
+  doc, asrHealth, canEdit, onReparse,
+}: AudioParseStateCardProps) {
+  const phase = doc.parse_phase || ''
+  const percent = Math.max(0, Math.min(100, doc.parse_progress_percent || 0))
+  const failed = doc.parse_status === 'failed'
+  const parsing = doc.parse_status === 'parsing'
+  const pending = doc.parse_status === 'pending'
+
+  const tunnelDown = asrHealth?.classification === 'unreachable'
+    || asrHealth?.classification === 'misconfigured'
+
+  let title: React.ReactNode
+  let accent: string
+  if (failed) {
+    title = <><ExclamationCircleFilled style={{ color: '#ef4444' }} /> 转写失败</>
+    accent = '#fef2f2'
+  } else if (parsing) {
+    title = <><LoadingOutlined spin style={{ color: '#2ec98a' }} /> 正在转写</>
+    accent = '#f0fdf4'
+  } else {
+    title = <><SyncOutlined spin style={{ color: '#f59e0b' }} /> 排队中</>
+    accent = '#fffbeb'
+  }
+
+  return (
+    <Card
+      size="small"
+      style={{ background: accent, border: '1px solid var(--ws-border)' }}
+      title={<Space size={8}>{title}</Space>}
+      extra={canEdit && (failed || pending) ? (
+        <Button
+          size="small" type="primary" icon={<SyncOutlined />}
+          onClick={onReparse}
+        >
+          重试转写
+        </Button>
+      ) : null}
+    >
+      <Space direction="vertical" size={8} style={{ width: '100%' }}>
+        <Progress
+          percent={percent}
+          size="small"
+          status={failed ? 'exception' : parsing ? 'active' : 'normal'}
+          strokeColor={failed ? undefined : '#2ec98a'}
+        />
+        {phase && (
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            阶段：{phase}
+          </Text>
+        )}
+        {failed && doc.parse_error && (
+          <Alert
+            type="error" showIcon
+            style={{ fontSize: 11 }}
+            message={<span style={{ fontSize: 12 }}>错误详情</span>}
+            description={
+              <pre style={{
+                margin: 0, fontSize: 11, whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word', maxHeight: 120, overflowY: 'auto',
+              }}>
+                {doc.parse_error}
+              </pre>
+            }
+          />
+        )}
+        {tunnelDown && !failed && (
+          <Alert
+            type="info" showIcon
+            style={{ fontSize: 11 }}
+            message={<span style={{ fontSize: 12 }}>语音转写服务尚未就绪</span>}
+            description={
+              <Text type="secondary" style={{ fontSize: 11 }}>
+                服务一恢复，后台会自动继续处理这个文件，不用重传。
+              </Text>
+            }
+          />
+        )}
+        {asrHealth?.ok && parsing && (
+          <Text type="secondary" style={{ fontSize: 11 }}>
+            🎙️ Qwen3-ASR · 当前队列 {asrHealth.queue_size ?? 0}
+            {asrHealth.gpu_count ? ` · ${asrHealth.gpu_count} GPU` : ''}
+          </Text>
+        )}
+      </Space>
+    </Card>
+  )
 }
 
 // ── Main ────────────────────────────────────────────────────────
@@ -172,8 +460,9 @@ export default function MyKnowledgeBase() {
   const [docsLoading, setDocsLoading] = useState(false)
   const [pingOk, setPingOk] = useState<boolean | null>(null)
   const [pingMsg, setPingMsg] = useState('')
-  const [asrOk, setAsrOk] = useState<boolean | null>(null)
-  const [asrMsg, setAsrMsg] = useState('')
+  const [asrHealth, setAsrHealth] = useState<AsrHealth | null>(null)
+  const [asrCheckedAt, setAsrCheckedAt] = useState<number | null>(null)
+  const [asrChecking, setAsrChecking] = useState(false)
   const [treeSearch, setTreeSearch] = useState('')
 
   const [uploadRows, setUploadRows] = useState<UploadProgressRow[]>([])
@@ -268,11 +557,20 @@ export default function MyKnowledgeBase() {
   }, [])
 
   const fetchAsrPing = useCallback(async () => {
+    setAsrChecking(true)
     try {
-      const res = await api.get<{ ok: boolean; message: string }>('/user-kb/asr/ping')
-      setAsrOk(res.data.ok); setAsrMsg(res.data.message)
+      const res = await api.get<AsrHealth>('/user-kb/asr/ping')
+      setAsrHealth(res.data)
     } catch (err: any) {
-      setAsrOk(false); setAsrMsg(err?.message || 'asr ping failed')
+      // Network error from the frontend's own perspective (e.g. backend
+      // itself down) — treat as unreachable, same as the probe failing.
+      const msg = err?.response?.data?.detail || err?.message || 'asr ping failed'
+      setAsrHealth({
+        ok: false, message: msg, classification: 'unreachable',
+      })
+    } finally {
+      setAsrCheckedAt(Date.now())
+      setAsrChecking(false)
     }
   }, [])
 
@@ -323,6 +621,19 @@ export default function MyKnowledgeBase() {
   }, [scope])
 
   useEffect(() => { fetchPing(); fetchAsrPing() }, [fetchPing, fetchAsrPing])
+
+  // Auto-refresh the ASR health so a transient tunnel blip self-heals without
+  // the user having to refresh the page. Faster cadence (15 s) while a job is
+  // actively in flight, slower (45 s) when idle.
+  useEffect(() => {
+    const hasActiveAudio = allDocs.some(
+      (d) => isAudioDoc(d.file_extension)
+        && (d.parse_status === 'pending' || d.parse_status === 'parsing'),
+    )
+    const interval = hasActiveAudio ? 15000 : 45000
+    const timer = window.setInterval(fetchAsrPing, interval)
+    return () => window.clearInterval(timer)
+  }, [fetchAsrPing, allDocs])
 
   // When scope flips, refresh everything and reset selection.
   useEffect(() => {
@@ -714,6 +1025,24 @@ export default function MyKnowledgeBase() {
     }
   }, [detailDoc, fetchAllDocs, fetchTree, tabsStore])
 
+  const reparseDoc = useCallback(async (doc: DocumentRow) => {
+    try {
+      const res = await api.post<DocumentRow>(`/user-kb/documents/${doc.id}/reparse`)
+      antdMessage.success('已重新排队解析')
+      // Optimistically reflect the new parse_status in the drawer so the
+      // progress bar appears immediately — the server has already reset
+      // ``parse_progress_percent`` / ``parse_status`` to pending.
+      if (detailDoc?.id === doc.id) setDetailDoc(res.data)
+      // Also retrigger a health check — most "failed" audio docs are the
+      // direct result of the tunnel being down mid-parse, and the user is
+      // about to watch this retry, so show them the live service state.
+      fetchAsrPing()
+      await Promise.all([fetchAllDocs(), fetchTree()])
+    } catch (err: any) {
+      antdMessage.error(`重试解析失败: ${err?.response?.data?.detail || err.message}`)
+    }
+  }, [detailDoc, fetchAllDocs, fetchTree, fetchAsrPing])
+
   const downloadOriginal = useCallback((doc: DocumentRow) => {
     (async () => {
       try {
@@ -783,13 +1112,12 @@ export default function MyKnowledgeBase() {
               description={<Text type="secondary" style={{ fontSize: 11 }}>{pingMsg}</Text>}
             />
           )}
-          {asrOk === false && (
-            <Alert
-              type="info" showIcon banner
-              message="语音转写服务暂不可用"
-              description={<Text type="secondary" style={{ fontSize: 11 }}>{asrMsg}</Text>}
-            />
-          )}
+          <AsrHealthBanner
+            health={asrHealth}
+            checkedAt={asrCheckedAt}
+            checking={asrChecking}
+            onRetry={fetchAsrPing}
+          />
 
           {/* Panel tabs */}
           <Tabs
@@ -1123,6 +1451,21 @@ export default function MyKnowledgeBase() {
                 <Space>
                   <Button size="small" icon={<DownloadOutlined />}
                     onClick={() => downloadOriginal(detailDoc)}>下载</Button>
+                  {/* Reparse is meaningful when the doc failed or is stuck in
+                      pending — most commonly because the ASR tunnel went down
+                      mid-transcription. The recovery sweep already retries
+                      every 60s, but a manual button is the faster path when
+                      the user is staring at the drawer. */}
+                  {isAudioDoc(detailDoc.file_extension)
+                    && (detailDoc.parse_status === 'failed'
+                        || detailDoc.parse_status === 'pending') && (
+                    <Button
+                      size="small" icon={<SyncOutlined />}
+                      onClick={() => reparseDoc(detailDoc)}
+                    >
+                      重试转写
+                    </Button>
+                  )}
                   <Popconfirm
                     title="确认删除？" description="不可恢复"
                     onConfirm={() => deleteDoc(detailDoc)}
@@ -1131,6 +1474,19 @@ export default function MyKnowledgeBase() {
                     <Button size="small" danger icon={<DeleteOutlined />}>删除</Button>
                   </Popconfirm>
                 </Space>
+              )}
+              {/* Audio-specific parse-state card: covers parsing / pending /
+                  failed. Shows live progress + phase + GPU queue context so
+                  the user knows exactly what's happening, and surfaces the
+                  reparse affordance near the error when the job fails. */}
+              {isAudioDoc(detailDoc.file_extension)
+                && detailDoc.parse_status !== 'completed' && (
+                <AudioParseStateCard
+                  doc={detailDoc}
+                  asrHealth={asrHealth}
+                  canEdit={canEditDoc(detailDoc)}
+                  onReparse={() => reparseDoc(detailDoc)}
+                />
               )}
               {isAudioDoc(detailDoc.file_extension)
                 && detailDoc.parse_status === 'completed'

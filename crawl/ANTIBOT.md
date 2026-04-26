@@ -1,24 +1,31 @@
 # 反反爬虫机制总览 (Antibot)
 
-> **版本**:2026-04-24 (v2.1, 含 backfill v1)
-> **代码**:`crawl/antibot.py` (~1100 行) + `crawl/crawler_monitor.py::start_all` 改造
+> **版本**:2026-04-25 (v2.2 — 实时档去量闸 + 浏览器模拟加强)
+> **代码**:`crawl/antibot.py` (~1200 行) + `crawl/crawler_monitor.py::start_all` 改造
 > **覆盖**:8 个 HTTP 爬虫 (alphapai / jinmen / meritco / funda / gangtise / acecamp / alphaengine / third_bridge) + 8 个 backfill 脚本。sentimentrader 走 Playwright 单跑不参与。
 
 ---
 
 ## 一句话总览
 
-`crawl/antibot.py` 提供 **9 层基础防御 + 6 层回填增强 = 15 层** 组件,18 个 watcher 不再共享指纹/节奏/账号闸,backfill 不再 24/7 平摊也不会饿死 realtime。任一 watcher 探测到软警告 → 该平台所有 watcher Redis 共享 flag 全局静默 30~60min,把"撞墙等吊销"改成"早一步收手"。
+`crawl/antibot.py` 提供 **10 层基础防御 + 6 层回填增强 = 16 层** 组件,18 个 watcher 不再共享指纹/节奏/账号闸,backfill 不再 24/7 平摊也不会饿死 realtime。任一 watcher 探测到软警告 → 该平台所有 watcher Redis 共享 flag 全局静默 30~60min,把"撞墙等吊销"改成"早一步收手"。
+
+**v2.2 变更**:
+- **实时档去数量闸** — 撤掉 `DailyCap` / `AccountBudget` rt 主桶的默认启用。WAF 抓的是节奏和指纹,不是 24h 总数;撞顶只会漏抓增量(alphapai report 单日 881 条撞 3000 的顶就是这么来的)。
+- **浏览器模拟加强** — `headers_for_platform` 补齐 Chrome 126 真实指纹(`Priority: u=1, i` + `sec-ch-ua-arch/bitness/full-version-list/model/platform-version`);`AdaptiveThrottle` 加 `idle_window_prob` 模拟切 tab;新增 `warmup_session` 在首次建连时先 GET landing HTML 再发 XHR。
+- 数量闸仅 backfill 保留(单进程兜底 + bg→rt floor 让位逻辑)。
 
 ---
 
 ## Part A — 基础 9 层防御 (适用所有 watcher / scraper)
 
-### ① 节奏抖动 (Gaussian + Long-tail)
+### ① 节奏抖动 (Gaussian + Long-tail + Idle-window)
 - 分布:`random.gauss(base, jitter/2)` (旧版 uniform 是机器特征)
 - 截断:`max(0.2, min(base + jitter*2, delay))`
-- 5% 概率叠加 5-30s "读完一条停一下" long-tail
-- CLI:`--throttle-base/-jitter`,`--no-long-tail`
+- 尾部概率分支 (**互斥**,避免一次停 3+ min):
+  - `idle_window_prob` (默认 0.0, 实时档注入 0.03) → 60-180s "切 tab 离开一会儿"
+  - `elif long_tail_prob` (默认 0.05) → 5-30s "读完一条停一下"
+- CLI:`--throttle-base/-jitter`,`--no-long-tail`,`--idle-window-prob N`
 
 ### ② 突发冷却 (Burst Cooldown)
 - 每 N 条请求后 `random.uniform(burst_cooldown_min, burst_cooldown_max)` 长冷却
@@ -43,44 +50,60 @@
 - 同一 watcher 重启 → 同一 UA(像同一个真人单设备)
 - 不同 watcher → 不同 UA(18 个进程自动散到 5-8 个)
 
-### ⑤ 完整 Browser-like Headers
-`headers_for_platform(platform)` 一并配齐:
+### ⑤ Chrome 126 完整 Browser-like Headers (2026-04-25 v2.2 升级)
+`headers_for_platform(platform)` 一并配齐完整 XHR 指纹:
 - `User-Agent` (从池里选)
 - `Accept-Language` (CN 站 zh-CN / US 站 en-US)
-- `sec-ch-ua` / `sec-ch-ua-mobile` / `sec-ch-ua-platform` (modern Chrome 必带)
+- `Accept-Encoding: gzip, deflate, br` (不加 zstd — requests/httpx 不原生支持解压)
+- `Priority: u=1, i` (RFC 9218 HTTP/2 priority hint, Chrome 126+ 必带)
+- Client Hints 全套:
+  - `sec-ch-ua` (简版)
+  - `sec-ch-ua-full-version-list` (详细 build, e.g. `126.0.6478.127`)
+  - `sec-ch-ua-arch` / `sec-ch-ua-bitness` (`"x86"` / `"64"`)
+  - `sec-ch-ua-mobile` / `sec-ch-ua-model` (`?0` / `""`)
+  - `sec-ch-ua-platform` / `sec-ch-ua-platform-version` (Win10/Mac + 版本号)
 - `Sec-Fetch-Dest/Mode/Site`
-- `Referer` / `Origin` (平台正确域)
+- `Referer` / `Origin` (平台正确 landing 域)
 
-### ⑥ 进程内单轮上限 (DailyCap)
+缺这些在现代 Chrome UA 下是硬指纹 (Akamai/Datadome/Cloudflare Turnstile 都会查)。
+
+### ⑥ 进程内单轮上限 (DailyCap) — **实时档默认禁用 (2026-04-25 v2.2)**
 - 单进程单轮抓 N 条就退出 (`if cap.exhausted(): break`)
-- 各档默认见下文「四档运行配置」
+- 实时档 `--daily-cap 0`(不传)— 旧版 600 被 80 条 burst 喘息 + tod 倍增实际覆盖
+- **backfill 档仍保留**,作为单进程跑飞兜底(见「四档运行配置」)
 - CLI:`--daily-cap N` (0=无限)
 
-### ⑦ 跨进程账号 24h 滚动闸 (AccountBudget)
+### ⑦ 跨进程账号 24h 滚动闸 (AccountBudget) — **rt 主桶默认禁用 (2026-04-25 v2.2)**
 - Redis sorted set 记录账号最近 24h **全部** 请求时间戳
 - `account_id` 从 token JWT 解出 uid (或 hash)
-- 同一账号下所有 watcher **共享同一预算桶** — 防 4 个 alphapai watcher × 500 = 2000/天
-- **role="rt"** (主桶, 默认) / **role="bg"** (后台桶, 给 backfill 用 — 见 Part B)
+- 同一账号下所有 watcher **共享同一预算桶**
+- **role="rt"** (主桶,**默认 0 禁用**) / **role="bg"** (后台桶, 给 backfill 用 — 见 Part B)
 
-| 平台 | rt 主桶 24h budget |
-|---|---|
-| alphapai | **3000 / 模块** (roadshow/comment/report 独立桶, 见下) |
-| jinmen | **1500 / 模块** (meetings/reports/oversea_reports 独立桶, 见下) |
-| funda | 2500 |
-| alphaengine | 1500 |
-| **acecamp** | **800** (2026-04-24 事故后, VIP detail quota 极紧) |
-| meritco | 1200 |
-| **thirdbridge** | **300** (反爬最严) |
-| gangtise (例外) | **20000** (1 个 G_token 5 进程共用, 节奏靠 base/burst 不靠数量闸) |
+**2026-04-25 变更**:rt 主桶旧版 300~20000/24h 作为硬封顶,实战检验:
+- alphapai report 财报季单日 881 条撞 3000 的顶 → 漏抓当日增量
+- jinmen reports 17k+ 历史回填一波把 2500 吃光 → meetings/oversea 饿死
+- 先是拆子模块分桶(加复杂度),再是各桶上调到 10000~20000(撞不到,等于没开)
+- 结论:**rt 量闸反爬价值≈0**,WAF 抓的是节奏/指纹/WAF cookie,不是 24h 总数
 
-**按子模块分桶**:alphapai 和 jinmen 的 3 条业务线此前共享一个 24h 桶, 高峰日一个
-category 的回填能把预算吃光, 其它几条实时线饿死. 现在通过 `account_id_for_alphapai()`
-/ `account_id_for_jinmen()` 给 account_id 追 category 后缀 (如
-`u_4210838:meetings` / `u_1244342170433880064:roadshow`), Redis 下的 sorted set
-key 天然分离, 一桶打满不影响其他桶. scraper `main()` 按 args 路由一次确定
-category, 3 个 worker 进程互斥 (一个进程只抓一类) 所以 category 全程不变.
+现行策略:rt 默认 0 不启用,靠 SoftCooldown + 节奏抖动 + UA 池 + Chrome 126
+header 联合防护。`_DEFAULT_ACCOUNT_BUDGET` 字典保留仅作为 bg 桶 `realtime_floor_pct=70` 让位逻辑的参考值。
 
-CLI:`--account-budget N` (0=禁用) / `--account-role rt|bg`
+| 平台 | rt floor 参考 (**不再作为 rt 硬闸**) | 仅用途 |
+|---|---|---|
+| alphapai | 3000 / 模块 | bg→rt 让位对比基准 |
+| jinmen | 1500 / 模块 | 同上 |
+| funda | 2500 | 同上 |
+| alphaengine | 1500 / 模块 | 同上 |
+| acecamp | 800 | 同上 |
+| meritco | 1200 | 同上 |
+| thirdbridge | 300 | 同上 |
+| gangtise | 20000 | 同上 |
+
+**子模块 account_id 后缀保留**(`account_id_for_alphapai` / `_for_jinmen` / `_for_alphaengine`),因为 bg 桶的子模块 floor 对比也用这套分桶 key。
+
+CLI:`--account-budget N` (0=禁用, 默认) / `--account-role rt|bg` (默认 rt;
+backfill 脚本 `add_backfill_args` 会覆盖成 bg)
+紧急限流仍可 CLI 传 `--account-budget 500` 自保。
 Redis key:`crawl:budget:<platform>:<account_id>` (rt) / `:<account_id>:bg` (bg)
 
 ### ⑧ 软警告全局冷却 (SoftCooldown,**核心**)
@@ -103,6 +126,19 @@ CLI:`--no-soft-cooldown` 调试时关闭
 - shell wrapper `sleep $((RANDOM % min(interval, 60))) && exec scraper.py ...`
 - 18 个 tick 散到整个 60s 窗口,**不再每分钟 :00 集体打闪**
 - 同时透传 `CRAWLER_PROCESS_LABEL` env → antibot 据此选 UA
+
+### ⑩ 会话 warmup(新 2026-04-25 v2.2)
+真人打开 SPA 先 GET 一次 HTML 主页,再由浏览器发 XHR。直接干 API 是教科书级 bot 指纹。
+
+`warmup_session(session, platform)` 在 scraper 的 `create_session` / `create_client` 末尾调一次:
+- 用 navigate-style headers(`Accept: text/html...`, `Sec-Fetch-Dest: document`, `Sec-Fetch-Mode: navigate`)GET 平台 landing(`_PLATFORM_HEADERS[platform]["referer"]`)
+- 停 2-5s(模拟页面加载 + 人类看一眼)
+- 把 set-cookie 自动收进 session,后续 XHR 自带
+- 幂等(`session._antibot_warmed` flag),失败不抛异常不影响调用方
+
+接入平台:
+- ✅ alphapai / jinmen / meritco / funda / gangtise / acecamp / alphaengine / semianalysis
+- ❌ third_bridge(AWS Cognito cookie jar 敏感,warmup 可能触发 challenge 或覆盖认证 cookie,故意跳过)
 
 ---
 
@@ -199,18 +235,20 @@ BackfillLock.acquire("gangtise", role="pdf_backfill", ttl_min=30)
 
 ## 四档运行配置 (crawler_monitor `_mode_args`)
 
-| 参数 | **realtime** | **backfill** (新, 推荐) | historical (老兼容) | dawn |
+| 参数 | **realtime** (2026-04-25) | **backfill** (推荐) | historical (老兼容) | dawn |
 |---|---|---|---|---|
 | `--interval` | 30s | **1200s** | 600s | 300s |
 | `--throttle-base` | 1.5s | **4.0s** | 3.0s | 2.5s |
 | `--throttle-jitter` (σ≈/2) | 1.0s | **2.5s** | 2.0s | 1.5s |
 | `--burst-size` | 80 | **30** | 40 | 60 |
 | `--burst-cooldown-min/max` | 10~25s | **60~180s** | 30~60s | 20~45s |
-| `--daily-cap` | 600 | **400** | 500 | 400 |
-| `--account-role` | rt 默认 | **`bg`** | rt | rt |
+| `--daily-cap` | **0 (不传)** | **400** | 500 | 400 |
+| `--account-budget` | **0 (不传)** | 0 (bg 桶接管) | 0 | 0 |
+| `--idle-window-prob` | **0.03** | — | — | — |
+| `--account-role` | rt 默认 (主桶 0 等效禁用) | **`bg`** | rt | rt |
 | `--since-hours` | 24 | (不限) | (不限) | 36 |
 | 工时禁跑 | ❌ | **✅ (各 backfill 脚本主循环执行)** | ❌ | ❌ |
-| 用途 | 实时入库 | **推荐回填,默认走 bg 桶+工时禁跑** | 紧急回填 (跟 realtime 抢主桶) | cron 02:00-06:00 |
+| 用途 | 实时入库 (靠节奏+指纹+SoftCooldown+warmup) | **推荐回填,bg 桶+工时禁跑** | 紧急回填 (跟 realtime 抢主桶) | cron 02:00-06:00 |
 
 **触发**:
 
@@ -592,15 +630,16 @@ curl -X POST 'http://127.0.0.1:8000/api/data-sources/acecamp/crawler/start'
 ## 设计原则(给以后改的人)
 
 1. **任何故障都别让单一 watcher 硬撑** — 软冷却跨进程联动是核心防护
-2. **指纹多样化优先于节奏放慢** — UA 池 + headers 对齐比把 base 调到 10s 更有效
-3. **实时档也要有保险** — 旧版 `--burst-size 0 --daily-cap 0` 是事故隐患
+2. **指纹多样化优先于节奏放慢** — UA 池 + Chrome 126 完整 client-hint + warmup 比把 base 调到 10s 更有效
+3. **实时档不要靠数量闸防跑飞** (2026-04-25 v2.2) — 旧版 `--daily-cap 600` / rt 主桶 1500~20000 经实战验证反爬价值≈0,反而频频漏抓增量。实时档靠:`--burst-size 80` 每 80 条喘息 (这是节奏不是量闸) + Gaussian 抖动 + long_tail + idle_window + 时段倍增 + SoftCooldown + UA 池 + Chrome 126 header 对齐 + warmup。数量闸只在 backfill 脚本保留做单进程兜底。
 4. **凌晨档独立配置** — dawn 模式按低峰时段语义命名,跟 historical 区分
-5. **回填脚本默认走 `--account-role bg`** — 不抢 realtime 主桶,realtime 用量 ≥70% 时自动让位
+5. **回填脚本默认走 `--account-role bg`** — 不抢 realtime 主桶,realtime 用量 ≥70% 时自动让位 (floor 对比读 `_DEFAULT_ACCOUNT_BUDGET` 参考值)
 6. **回填默认强制工时禁跑** — `BackfillWindow.wait_until_allowed()` 是主循环顶部第一件事
 7. **每个 backfill 进程要持锁** — `BackfillLock.acquire(platform, role=唯一)`,死了自动 TTL 清
 8. **每 N 条强制阅读停留** — 切碎稳态密度,比单纯放慢 throttle 有效
 9. **orchestrator (backfill_by_date / backfill_6months) 自己也持一把全局锁** — 防 2 个 orchestrator 同时跑
 10. **子 scraper 默认接受 `--account-role`** — `add_antibot_args` 已加,所有 scraper 都接受 bg flag
 11. **Redis 不可用要降级** — 不能强制依赖,开发机和 CI 不该跑 Redis
-12. **每次启动打 stamp** — 出问题第一手 grep `\[antibot\]` / `\[backfill\]` 就能知道当时配置
+12. **每次启动打 stamp** — 出问题第一手 grep `\[antibot\]` / `\[backfill\]` 就能知道当时配置。rt 桶禁用后 stamp 不再打 `acct_budget=...`,这是正常的
 13. **dry-run 跳过 antibot stack** — 调试时不污染 Redis 桶
+14. **warmup 是幂等的** — 新 session 调一次就够;老 session `_antibot_warmed` 标记会阻止重复 warmup。敏感 cookie jar (如 third_bridge AWS Cognito) 故意跳过。

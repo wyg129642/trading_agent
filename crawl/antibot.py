@@ -3,22 +3,36 @@
 设计目标 — 在不降低可用性的前提下,把爬取行为改造得更像真人浏览, 同时
 确保实时档(低延迟) 与回填档(夜间安全) 都有保险, 避免任何单次故障升级到封号:
 
-1. **节奏抖动: Gaussian + 偶发 long-tail "读完一条停一下"**
+1. **节奏抖动: Gaussian + long-tail 阅读停留 + idle 切 tab 停留**
    均匀抖动是机器特征 (后端方差检测一抓一个准). Gaussian 拟合人类反应时间分布,
-   再以 5% 概率叠加 5-30s "阅读" 长尾, 让请求间隔的高阶矩跟真人对齐.
+   再以 5% 概率叠加 5-30s long-tail ("读完一条停一下"), 3% 概率叠加 60-180s
+   idle window ("切了个 tab 离开一会儿"). 三层让请求间隔的高阶矩跟真人对齐.
 2. **突发冷却**: 每 N 条请求后静止 30~60s (模拟用户"读一下再继续")
 3. **指数退避**: 429/5xx 上逐步加长, 尊重 `Retry-After`
 4. **会话死亡快速失败**: 401/403 = 会话被吊销, 立即抛 `SessionDead` 让调用方提示用户重登, 不要重试
-5. **DailyCap**: 单进程上限 (回退保护, 真正的总量闸是 AccountBudget)
-6. **AccountBudget (新)**: 跨进程账号配额, Redis backed. 同账号多 watcher
-   共享同一 24h 滚动窗预算, 防止 4 个 alphapai watcher × 500 = 2000/天单号被封.
-7. **SoftCooldown (新)**: 软警告全局冷却. 任何 watcher 触发警告 (软 429 / 配额
+5. **DailyCap** (legacy, 实时档默认禁用 2026-04-25): 单进程上限. 实时档不再
+   靠"每轮 N 条"这种量闸防跑飞 — WAF 关心的是节奏和指纹, 不是 24h 总数.
+   backfill 脚本仍会自带一个保守值做单进程兜底, 实时档 watcher 默认 0.
+6. **AccountBudget** (rt 主桶默认禁用 2026-04-25): 跨进程账号配额, Redis backed.
+   旧版每平台 1500~20000 作为 rt 硬封顶, 实际效果是**撞顶就漏抓增量**
+   (alphapai report 单日 881 条撞 3000 就是这么来的), 反爬价值≈0.
+   现在: rt 默认不启用 (0); bg (backfill) 桶保留, 用作 "realtime floor 让位"
+   的比较基准 (backfill 在 rt 用量 >= 70% 时暂停). floor 参考值见
+   `_DEFAULT_ACCOUNT_BUDGET`, 已不作为 rt 硬闸.
+7. **SoftCooldown (核心)**: 软警告全局冷却. 任何 watcher 触发警告 (软 429 / 配额
    截断 / captcha cookie / 风控关键词) → 同平台所有 watcher 静默 30~60min,
-   不等到 401/403 才退. Redis backed, 跨进程立即生效.
-8. **时段倍增 (新)**: 23:00-07:00 CST × 2.5, 周末 × 1.8, 12:00-13:30 × 1.3.
+   不等到 401/403 才退. Redis backed, 跨进程立即生效. 实时档去掉数量闸后,
+   这一层 + 指纹 + 节奏是主要防线.
+8. **时段倍增**: 23:00-07:00 CST × 2.5, 周末 × 1.8, 12:00-13:30 × 1.3.
    24/7 平摊节奏一看就是 cron, 工时形态拉低识别率.
-9. **进程级 UA 池 (新)**: 18 个 watcher 共享 UA = 教科书级 bot signature.
-   按 process label 稳定 hash 映射到 5-8 个 Chrome 122-126 Win/Mac UA.
+9. **进程级 UA 池 + Chrome 126 现代 header**: 18 个 watcher 共享 UA 是教科书级
+   bot signature, pool 按 process label 稳定 hash 映射到 5-8 个 Chrome 122-126
+   Win/Mac UA. `headers_for_platform` 一并配齐 `Priority: u=1, i` 和完整
+   `sec-ch-ua-*` 指纹 (arch/bitness/full-version-list/model/platform-version),
+   跟真实 Chrome 126 的 XHR 指纹对齐.
+10. **会话 warmup (新 2026-04-25)**: `warmup_session(session, platform)` 在
+    scraper create_session 里调一次, 先 GET 一次 landing HTML 再做 XHR, 模拟
+    真人打开 SPA 的顺序. 幂等, 失败不影响调用方.
 
 使用方式 (每个 scraper 在顶部):
 
@@ -208,9 +222,12 @@ _PLATFORM_HEADERS = {
     "gangtise":    {"accept_language": "zh-CN,zh;q=0.9,en;q=0.6",
                     "sec_ch_ua_platform": '"Windows"',
                     "referer": "https://open.gangtise.com/research/"},
+    # acecamp 真实域是 acecamptech.com (scraper 用 WEB_BASE=https://www.acecamptech.com
+    # 覆盖过). 旧默认 ace-camp.com 是无关域名 — 2026-04-25 纠正, 这样
+    # warmup_session / 默认 Referer 都打到正确 landing.
     "acecamp":     {"accept_language": "zh-CN,zh;q=0.9,en;q=0.6",
                     "sec_ch_ua_platform": '"Windows"',
-                    "referer": "https://www.ace-camp.com/"},
+                    "referer": "https://www.acecamptech.com/"},
     # alphaengine referer: API host 是 www.alphaengine.top, 所有 XHR 从同域
     # /#/summary-center SPA 发起. 旧默认 app.alphaengine.com.cn 是老版本或不同环境
     # 的域, 跟 API_BASE 不匹配 → WAF 看到 Referer/Origin 跨域会扣分. scraper
@@ -232,39 +249,144 @@ _PLATFORM_HEADERS = {
     "semianalysis":   {"accept_language": "en-US,en;q=0.9",
                        "sec_ch_ua_platform": '"macOS"',
                        "referer": "https://newsletter.semianalysis.com/archive"},
+    "the_information": {"accept_language": "en-US,en;q=0.9",
+                        "sec_ch_ua_platform": '"Windows"',
+                        "referer": "https://www.theinformation.com/"},
+}
+
+
+# Chrome major → 真实 build full version. Sec-CH-UA-Full-Version-List 是 Chrome 86+
+# 从 `sec-ch-ua` 派生出的 "详细版本" 扩展, 光给 major 会露馅 — 现代 Chrome 默认都发.
+_CHROME_FULL_VERSIONS = {
+    "126": "126.0.6478.127",
+    "125": "125.0.6422.142",
+    "124": "124.0.6367.207",
+    "123": "123.0.6312.122",
+    "122": "122.0.6261.129",
 }
 
 
 def headers_for_platform(platform: str, label: Optional[str] = None) -> dict:
-    """Build a baseline header dict for a platform: UA + locale + sec-ch-ua hints.
-    Caller layers Authorization / Content-Type / custom headers on top.
+    """Build a baseline header dict for a platform: UA + locale + full Chrome 126
+    client-hint fingerprint. Caller layers Authorization / Content-Type on top.
 
-    Sec-CH-UA hints aren't strictly required but their absence on a Chrome UA
-    is itself a tell — modern Chrome always sends them.
+    2026-04-25 (v2.2): 补齐 Chrome 126 默认头 — `Priority: u=1, i` (RFC 9218 hint),
+    全套 `sec-ch-ua-arch/bitness/full-version-list/model/platform-version`. 缺这些
+    在现代 Chrome UA 下是硬指纹 (Akamai/Datadome/Cloudflare Turnstile 都会查).
+
+    不加 zstd 到 Accept-Encoding — requests/httpx 不原生支持 zstd 解压,
+    response 返回 zstd 压缩字节 scraper 会解析失败. `gzip, deflate, br` 对 Chrome
+    122~125 完全合理 (125 才默认加 zstd, 历史 UA 普遍禁用 zstd).
     """
     cfg = _PLATFORM_HEADERS.get(platform, _PLATFORM_HEADERS["alphapai"])
     ua = pick_user_agent(label)
-    # Extract Chrome major from UA for consistent sec-ch-ua hints
     chrome_ver = "126"
     for marker in ("Chrome/126", "Chrome/125", "Chrome/124", "Chrome/123", "Chrome/122"):
         if marker in ua:
             chrome_ver = marker.split("/")[1]
             break
-    sec_ch_ua = f'"Chromium";v="{chrome_ver}", "Not.A/Brand";v="24", "Google Chrome";v="{chrome_ver}"'
+    full_ver = _CHROME_FULL_VERSIONS.get(chrome_ver, f"{chrome_ver}.0.0.0")
+    sec_ch_ua = (f'"Chromium";v="{chrome_ver}", '
+                 f'"Not.A/Brand";v="24", '
+                 f'"Google Chrome";v="{chrome_ver}"')
+    sec_ch_ua_full = (f'"Chromium";v="{full_ver}", '
+                      f'"Not.A/Brand";v="24.0.0.0", '
+                      f'"Google Chrome";v="{full_ver}"')
+    is_mac = cfg["sec_ch_ua_platform"] == '"macOS"'
+    # UA pool 里 mac 都是 Intel ("Intel Mac OS X"), 没有 arm64. Win 也是 x86.
+    arch = '"x86"'
+    bitness = '"64"'
+    platform_ver = '"14.5.0"' if is_mac else '"15.0.0"'
     return {
         "User-Agent": ua,
-        "Accept-Language": cfg["accept_language"],
         "Accept": "application/json, text/plain, */*",
         "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": cfg["accept_language"],
+        # HTTP/2 priority hint (RFC 9218). Chrome 126+ always sends for XHR.
+        "Priority": "u=1, i",
+        # Client Hints - full Chrome 126 set
         "sec-ch-ua": sec_ch_ua,
+        "sec-ch-ua-arch": arch,
+        "sec-ch-ua-bitness": bitness,
+        "sec-ch-ua-full-version-list": sec_ch_ua_full,
         "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-model": '""',
         "sec-ch-ua-platform": cfg["sec_ch_ua_platform"],
+        "sec-ch-ua-platform-version": platform_ver,
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-site",
         "Referer": cfg["referer"],
         "Origin": cfg["referer"].rstrip("/"),
     }
+
+
+def warmup_session(session, platform: str,
+                   pause_min: float = 2.0, pause_max: float = 5.0,
+                   verbose: bool = True) -> bool:
+    """首次建连时先访问 landing 页 — 真人打开 SPA 必然先请求 HTML 再 XHR,
+    直接干 XHR 是硬指纹. 幂等 (对同一 session 多次调用只执行一次).
+
+    Works for both requests.Session and httpx.Client (都支持 .get 和 setattr).
+
+    返回 True 表示 warmup 成功或已 warmed,False 表示失败 (不影响调用方继续).
+    失败不抛异常 — landing 可能被 CDN 重定向 / 返回 HTML 登录页, 这不算错误.
+    """
+    if getattr(session, '_antibot_warmed', False):
+        return True
+    cfg = _PLATFORM_HEADERS.get(platform)
+    if not cfg:
+        try:
+            session._antibot_warmed = True
+        except Exception:
+            pass
+        return False
+    landing = (cfg.get('referer') or '').rstrip('/')
+    if not landing:
+        try:
+            session._antibot_warmed = True
+        except Exception:
+            pass
+        return False
+    # Navigate-style headers — 真人打开主页走的是 HTML GET, 不是 XHR.
+    # Sec-Fetch-* 切到 navigate; Accept 切到 HTML-first.
+    warmup_headers = {
+        "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                   "image/avif,image/webp,image/apng,*/*;q=0.8"),
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    try:
+        r = session.get(landing, headers=warmup_headers, timeout=8,
+                        allow_redirects=True)
+        status = getattr(r, 'status_code', 0)
+        size = len(getattr(r, 'content', b'') or b'')
+        ncookies = 0
+        try:
+            ncookies = len(dict(r.cookies))
+        except Exception:
+            pass
+        if verbose:
+            print(f"  [warmup] {platform} GET {landing} -> {status} "
+                  f"({size}B, cookies+{ncookies})", flush=True)
+        time.sleep(random.uniform(pause_min, pause_max))
+        try:
+            session._antibot_warmed = True
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        if verbose:
+            print(f"  [warmup] {platform} failed: {type(e).__name__}: {e} "
+                  f"(ignore, continue)", flush=True)
+        try:
+            session._antibot_warmed = True
+        except Exception:
+            pass
+        return False
 
 
 # ============================================================================
@@ -997,7 +1119,9 @@ class AdaptiveThrottle:
       - 每 `burst_size` 条请求后, 下一次 sleep 变成 [burst_cooldown_min, burst_cooldown_max] 随机
       - `on_retry` 设置的 backoff 只作用一次, 之后回到正常节奏
       - 正常节奏: max(0.2, gauss(base, jitter/2)) × time_of_day_multiplier
-      - 5% 概率额外叠加 long-tail 5-30s "阅读" 停留
+      - 2026-04-25: normal 节奏尾部依次概率触发 (互斥, 避免一次停 3+ min):
+          * idle_window_prob (默认 0.03) → 60-180s "切 tab 离开一会儿"
+          * elif long_tail_prob (默认 0.05) → 5-30s "读完一条停一下"
       - 出现一次警告 → 后续 N 次请求节奏 ×2 (preemptive_factor)
     """
     base_delay: float = 3.0
@@ -1014,6 +1138,11 @@ class AdaptiveThrottle:
     long_tail_prob: float = 0.05         # 5% 概率叠加阅读停留
     long_tail_min: float = 5.0
     long_tail_max: float = 30.0
+    # idle_window: 更稀疏但更长的"切 tab 离开"停留. 跟 long_tail 互斥 (避免叠加 3+min).
+    # 实时档默认 0.03 (由 crawler_monitor 的 realtime _mode_args 注入), CLI 默认 0.0.
+    idle_window_prob: float = 0.0
+    idle_window_min: float = 60.0
+    idle_window_max: float = 180.0
 
     _count_since_burst: int = field(default=0, init=False)
     _pending_backoff: float = field(default=0.0, init=False)
@@ -1072,8 +1201,16 @@ class AdaptiveThrottle:
             delay *= self._preemptive_factor
             self._preemptive_remaining -= 1
 
-        # 5% long-tail "读完一条停一下"
-        if random.random() < self.long_tail_prob:
+        # Idle window 和 long-tail 互斥 — 前者更稀疏更长 (60-180s, 模拟切 tab),
+        # 后者更常见更短 (5-30s, 模拟读完一条). 两个一起叠加概率太低但万一触发
+        # 就是 3+ min 停留, 会拖累实时响应, 因此 elif 互斥.
+        if self.idle_window_prob > 0 and random.random() < self.idle_window_prob:
+            extra = random.uniform(self.idle_window_min, self.idle_window_max)
+            delay += extra
+            if self.verbose:
+                print(f"  [throttle] idle window +{extra:.0f}s "
+                      f"(模拟切 tab 离开)", flush=True)
+        elif random.random() < self.long_tail_prob:
             extra = random.uniform(self.long_tail_min, self.long_tail_max)
             delay += extra
             if self.verbose:
@@ -1169,26 +1306,19 @@ class DailyCap:
 # CLI 标准化
 # ============================================================================
 
-# 每平台账号 24h 滚动总闸 — 比 daily_cap × watcher 数更安全的总量保护.
-# 估算依据: 实时档期望日入库 ~500-1500 条/平台, ×2 给 backfill / 重试余量.
-# 0 = 不启用 (在调试 / 历史回填等明确不需要时关掉).
+# Per-platform reference values for **estimated realtime peak volume / 24h**.
 #
-# alphapai 2026-04-24 改为 *按子模块* 计算 — roadshow/comment/report 各自独立
-# account_id (suffix `:roadshow` / `:comment` / `:report`), 每桶 3000/24h.
-# 见 `account_budget_for_alphapai()`. 之所以拆是因为旧版 3 个子模块合起来共享
-# 3000, 高峰日会因 report list+detail 把预算吃光, 漏抓 roadshow / comment 的增量.
+# 2026-04-25: 这个字典曾经是 "rt 24h 硬封顶" (add_antibot_args 的默认 --account-budget),
+# 实际价值≈0 — 被 WAF 抓的从来是节奏和指纹, 不是 24h 总数; 撞顶就漏抓增量
+# (alphapai report 单日 881 条撞 3000 就是这么来的). 现在保留只因为 bg 桶的
+# `realtime_floor_pct` 让位逻辑需要一个参考 (AccountBudget.exhausted 对 bg
+# role: 当 rt sibling 用量 >= floor% 时, bg.exhausted=True 暂停 backfill).
+# rt 桶本身不再 default-on, 要启用只能 CLI 传 `--account-budget N>0`.
 #
-# jinmen 2026-04-24 同样按子模块拆 — meetings/reports/oversea_reports 各自
-# 独立 account_id (suffix `:meetings` / `:reports` / `:oversea_reports`), 每桶
-# 1500/24h. 见 `account_id_for_jinmen()`. 旧版 2500 共享时, reports 的历史
-# 回填 (17k+ 条) 会把 24h 窗口吃光, meetings / oversea_reports 的实时增量饿死.
-# 单桶 1500 够 2-3× realtime 峰值 + 有限 backfill 余量, 跨桶不互相干扰.
+# 子模块分桶 (alphapai/jinmen/alphaengine) 保留 — 不同模块的 rt 统计分开算,
+# floor 对比更精准. 见下方 account_id_for_* 函数.
 #
-# alphaengine 2026-04-24 同样按子模块拆 — summary/chinaReport/foreignReport/
-# news (list watcher) + enrich + roadshow_events + pdf_backfill 各自独立
-# account_id, 每桶 1500/24h. 见 `account_id_for_alphaengine()`. 旧版 1500
-# 共享时, foreignReport 撞 REFRESH_LIMIT 退避阶段仍占桶, 其他 list watcher +
-# enrich worker + 独立 backfill 都无法扣配额, 链式饿死.
+# 估算依据 (大致日入库 ×2 余量): 仅供 floor 参照, 不必精确.
 _DEFAULT_ACCOUNT_BUDGET = {
     "alphapai":    3000,    # 单模块额度 (用子模块 suffix 账号隔离, 见下)
     "jinmen":      1500,    # 单模块额度 (用子模块 suffix 账号隔离, 见下)
@@ -1257,16 +1387,22 @@ def account_id_for_alphaengine(base_account_id: str, category: Optional[str]) ->
 def add_antibot_args(parser, default_base: float = 3.0,
                      default_jitter: float = 2.0,
                      default_burst: int = 40,
-                     default_cap: Optional[int] = 500,
+                     default_cap: Optional[int] = 0,
                      platform: Optional[str] = None) -> None:
     """Attach the standard --throttle-* / --daily-cap / --burst-size /
-    --account-budget / --no-time-of-day / --no-soft-cooldown flags.
+    --account-budget / --idle-window-prob / --no-time-of-day / --no-soft-cooldown flags.
 
     每个 scraper 的 parse_args() 里调用:
         add_antibot_args(p, default_base=3, default_jitter=2,
-                         default_burst=40, default_cap=500, platform="alphapai")
+                         default_burst=40, platform="alphapai")
     然后用 `throttle_from_args(args)` / `cap_from_args(args)` /
     `budget_from_args(args, account_id=...)` 建对应实例.
+
+    2026-04-25 (v2.2) 默认变更:
+      - default_cap 500 → 0 (禁用). 实时档不再靠数量闸, 见模块顶部 §5.
+      - --account-budget 默认 0 (禁用 rt 主桶), 见模块顶部 §6.
+      - 新增 --idle-window-prob: 概率触发的 60-180s "切 tab" 停留; 实时档
+        crawler_monitor 注入 0.03, CLI 默认 0.
     """
     g = parser.add_argument_group("反爬 / 节流 (antibot)")
     g.add_argument("--throttle-base", type=float, default=default_base,
@@ -1281,10 +1417,14 @@ def add_antibot_args(parser, default_base: float = 3.0,
     g.add_argument("--burst-cooldown-max", type=float, default=60.0,
                    help="突发冷却最长秒数 (默认 60)")
     g.add_argument("--daily-cap", type=int, default=default_cap,
-                   help=f"单轮最多抓 N 条, 防止封号 (默认 {default_cap}, 0=无限)")
-    default_budget = _DEFAULT_ACCOUNT_BUDGET.get(platform or "", 0) if platform else 0
-    g.add_argument("--account-budget", type=int, default=default_budget,
-                   help=f"24h 跨进程账号总闸 (默认 {default_budget}, 0=禁用)")
+                   help=f"单轮最多抓 N 条, 0=无限 (默认 {default_cap}, "
+                        f"实时档默认 0; backfill 脚本会覆盖)")
+    g.add_argument("--account-budget", type=int, default=0,
+                   help="24h 跨进程账号总闸 (默认 0=禁用; 紧急限流或 backfill 用; "
+                        "实时档不启用, 由 SoftCooldown/节奏/指纹防护)")
+    g.add_argument("--idle-window-prob", type=float, default=0.0,
+                   help="每请求间 N%% 概率叠加 60-180s idle 停留 (模拟切 tab). "
+                        "默认 0.0; 实时档 crawler_monitor 注入 0.03")
     g.add_argument("--no-time-of-day", dest="time_of_day", action="store_false",
                    default=True,
                    help="禁用工时倍增 (调试时偶尔用; 默认开启)")
@@ -1322,6 +1462,7 @@ def throttle_from_args(args, platform: Optional[str] = None) -> AdaptiveThrottle
         enable_time_of_day=getattr(args, "time_of_day", True),
         enable_soft_cooldown=getattr(args, "soft_cooldown", True),
         long_tail_prob=0.05 if getattr(args, "long_tail", True) else 0.0,
+        idle_window_prob=max(0.0, min(1.0, getattr(args, "idle_window_prob", 0.0))),
     )
 
 
@@ -1523,6 +1664,8 @@ __all__ = [
     "account_id_for_alphapai",
     "account_id_for_jinmen",
     "account_id_for_alphaengine",
+    # antibot v2.2 (2026-04-25) — realtime 去数量闸 + 浏览器模拟加强
+    "warmup_session",
     # backfill v1 (2026-04-24)
     "BackfillWindow",
     "BackfillSession",

@@ -17,7 +17,7 @@
 | [`meritco_crawl/`](meritco_crawl/README.md) | research.meritco-group.com (久谦中台) | 论坛 (纪要/专家/业绩/路演/研报/活动) + 久谦研究 | Mongo `meritco` + PDF | Network 32-hex token + RSA X-My-Header |
 | [`third_bridge/`](third_bridge/README.md) | forum.thirdbridge.com (Third Bridge) | 专家访谈 (议程/逐字稿/专家/关联公司) | Mongo `thirdbridge` | Cookie 串 (AWS Cognito + WAF) |
 | [`funda/`](funda/README.md) | funda.ai | 研报 / 8-K / 业绩会 / 情绪因子 | Mongo `funda` | Cookie `session-token` + tRPC superjson |
-| [`gangtise/`](gangtise/README.md) | open.gangtise.com (港推) | 纪要 (7 分类) / 研报 / 首席观点 | Mongo `gangtise` + PDF | localStorage `G_token` (UUID) |
+| [`gangtise/`](gangtise/README.md) | open.gangtise.com (岗底斯) | 纪要 (7 分类) / 研报 / 首席观点 | Mongo `gangtise` + PDF | localStorage `G_token` (UUID) |
 | [`AceCamp/`](AceCamp/README.md) | api.acecamptech.com | 观点 / 纪要 / 调研 | Mongo `acecamp` | Cookie 三件套 |
 | [`sentimentrader/`](sentimentrader/README.md) | users.sentimentrader.com | Smart/Dumb · Fear/Greed · QQQ Optix | Mongo `sentimentrader` + PNG | email + 密码 (Playwright) |
 | `tools/` | `dedup_urls.py` (调研抓包 URL 去重) | — | — | — |

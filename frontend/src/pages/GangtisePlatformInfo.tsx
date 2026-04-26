@@ -883,7 +883,7 @@ function Header({
     >
       <div>
         <Title level={3} style={{ color: '#fff', margin: 0, fontSize: 20 }}>
-          <GlobalOutlined /> Gangtise 港推 · 平台信息
+          <GlobalOutlined /> Gangtise 岗底斯 · 平台信息
         </Title>
         <Text style={{ color: 'rgba(255,255,255,0.9)', fontSize: 12 }}>
           open.gangtise.com 主页实时快照 · 正常 {snap.ok_count}/{snap.module_count}

@@ -9,15 +9,18 @@ Source: https://sentimentrader.com (paid subscription — user-owned).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import time
 from datetime import datetime, timezone
+from email.utils import formatdate, parsedate_to_datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pydantic import BaseModel
 
@@ -33,6 +36,16 @@ _VALID_SLUGS = {"smart_dumb_spread", "cnn_fear_greed", "etf_qqq", "smart_dumb"}
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Indicator response is daily-fresh data; cache 60s to absorb the page-load
+# burst (4 cards × N users hitting at the same time) and skip the remote-Mongo
+# round-trip when the event loop is contended.
+_INDICATORS_CACHE_TTL = 60.0
+_indicators_cache: dict[str, Any] = {"ts": 0.0, "payload": None}
+
+# Chart PNGs are ~110 KB each, total <500 KB — keyed by (slug, mtime) so a
+# fresh scraper run invalidates automatically.
+_image_cache: dict[str, tuple[float, bytes, str]] = {}  # slug -> (mtime, bytes, etag)
 
 
 @lru_cache(maxsize=1)
@@ -134,7 +147,17 @@ async def list_indicators(user: User = Depends(get_current_user)):
 
     Response preserves insertion order (smart/dumb spread → fear&greed → qqq)
     so the frontend can render cards left-to-right consistently.
+
+    Cached for ``_INDICATORS_CACHE_TTL`` seconds so the dashboard's burst load
+    (4 cards × every authed user) doesn't repeatedly drag a 4-doc/3000-point
+    payload over the wire from remote Mongo only to slice it down to 90 points
+    in ``_shape_indicator``. The underlying scraper writes once per day.
     """
+    now = time.monotonic()
+    cached = _indicators_cache.get("payload")
+    if cached is not None and (now - _indicators_cache["ts"]) < _INDICATORS_CACHE_TTL:
+        return cached
+
     settings = get_settings()
     db = _mongo_db()
     # 2026-04-23 迁移: sentimentrader 合并到 funda DB,collection 加前缀
@@ -143,7 +166,15 @@ async def list_indicators(user: User = Depends(get_current_user)):
     # Explicit slug order so the UI is deterministic. Keep the two smart/dumb
     # cards adjacent — spread on the left (derivative), raw confidences next.
     slug_order = ["smart_dumb_spread", "smart_dumb", "cnn_fear_greed", "etf_qqq"]
-    docs = await col.find({"slug": {"$in": slug_order}}).to_list(length=10)
+    # $slice tail: only the most recent SPARKLINE_POINTS data points are ever
+    # rendered, but the docs hold ~750 each. Pulling 750×4 arrays from remote
+    # Mongo for a 90-point sparkline was ~700 ms wire time + JSON encode.
+    projection = {
+        "history_trimmed": {"$slice": -SPARKLINE_POINTS},
+        "benchmark_trimmed": {"$slice": -SPARKLINE_POINTS},
+        "secondary_history_trimmed": {"$slice": -SPARKLINE_POINTS},
+    }
+    docs = await col.find({"slug": {"$in": slug_order}}, projection).to_list(length=10)
     by_slug = {d["slug"]: d for d in docs}
 
     shaped = [_shape_indicator(by_slug[s]) for s in slug_order if s in by_slug]
@@ -158,30 +189,91 @@ async def list_indicators(user: User = Depends(get_current_user)):
         (d.get("updated_at") for d in docs if d.get("updated_at")),
         default=None,
     )
-    return {
+    payload = {
         "indicators": shaped,
         "source": "SentimenTrader",
         "source_url": "https://sentimentrader.com",
         "updated_at": latest.isoformat() if hasattr(latest, "isoformat") else None,
     }
+    _indicators_cache["payload"] = payload
+    _indicators_cache["ts"] = now
+    return payload
 
 
 @router.get("/chart/{slug}.png")
-async def chart_image(slug: str, user: User = Depends(get_current_user)):
+async def chart_image(
+    slug: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+):
     """Serve the latest Playwright screenshot of the real Highcharts chart.
 
-    2026-04-23 迁移后: 图片走 funda DB 的 GridFS (filename 形如
-    `sentimentrader/sentimentrader_images/smart_dumb_spread.png`); 本地
-    `/home/ygwang/crawl_data/sentimentrader_images/` 作为 fallback 保留.
+    Fresh scrapes (hourly cron) overwrite the file on disk in `_IMAGE_DIR`,
+    so disk is always the authoritative source. The 2026-04-23 GridFS
+    migration left a one-shot snapshot in funda's bucket but ongoing runs
+    don't write there — the unified `stream_pdf_or_file` heuristic also
+    can't reconcile sentimentrader's `<platform>/<dir>/<file>` GridFS
+    filename with the `_IMAGE_DIR`-rooted disk layout. Serve disk only.
+
+    Caches bytes in-process keyed by file mtime (~440 KB total for all 4
+    PNGs). Sets ``Cache-Control: private, max-age=300`` + ``ETag`` so the
+    browser short-circuits subsequent loads with a conditional request and
+    we return ``304 Not Modified`` without re-reading the file.
     """
     if slug not in _VALID_SLUGS:
         raise HTTPException(status_code=404, detail="unknown indicator slug")
-    from ..services.pdf_storage import stream_pdf_or_file
-    return await stream_pdf_or_file(
-        db=_mongo_db(),
-        pdf_rel_path=f"sentimentrader/sentimentrader_images/{slug}.png",
-        pdf_root=str(_IMAGE_DIR),
-        download_filename=f"{slug}.png",
-        download=False,
+    file_path = _IMAGE_DIR / f"{slug}.png"
+    try:
+        st = file_path.stat()
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"screenshot missing — run crawl/sentimentrader/scraper.py to refresh",
+        )
+
+    cached = _image_cache.get(slug)
+    if cached and cached[0] == st.st_mtime:
+        _, body, etag = cached
+    else:
+        body = file_path.read_bytes()
+        etag = f'W/"{slug}-{int(st.st_mtime)}-{len(body)}"'
+        _image_cache[slug] = (st.st_mtime, body, etag)
+
+    last_modified = formatdate(st.st_mtime, usegmt=True)
+
+    inm = request.headers.get("if-none-match")
+    if inm and etag in [v.strip() for v in inm.split(",")]:
+        return Response(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Last-Modified": last_modified,
+                "Cache-Control": "private, max-age=300",
+            },
+        )
+    ims = request.headers.get("if-modified-since")
+    if ims:
+        try:
+            ims_dt = parsedate_to_datetime(ims)
+            if ims_dt and ims_dt.timestamp() >= int(st.st_mtime):
+                return Response(
+                    status_code=304,
+                    headers={
+                        "ETag": etag,
+                        "Last-Modified": last_modified,
+                        "Cache-Control": "private, max-age=300",
+                    },
+                )
+        except (TypeError, ValueError):
+            pass
+
+    return Response(
+        content=body,
         media_type="image/png",
+        headers={
+            "ETag": etag,
+            "Last-Modified": last_modified,
+            "Cache-Control": "private, max-age=300",
+            "Content-Length": str(len(body)),
+        },
     )

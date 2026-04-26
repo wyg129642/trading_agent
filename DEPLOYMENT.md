@@ -15,7 +15,6 @@ infrastructure but fully isolated at the data layer.
 | ClickHouse DB               | `db_spider`                                 | `db_spider_staging`                            |
 | Mongo (crawler corpus)      | writes                                      | **read-only** (shared)                         |
 | Mongo (personal KB)         | `documents` / `chunks` / `fs.files` / `fs.chunks` | `stg_documents` / `stg_chunks` / `stg_fs.files` / `stg_fs.chunks` |
-| Mongo (research sessions)   | `research_sessions`                         | `stg_research_sessions`                        |
 | Crawlers / engine / scanner | run                                         | **refuse to start** (guarded in `start_web.sh`) |
 | ASR tunnel / FutuOpenD      | run once                                    | shared with prod                               |
 | Wind MySQL / Market CH      | read                                        | read (same connection)                         |
@@ -152,7 +151,7 @@ The staging worktree's `start_web.sh` hard-refuses to start these:
 - `crawler_monitor.py` + all 24 scrapers
 - The engine subprocess (auto-started by the backend — also prod-only)
 
-Staging still READs crawler output (shared remote Mongo), the Wind MySQL
+Staging still READs crawler output (shared local `ta-mongo-crawl` :27018), the Wind MySQL
 1-致预期 numbers, and the ClickHouse kline stream. The guardrail is
 `_prod_only_guard` in `start_web.sh`.
 
@@ -187,6 +186,32 @@ schema-touching release is a forward fix-release.)
 
 ---
 
+## Chat audit log retention
+
+The AI chat audit pipeline (`backend/app/services/chat_audit_writer.py`) writes
+one row per chat request to `chat_audit_run` and a timeline of events to
+`chat_audit_event`. Default retention is **90 days**; rows older than that should
+be pruned by a nightly job so the events table stays manageable.
+
+Recommended cron entry (run on prod and staging — each has its own
+`trading_agent[_staging]` DB; the writer is enabled in both worktrees):
+
+```cron
+# 03:25 every day — prune chat audit log entries older than 90 days
+25 3 * * *  PGPASSWORD="$PGPASSWORD" psql -h 127.0.0.1 -U ti_app -d trading_agent \
+    -c "DELETE FROM chat_audit_event WHERE created_at < now() - interval '90 days'; \
+        DELETE FROM chat_audit_run   WHERE started_at  < now() - interval '90 days';" \
+    >> /home/ygwang/logs/chat_audit_prune.log 2>&1
+```
+
+`chat_audit_event.run_id` cascades on run delete, but deleting the events
+first is faster on large tables since the FK index on the events side is
+the path the planner picks. If you want a different retention window per
+env, replace `90 days` with the desired interval — there is no env-driven
+config (this is operator policy, not application policy).
+
+---
+
 ## Port / URL cheat-sheet
 
 | What                          | Prod                              | Staging                              |
@@ -211,11 +236,14 @@ schema-touching release is a forward fix-release.)
   instances would complicate `REDIS_URL` env-var plumbing for every
   background daemon (engine, scanner, memory processor).
 
-- **Mongo collection prefix, not a separate DB.** The remote cluster's
-  `u_spider` role cannot issue `createDatabase`, only `createCollection`
-  inside the DBs it was granted. So staging's personal-KB + research-log
-  collections live in the same DB as prod with a `stg_` prefix. Shared
-  crawler data is read-only from staging.
+- **Mongo collection prefix, not a separate DB.** Originally chosen because
+  the remote `u_spider` role couldn't issue `createDatabase`, only
+  `createCollection` inside the DBs it was granted. After migrating Mongo
+  back to the local `ta-mongo-crawl` container we keep this layout — staging's
+  personal-KB + research-log collections live in the same physical DB as
+  prod with a `stg_` prefix; spinning up parallel staging-only DBs would
+  duplicate ~600 GB of PDFs in GridFS for no benefit. Crawler corpus DBs
+  are shared read/write across both worktrees.
 
 - **Milvus collection suffix.** Milvus `CREATE COLLECTION` is the natural
   isolation boundary; running a second Milvus instance would be massive

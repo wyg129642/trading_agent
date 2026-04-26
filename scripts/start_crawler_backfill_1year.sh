@@ -23,7 +23,7 @@
 
 set -euo pipefail
 
-REPO=/home/ygwang/trading_agent
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY=/home/ygwang/miniconda3/envs/agent/bin/python3
 LOGS=$REPO/logs/weekend_backfill
 
@@ -91,11 +91,8 @@ cmd_start() {
 
     log "=== 启动 1 年回填 (since-hours=$SINCE_HOURS) ==="
 
-    # 0. 检查 docker
-    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^crawl_data$'; then
-        err "docker 容器 crawl_data 没在跑"
-        exit 1
-    fi
+    # 0. Mongo 已迁远程 (2026-04-23), 本地 crawl_data 容器不再需要;
+    #    依赖 ta-postgres-dev / ta-redis-dev 由 start_web.sh infra 托管,不在此检查。
 
     # 1. 检查现有 backfill
     local existing=$(count_backfill)

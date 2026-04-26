@@ -59,12 +59,45 @@ async def lifespan(app: FastAPI):
     app.state.redis = aioredis.from_url(settings.redis_url, decode_responses=True)
     logger.info("Redis connected at %s:%d", settings.redis_host, settings.redis_port)
 
-    # Start Engine Manager (auto-starts the trading engine subprocess)
-    from backend.app.services.engine_manager import EngineManager
-    engine_mgr = EngineManager(settings)
-    app.state.engine_manager = engine_mgr
-    await engine_mgr.start()
-    logger.info("Engine manager initialized (auto-start enabled)")
+    # Start the chat-audit writer task. Every ChatTrace.log_* call enqueues
+    # an event onto its in-memory queue; one consumer drains in batches and
+    # writes to chat_audit_run / chat_audit_event. Failure-tolerant: if the
+    # queue can't drain, the rotating logs/chat_debug.log file is still the
+    # parallel safety net.
+    from backend.app.services import chat_audit_writer
+    await chat_audit_writer.start_writer()
+
+    # Pre-warm the crawler Mongo connection pool so the first Stock Hub click
+    # after a restart doesn't serialize 21 TCP handshakes. All 8 crawler DBs
+    # share one URI; firing several concurrent pings opens that many physical
+    # connections in parallel (a single ping only opens one).
+    try:
+        from backend.app.api.stock_hub import _client as _stock_hub_client
+        import asyncio as _asyncio_warm
+        _sh_mongo = _stock_hub_client(settings.alphapai_mongo_uri)
+        await _asyncio_warm.gather(
+            *[_sh_mongo.admin.command("ping") for _ in range(8)],
+            return_exceptions=True,
+        )
+        logger.info("Stock Hub crawler Mongo pool warmed (8 conns)")
+    except Exception as e:
+        logger.warning("Stock Hub crawler Mongo warmup failed: %s", e)
+
+    # Start Engine Manager (auto-starts the trading engine subprocess).
+    # Staging must NOT spawn the engine — it shares prod's Postgres pool, and
+    # every ungraceful backend restart orphans the subprocess (ppid=1), each
+    # holding a fresh connection pool. Accumulated orphans exhausted
+    # max_connections once already (2026-04-24 incident). Gate matches the
+    # CLAUDE.md contract: staging runs uvicorn only; engine stays prod-only.
+    if settings.is_staging:
+        app.state.engine_manager = None
+        logger.info("Engine manager skipped (APP_ENV=staging)")
+    else:
+        from backend.app.services.engine_manager import EngineManager
+        engine_mgr = EngineManager(settings)
+        app.state.engine_manager = engine_mgr
+        await engine_mgr.start()
+        logger.info("Engine manager initialized (auto-start enabled)")
 
     # Start AlphaPai sync + enrichment services (if configured)
     alphapai_sync = None
@@ -79,8 +112,11 @@ async def lifespan(app: FastAPI):
         app.state.alphapai_sync = alphapai_sync
         logger.info("AlphaPai sync service started")
 
-        # Start LLM enrichment if an enrichment LLM is configured
-        if settings.llm_enrichment_api_key:
+        # Realtime LLM enrichment of newly-ingested AlphaPai records is
+        # OFF by default — gated on realtime_llm_enrichment_enabled so the
+        # DB only carries raw scraped data going forward. Existing enrichment
+        # rows are left untouched.
+        if settings.llm_enrichment_api_key and settings.realtime_llm_enrichment_enabled:
             from backend.app.services.alphapai_processor import AlphaPaiProcessor
 
             alphapai_processor = AlphaPaiProcessor(settings)
@@ -99,7 +135,8 @@ async def lifespan(app: FastAPI):
         app.state.jiuqian_sync = jiuqian_sync
         logger.info("Jiuqian sync service started")
 
-        if settings.llm_enrichment_api_key:
+        # Realtime LLM enrichment for Jiuqian — same gate as AlphaPai above.
+        if settings.llm_enrichment_api_key and settings.realtime_llm_enrichment_enabled:
             from backend.app.services.jiuqian_processor import JiuqianProcessor
 
             jiuqian_processor = JiuqianProcessor(settings)
@@ -109,9 +146,10 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to start Jiuqian services")
 
-    # Start hot news LLM filter (classifies hot news titles for market relevance)
+    # Hot-news LLM relevance filter — also gated behind
+    # realtime_llm_enrichment_enabled so no LLM runs at ingest time.
     hotnews_filter = None
-    if settings.llm_enrichment_api_key:
+    if settings.llm_enrichment_api_key and settings.realtime_llm_enrichment_enabled:
         try:
             from backend.app.services.hotnews_filter import HotNewsFilter
 
@@ -216,16 +254,6 @@ async def lifespan(app: FastAPI):
         )
     except Exception:
         logger.exception("user_kb startup recovery failed (non-fatal)")
-
-    # Connect the research-interaction recorder (MongoDB-backed session log
-    # feeding the admin /admin/research-logs visualization page). Best-effort:
-    # if the target Mongo refuses auth, the recorder disables itself and the
-    # chat pipeline proceeds untouched.
-    try:
-        from backend.app.services.research_interaction_log import init_recorder
-        await init_recorder()
-    except Exception:
-        logger.exception("Failed to initialize research interaction recorder")
 
     # Start daily AI-chat recommendation scheduler
     recommendation_scheduler = None
@@ -466,6 +494,30 @@ async def lifespan(app: FastAPI):
         )
         logger.info("staging_user_sync: scheduled (interval=900s)")
 
+    # KB vector auto-sync — polls crawler Mongo and ingests new/updated docs
+    # into Milvus via the jumpbox TEI (Qwen3-Embedding-8B) embedding service,
+    # plus a daily delete sweep that reconciles Milvus to Mongo tombstones.
+    # Without this loop the vector index drifts forever behind the crawlers.
+    # Gated by VECTOR_SYNC_ENABLED + APP_ENV (+ KB_VECTOR_SYNC_ALLOW_PROD
+    # override); see backend/app/services/kb_vector_sync.py for the full
+    # rationale including ownership between staging and prod.
+    kb_vector_sync_svc = None
+    try:
+        from backend.app.services.kb_vector_sync import (
+            KbVectorSyncService,
+            _should_start as _kb_vector_sync_should_start,
+        )
+        start_it, reason = _kb_vector_sync_should_start(settings)
+        if start_it:
+            kb_vector_sync_svc = KbVectorSyncService(settings)
+            await kb_vector_sync_svc.start()
+            app.state.kb_vector_sync = kb_vector_sync_svc
+            logger.info("kb_vector_sync enabled (%s)", reason)
+        else:
+            logger.info("kb_vector_sync disabled (%s)", reason)
+    except Exception:
+        logger.exception("Failed to start kb_vector_sync (non-fatal)")
+
     yield
 
     # Shutdown
@@ -490,6 +542,11 @@ async def lifespan(app: FastAPI):
     task = getattr(app.state, "staging_user_sync_task", None)
     if task:
         task.cancel()
+    if kb_vector_sync_svc is not None:
+        try:
+            await kb_vector_sync_svc.stop()
+        except Exception:
+            logger.exception("kb_vector_sync shutdown failed")
     try:
         from backend.app.services.quote_providers import futu_provider
         futu_provider.close_ctx()
@@ -511,7 +568,12 @@ async def lifespan(app: FastAPI):
         await alphapai_sync.stop()
     if backtest_scheduler:
         await backtest_scheduler.stop()
-    await engine_mgr.stop()
+    if app.state.engine_manager is not None:
+        await app.state.engine_manager.stop()
+    try:
+        await chat_audit_writer.stop_writer()
+    except Exception:
+        logger.exception("chat_audit_writer shutdown failed")
     await app.state.redis.close()
     logger.info("Trading Agent API shutdown complete")
 
@@ -539,6 +601,71 @@ def create_app() -> FastAPI:
 
     # Request logging
     app.add_middleware(RequestLoggingMiddleware)
+
+    # Surface starlette's MultiPartException reason. By default FastAPI swallows
+    # it into a bare 400 with no structured log, so when an upload is rejected
+    # (truncated body from a reverse proxy, malformed boundary, missing name
+    # field, etc.) we see only ``POST ... 400`` with no clue why. Logging the
+    # exception message + request path + content-length turns this into a
+    # one-line diagnosis.
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    try:
+        from python_multipart.exceptions import MultipartParseError  # type: ignore
+    except Exception:
+        try:
+            from multipart.exceptions import MultipartParseError  # type: ignore
+        except Exception:
+            MultipartParseError = None  # type: ignore
+
+    from starlette.formparsers import MultiPartException
+
+    @app.exception_handler(MultiPartException)
+    async def _multipart_exception_handler(request: Request, exc: MultiPartException):
+        logger.warning(
+            "multipart parse failed path=%s content_length=%s content_type=%r: %s",
+            request.url.path,
+            request.headers.get("content-length"),
+            request.headers.get("content-type", ""),
+            exc.message,
+        )
+        return JSONResponse(status_code=400, content={"detail": exc.message})
+
+    # Starlette re-wraps MultiPartException into HTTPException(400, ...) in
+    # Request._get_form before our handler gets a chance, so the MultiPart
+    # handler above won't fire. This one logs *any* 400 on an upload endpoint
+    # so we can see the exact detail ("Malformed boundary", "Part exceeded",
+    # "Missing boundary", truncated-body ClientDisconnect, etc.).
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exception_logger(request: Request, exc: StarletteHTTPException):
+        if (
+            exc.status_code == 400
+            and request.method == "POST"
+            and ("/user-kb/documents" in request.url.path or "/upload" in request.url.path)
+        ):
+            logger.warning(
+                "upload 400 path=%s cl=%s ct=%r detail=%r",
+                request.url.path,
+                request.headers.get("content-length"),
+                request.headers.get("content-type", ""),
+                exc.detail,
+            )
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+    if MultipartParseError is not None:
+        @app.exception_handler(MultipartParseError)
+        async def _multipart_parse_error_handler(request: Request, exc):
+            logger.warning(
+                "multipart parse error path=%s content_length=%s: %r",
+                request.url.path,
+                request.headers.get("content-length"),
+                exc,
+            )
+            return JSONResponse(
+                status_code=400, content={"detail": f"multipart parse error: {exc}"},
+            )
 
     # Register API routers
     from backend.app.api.auth import router as auth_router
@@ -568,13 +695,13 @@ def create_app() -> FastAPI:
     from backend.app.api.signals import router as signals_router
     from backend.app.api.analyst_rating import router as analyst_rating_router
     from backend.app.api.chat import router as chat_router
+    from backend.app.api.chat_audit import router as chat_audit_router
     from backend.app.api.chat_memory import router as chat_memory_router
     from backend.app.api.predictions import router as predictions_router
     from backend.app.api.open import router as open_router
     from backend.app.api.portfolio_news import router as portfolio_news_router
     from backend.app.api.sentimentrader import router as sentimentrader_router
     from backend.app.api.data_sources import router as data_sources_router
-    from backend.app.api.research_logs import router as research_logs_router
     from backend.app.api.user_kb import router as user_kb_router
     from backend.app.api.database_overview import router as database_overview_router
     from backend.app.api.platform_info import router as platform_info_router
@@ -615,13 +742,13 @@ def create_app() -> FastAPI:
     app.include_router(signals_router, prefix="/api/signals", tags=["Signals"])
     app.include_router(analyst_rating_router, prefix="/api/analyst-rating", tags=["Analyst Rating"])
     app.include_router(chat_router, prefix="/api/chat", tags=["AI Chat"])
+    app.include_router(chat_audit_router, prefix="/api/chat-audit", tags=["AI Chat Audit"])
     app.include_router(chat_memory_router, prefix="/api/chat-memory", tags=["AI Chat Memory"])
     app.include_router(predictions_router, prefix="/api/predictions", tags=["Predictions"])
     app.include_router(open_router, prefix="/api/open", tags=["Open API"])
     app.include_router(portfolio_news_router, prefix="/api/portfolio", tags=["Portfolio"])
     app.include_router(sentimentrader_router, prefix="/api/sentimentrader", tags=["SentimenTrader"])
     app.include_router(data_sources_router, prefix="/api/data-sources", tags=["Data Sources"])
-    app.include_router(research_logs_router, prefix="/api/research-logs", tags=["Research Logs (Admin)"])
     app.include_router(user_kb_router, prefix="/api/user-kb", tags=["Personal Knowledge Base"])
     app.include_router(database_overview_router, prefix="/api", tags=["System"])
     app.include_router(platform_info_router, prefix="/api/platform-info", tags=["AlphaPai Platform Info"])

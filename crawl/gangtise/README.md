@@ -1,6 +1,6 @@
-# gangtise/ — open.gangtise.com (港推) 爬虫
+# gangtise/ — open.gangtise.com (岗底斯) 爬虫
 
-抓取港推 (Gangtise) 研究平台的 **纪要 / 研报 / 首席观点** 三类内容到 MongoDB,
+抓取岗底斯 (Gangtise) 研究平台的 **纪要 / 研报 / 首席观点** 三类内容到 MongoDB,
 并落地研报 PDF, 供 backend `/api/gangtise-db` 和 unified 跨平台检索复用.
 
 - 单文件 `scraper.py` (~780 行), 与 `alphapai_crawl` / `jinmen` 同构.

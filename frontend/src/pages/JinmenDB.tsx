@@ -556,6 +556,45 @@ export default function JinmenDB() {
           )}
         </Spin>
       </Drawer>
+
+      <style>{`
+        .jinmen-md h1, .jinmen-md h2, .jinmen-md h3, .jinmen-md h4 {
+          color: #0f172a;
+          margin: 16px 0 8px;
+          font-weight: 600;
+          line-height: 1.4;
+        }
+        .jinmen-md h2 { font-size: 16px; }
+        .jinmen-md h3 { font-size: 15px; }
+        .jinmen-md h4 { font-size: 13.5px; }
+        .jinmen-md ul, .jinmen-md ol {
+          padding-left: 1.6em;
+          margin: 6px 0;
+        }
+        .jinmen-md li { margin: 3px 0; }
+        .jinmen-md li > ul, .jinmen-md li > ol { margin: 3px 0; }
+        .jinmen-md p { margin: 6px 0; }
+        .jinmen-md strong { font-weight: 600; color: #0f172a; }
+        .jinmen-md em { font-style: italic; }
+        .jinmen-md table {
+          border-collapse: collapse;
+          margin: 10px 0;
+          font-size: 12px;
+        }
+        .jinmen-md th, .jinmen-md td {
+          border: 1px solid #e2e8f0;
+          padding: 5px 9px;
+        }
+        .jinmen-md th { background: #f8fafc; font-weight: 600; }
+        .jinmen-md a { color: #2563eb; text-decoration: none; }
+        .jinmen-md a:hover { text-decoration: underline; }
+        .jinmen-md code {
+          background: #eef2f7;
+          padding: 1px 5px;
+          border-radius: 3px;
+          font-size: 12px;
+        }
+      `}</style>
     </div>
   )
 }
@@ -572,6 +611,7 @@ function MarkdownContent({
   if (!md) return <Empty description={empty} style={{ margin: '20px 0' }} />
   return (
     <div
+      className={mono ? undefined : 'jinmen-md'}
       style={{
         background: '#f8fafc',
         padding: 14,

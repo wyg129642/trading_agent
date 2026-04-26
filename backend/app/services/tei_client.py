@@ -168,7 +168,10 @@ async def _get_client() -> httpx.AsyncClient:
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
-            timeout=httpx.Timeout(connect=2.0, read=15.0, write=5.0, pool=5.0),
+            # Single-query path stays well under 1 s on warm GPU; 60 s read
+            # is for the batch ingest path where a 32-chunk batch can bump
+            # against cold-model loads or brief GPU preemption.
+            timeout=httpx.Timeout(connect=2.0, read=60.0, write=5.0, pool=5.0),
             limits=httpx.Limits(max_connections=64, max_keepalive_connections=32),
             # TEI is on LAN — never send via any ambient http(s)_proxy.
             trust_env=False,

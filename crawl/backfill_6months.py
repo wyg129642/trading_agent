@@ -57,7 +57,7 @@ CST = timezone(timedelta(hours=8))
 # standalone invocations (no env) still find the data.
 MONGO_URI = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 
 # Remote DB names differ from the old local short names; keep a translation so
@@ -94,21 +94,39 @@ class Target:
 
 
 # ----- Per-task throttle ---------------------------------------------------
-# 2026-04-24 反爬重写: 改用 backfill 安全档. 旧版 --throttle-base 1.5 + burst 0
-# + daily-cap 0 是事故隐患, 跟 live watcher 抢主桶 + 任何故障没人接.
-# 新版: 4s/2.5s Gaussian, burst 30, cap 400, --account-role bg (后台桶让位 realtime).
-UNIVERSAL_FLAGS = [
-    "--throttle-base", "4.0",
-    "--throttle-jitter", "2.5",
-    "--burst-size", "30",
-    "--burst-cooldown-min", "60",
-    "--burst-cooldown-max", "180",
-    "--daily-cap", "400",
-    "--account-role", "bg",
-    # Stream mode: each scraper dumps per-page instead of list-first-then-dump,
-    # so DB writes start on page 1 and deep_page checkpoint enables resume.
-    "--stream-backfill",
-]
+# Baseline (multiplier=1.0): 4s/2.5s Gaussian, burst 30, cap 400, --account-role
+# bg (后台桶让位 realtime). Per-platform speed multipliers below scale these knobs
+# (higher m = faster — shorter throttle, larger burst+cap, shorter cooldown).
+#
+# 2026-04-26 第二轮调速 — 基于真实测量校准:
+#   gangtise    10x    实测无反爬信号, 保留观察
+#   jinmen       3x    15x 被平台返回 "msg:稍后再试" + 60min 静默, 实际比 1x 还慢;
+#                      降到 3x = base 1.3s 接近合理边界
+#   alphaengine  1x    5x 秒触发 REFRESH_LIMIT (quota 是平台日定额, 跟请求率无关),
+#                      加速等于"快速消耗 quota → 进入 30min cooldown → 每天少做几个
+#                      cycle", 反而是负优化. 1x 让单 cycle 慢慢吃满 400 条 quota.
+SPEED_MULT: dict[str, float] = {
+    "gangtise":    10.0,
+    "jinmen":       3.0,
+    "alphaengine":  1.0,
+    # other platforms default to 1.0 (alphapai/meritco/funda/acecamp)
+}
+
+
+def universal_flags_for(platform: str) -> list[str]:
+    m = SPEED_MULT.get(platform, 1.0)
+    return [
+        "--throttle-base",        f"{4.0 / m:.3f}",
+        "--throttle-jitter",      f"{2.5 / m:.3f}",
+        "--burst-size",           str(int(30 * m)),
+        "--burst-cooldown-min",   str(max(5, int(60 / m))),
+        "--burst-cooldown-max",   str(max(15, int(180 / m))),
+        "--daily-cap",            str(int(400 * m)),
+        "--account-role",         "bg",
+        # Stream mode: each scraper dumps per-page instead of list-first-then-dump,
+        # so DB writes start on page 1 and deep_page checkpoint enables resume.
+        "--stream-backfill",
+    ]
 
 
 TARGETS: list[Target] = [
@@ -149,15 +167,18 @@ TARGETS: list[Target] = [
            "alphapai", "reports"),
 
     # Jinmen — meetings + reports + oversea_reports
-    Target("jinmen", "meetings", "crawl/jinmen",
-           ["--page-size", "50"],
-           "jinmen", "meetings"),
+    # 2026-04-26 disabled: jinmen.meetings 端点对当前 token 返回 code=500 用户信息不存在;
+    # jinmen.oversea_reports 端点账号被冻结 (code=201). 都需要重登 jinmen 才能恢复;
+    # 让 backfill orchestrator 不再 spawn 这两条避免持续打死端点 + 烧 fail-streak.
+    # Target("jinmen", "meetings", "crawl/jinmen",
+    #        ["--page-size", "50"],
+    #        "jinmen", "meetings"),
     Target("jinmen", "reports",  "crawl/jinmen",
            ["--reports", "--page-size", "100"],
            "jinmen", "reports"),
-    Target("jinmen", "oversea_reports", "crawl/jinmen",
-           ["--oversea-reports", "--page-size", "50", "--skip-pdf"],
-           "jinmen", "oversea_reports"),
+    # Target("jinmen", "oversea_reports", "crawl/jinmen",
+    #        ["--oversea-reports", "--page-size", "50", "--skip-pdf"],
+    #        "jinmen", "oversea_reports"),
 
     # Meritco — type 2 (professional) + type 3 (jiuqian-native); same collection, filter by type
     Target("meritco", "type2", "crawl/meritco_crawl",
@@ -327,6 +348,8 @@ class PlatformRunner:
         # crawl_data container is gone; scraper's hardcoded "alphapai" default
         # must be overridden with the remote "alphapai-full" alias.
         remote_db = _resolve_db(t.mongo_db)
+        platform_flags = universal_flags_for(t.platform)
+        speed_mult = SPEED_MULT.get(t.platform, 1.0)
         extra = list(t.extra_args) + [
             "--mongo-uri", MONGO_URI,
             "--mongo-db", remote_db,
@@ -334,12 +357,12 @@ class PlatformRunner:
         self.log_file = open(log_path, "ab", buffering=0)
         header = (
             f"\n\n===== BACKFILL START {datetime.now(CST).isoformat()} =====\n"
-            f"target={t.key} cwd={t.cwd} remote_db={remote_db}\n"
+            f"target={t.key} cwd={t.cwd} remote_db={remote_db} speed={speed_mult}x\n"
             f"starting state: count={self.start_count} oldest={oldest_str}\n"
-            f"cmd: python3 -u scraper.py {' '.join(extra + UNIVERSAL_FLAGS)}\n\n"
+            f"cmd: python3 -u scraper.py {' '.join(extra + platform_flags)}\n\n"
         ).encode()
         self.log_file.write(header)
-        cmd = ["python3", "-u", "scraper.py"] + extra + UNIVERSAL_FLAGS
+        cmd = ["python3", "-u", "scraper.py"] + extra + platform_flags
         env = os.environ.copy()
         for k in _PROXY_ENV_KEYS:
             env.pop(k, None)

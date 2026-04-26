@@ -6,6 +6,7 @@ across all data sources in one place.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -24,6 +25,49 @@ from backend.app.models.jiuqian import JiuqianForum, JiuqianMinutes, JiuqianWech
 from backend.app.models.news import AnalysisResult, FilterResult, NewsItem
 from backend.app.models.user import User
 from backend.app.services.stock_verifier import get_stock_verifier
+from backend.app.services.ticker_normalizer import normalize_one
+
+
+# Mirrors frontend Portfolio.tsx::toCanonical so each suggestion's
+# canonical_id matches what scripts/enrich_tickers.py writes into Mongo
+# `_canonical_tickers`. Custom KR/JP/AU/DE codes bypass normalize_one()
+# because a bare 6-digit Korean code (e.g. "005930") would otherwise be
+# misclassified as A-share by the bare-code parser.
+_MARKET_SUFFIX = {"韩股": "KS", "日股": "JP", "澳股": "AU", "德股": "DE"}
+
+
+def _suggestion_canonical(code: str, market: str) -> str | None:
+    code = (code or "").strip()
+    if not code:
+        return None
+    if "." in code and code.endswith((".SH", ".SZ", ".BJ", ".HK", ".US")):
+        return code.upper()
+    if market == "A股":
+        # Bare CN code that didn't get a suffix on its way in
+        return normalize_one(code)
+    if market == "美股":
+        return f"{code.upper()}.US"
+    if market == "港股":
+        digits = re.sub(r"\D", "", code).lstrip("0") or "0"
+        return f"{digits.zfill(5)}.HK"
+    suffix = _MARKET_SUFFIX.get(market)
+    if suffix:
+        return f"{code.upper()}.{suffix}"
+    if market == "其他":
+        # Resolve the real market via portfolio_sources.yaml registration
+        verifier = get_stock_verifier()
+        real_market = (
+            verifier._custom_code_to_market.get(code)
+            or verifier._custom_code_to_market.get(code.upper())
+        )
+        if real_market:
+            sfx = _MARKET_SUFFIX.get(real_market)
+            if sfx:
+                return f"{code.upper()}.{sfx}"
+    try:
+        return normalize_one(code)
+    except Exception:
+        return None
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -126,7 +170,14 @@ async def suggest_stocks(
             return
         seen_names.add(key)
         seen_names.add(same_name_key)
-        results.append({"name": name, "code": code, "market": market, "label": f"{name}({code})", "rank": rank})
+        results.append({
+            "name": name,
+            "code": code,
+            "market": market,
+            "label": f"{name}({code})",
+            "rank": rank,
+            "canonical_id": _suggestion_canonical(code, market),
+        })
 
     # --- Exact code match (highest priority) ---
     result = verifier._lookup_by_code(q_upper)

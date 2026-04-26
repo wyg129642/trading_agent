@@ -62,7 +62,6 @@ from backend.app.services.revenue_model_chat_tool import (
     TRIGGER_REVENUE_MODEL_TOOLS, TRIGGER_REVENUE_MODEL_SYSTEM_PROMPT,
 )
 from backend.app.services.chat_debug import chat_trace
-from backend.app.services.research_interaction_log import get_recorder
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -744,6 +743,7 @@ async def send_message_stream(
         user_id=str(user.id),
         username=getattr(user, "username", ""),
         conversation_id=str(conv.id),
+        message_id=str(msg_id),
     )
     trace_id = trace.trace_id
 
@@ -761,11 +761,6 @@ async def send_message_stream(
         history_len=len(history),
     )
 
-    # Mongo-backed research interaction recorder — start the session doc now so
-    # the admin page can see in-flight requests while they stream.
-    _recorder = get_recorder()
-    messages_payload_preview: list[dict] = []  # filled below after _build_messages
-
     logger.info(
         "Chat stream [%s]: web_search=%s alphapai=%s jinmen=%s tools=%d sys_prompt_len=%d models=%s mode=%s",
         trace_id, body.web_search, body.alphapai_enabled, body.jinmen_enabled, len(all_tools),
@@ -777,29 +772,6 @@ async def send_message_stream(
 
     # Log the full messages payload for deep debugging
     trace.log_messages_payload(messages_payload)
-
-    # Persist the full request setup to Mongo for the visualization page.
-    try:
-        await _recorder.start_request(
-            trace_id=trace_id,
-            user_id=str(user.id),
-            username=getattr(user, "username", ""),
-            conversation_id=str(conv.id),
-            query=body.content,
-            attachments=body.attachments,
-            models_requested=body.models,
-            mode=mode,
-            web_search=body.web_search or "off",
-            alphapai_enabled=body.alphapai_enabled,
-            jinmen_enabled=body.jinmen_enabled,
-            kb_enabled=body.kb_enabled,
-            tools_enabled=tool_names,
-            system_prompt=system_prompt or "",
-            initial_messages=messages_payload,
-            history_len=len(history),
-        )
-    except Exception:
-        logger.warning("Failed to persist research interaction start_request", exc_info=True)
 
     # Auto-generate title in background (don't block the SSE stream)
     is_first = conv.title == "新对话"
@@ -826,12 +798,11 @@ async def send_message_stream(
                 user_id=str(user.id),
                 username=getattr(user, "username", ""),
                 conversation_id=str(conv.id),
+                message_id=str(msg_id),
                 model_id=model_id,
                 trace_id=trace_id,
             )
             model_trace.log_sse_event("MODEL_STREAM_START", f"model={model_id}")
-            _mi = MODEL_MAP.get(model_id, {"name": model_id})
-            _recorder.record_model_start(trace_id, model_id, _mi.get("name", model_id))
             try:
                 async for chunk in call_model_stream_with_tools(
                     model_id, messages_payload, mode=mode, tools=all_tools or None,
@@ -921,6 +892,7 @@ async def send_message_stream(
                     from backend.app.services.chat_debug import chat_trace as _ct2
                     done_trace = _ct2(
                         user_id=str(user.id), conversation_id=str(conv.id),
+                        message_id=str(msg_id),
                         model_id=model_id, trace_id=trace_id,
                     )
                     done_trace.log_llm_done(
@@ -930,20 +902,6 @@ async def send_message_stream(
                         error=item.get("error"),
                     )
                     done_trace.log_llm_response_content(item.get("content", ""))
-
-                    # Persist per-model completion to Mongo for the visualization.
-                    try:
-                        _recorder.record_model_done(
-                            trace_id=trace_id,
-                            model_id=model_id,
-                            final_content=item.get("content", ""),
-                            tokens=item.get("tokens", 0),
-                            latency_ms=item.get("latency_ms", 0),
-                            error=item.get("error"),
-                            citations=model_sources.get(model_id),
-                        )
-                    except Exception:
-                        logger.debug("recorder.record_model_done failed", exc_info=True)
 
                     # Save to DB — wrapped in try/except so one model's save
                     # failure doesn't abort the entire SSE stream and lose
@@ -1017,11 +975,6 @@ async def send_message_stream(
             # Log request end
             total_ms = int((_time.monotonic() - _stream_start) * 1000)
             trace.log_request_end(total_ms)
-            # Finalize the Mongo research-interaction session document.
-            try:
-                await _recorder.finalize_request(trace_id, total_ms)
-            except Exception:
-                logger.debug("recorder.finalize_request failed", exc_info=True)
 
             # Bump usage_count on memories that got injected into this turn
             # (best-effort; opens its own session — `db` is closed by now).

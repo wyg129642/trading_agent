@@ -89,33 +89,500 @@ _TB_COUNTRY_MAP: dict[str, str] = {
     "FI": "HE",
 }
 
-# Markets we know about — used to validate ".X" suffixes already in canonical form
+# Markets we know about — used to validate ".X" suffixes already in canonical form.
+# Extended 2026-04-24 to cover all markets observed in upstream crawler corpora
+# (Jinmen oversea_reports, Gangtise, AlphaPai, AlphaEngine).
 _KNOWN_MARKETS: set[str] = {
+    # CN / HK / original set
     "SH", "SZ", "BJ", "HK", "US", "DE", "JP", "KS", "TW", "AU",
     "CA", "GB", "FR", "CH", "NL", "SE", "NO", "IT", "AT", "NZ", "HE",
+    # New additions (2026-04-24) — canonical 2-letter ISO-ish codes
+    "IN",  # India (NSE/BSE)
+    "BR",  # Brazil (B3)
+    "ES",  # Spain (BME)
+    "DK",  # Denmark (Nasdaq Copenhagen)
+    "SG",  # Singapore (SGX)
+    "TH",  # Thailand (SET)
+    "MY",  # Malaysia (Bursa)
+    "ID",  # Indonesia (IDX)
+    "PH",  # Philippines (PSE)
+    "VN",  # Vietnam (HOSE)
+    "TR",  # Turkey (BIST)
+    "MX",  # Mexico (BMV)
+    "AR",  # Argentina
+    "CL",  # Chile
+    "PE",  # Peru
+    "CO",  # Colombia
+    "SA",  # Saudi Arabia (Tadawul)
+    "AE",  # UAE (ADX/DFM)
+    "EG",  # Egypt
+    "ZA",  # South Africa (JSE)
+    "QA",  # Qatar (QSE)
+    "IL",  # Israel (TASE)
+    "HU",  # Hungary (BÉT)
+    "CZ",  # Czechia (PSE)
+    "PL",  # Poland (GPW)
+    "BE",  # Belgium (Euronext Brussels)
+    "PT",  # Portugal (Euronext Lisbon)
+    "IE",  # Ireland (Euronext Dublin)
+    "GR",  # Greece (ATHEX)
+    "RU",  # Russia (MOEX)
 }
 
+
 # --------------------------------------------------------------------------- #
-# Alias table (manually curated — see aliases.json)
+# Exchange-suffix aliases → canonical MARKET (2026-04-24)
+# --------------------------------------------------------------------------- #
+# Bloomberg / Reuters / Jinmen's self-coined 3-letter suffixes. Inputs like
+# ``2371.JPN``, ``NESN.AUT``, ``PLX.PA``, ``BBY.N``, ``4190.SE`` are resolved
+# through this table.
+#
+# ⚠️  Single-letter suffixes ``.A / .P / .V / .B`` are intentionally OMITTED —
+#    they collide with company legal-form abbreviations (``S.p.A.``, ``J.P.``,
+#    ``N.V.``, ``TECK.B``) and would generate heavy false positives on free
+#    text. Use the colon-form parser (``ARX:CA``) or structured fields instead.
+#
+# ⚠️  ``.CA`` (dot-form) is ambiguous — could be Cairo (Reuters) or Canada
+#    (older Bloomberg). Canada is resolved via ``CODE:CA`` colon-form or via
+#    ``.TO`` / ``.V``. Bare ``.CA`` is left unmapped to avoid Egypt/Canada
+#    confusion.
+_EXCHANGE_SUFFIX_MAP: dict[str, str] = {
+    # Identity for canonical 2-letter codes (populated from _KNOWN_MARKETS below)
+
+    # --- Single-letter Bloomberg / Reuters ---
+    "N": "US",   # NYSE
+    "O": "US",   # NASDAQ composite
+    "S": "CH",   # Swiss SIX
+    "T": "JP",   # Tokyo
+    "L": "GB",   # London
+    "F": "DE",   # Frankfurt retail
+    "J": "ZA",   # Johannesburg
+
+    # --- 2-letter Bloomberg / Reuters ---
+    "OQ": "US",  "PK": "US",   "NY": "US",
+    "LN": "GB",
+    "PA": "FR",  "FP": "FR",
+    "AS": "NL",  "NA": "NL",
+    "GY": "DE",  "GR": "DE",   # German Xetra
+    "MI": "IT",  "IM": "IT",
+    "MC": "ES",  "SM": "ES",
+    "CO": "DK",  "DC": "DK",
+    "ST": "SE",  "SS": "SE",
+    "FH": "HE",
+    "OL": "NO",
+    "WA": "PL",  "PW": "PL",
+    "VI": "AT",  "AV": "AT",
+    "SW": "CH",  "VX": "CH",
+    "BB": "BE",                # Brussels
+    "LS": "PT",
+    "AX": "AU",
+    "TA": "IL",
+    "BO": "IN",  "NS": "IN",  "IB": "IN",
+    "KQ": "KS",
+    "TT": "TW",  "TWO": "TW",
+    "KL": "MY",  "MK": "MY",
+    "BK": "TH",  "TB": "TH",
+    "SI": "SG",  "SP": "SG",
+    "JK": "ID",  "IJ": "ID",
+    "PS": "PH",  "PM": "PH",
+    "HM": "VN",
+    "IS": "TR",  "TI": "TR",
+    "BU": "HU",  "HB": "HU",
+    "PR": "CZ",  "CP": "CZ",
+    "SN": "CL",
+    "BA": "AR",
+    "MM": "MX",
+    "TO": "CA",                # Toronto — colon-form primarily, but allow dotted too
+    "QD": "QA",
+    "AB": "SA",                # Saudi alt
+    "DU": "AE",
+    "RM": "RU",
+    "AT": "GR",                # Reuters Athens — beware: canonical AT is Austria (distinct)
+    # NOTE: these three are context-dependent; treat conservatively.
+    # Jinmen convention: ``.SA`` = Brazil (São Paulo), ``.SE`` = Saudi
+    "SA": "BR",                # Brazil B3 (Jinmen + Reuters)
+    "SE": "SA",                # Saudi Tadawul (Jinmen + Reuters)
+
+    # --- 3-letter Jinmen / Refinitiv style ---
+    "JPN": "JP", "KOR": "KS", "TWN": "TW", "AUS": "AU",
+    "CAN": "CA", "GBR": "GB", "FRA": "FR", "DEU": "DE", "GER": "DE",
+    "CHE": "CH", "NLD": "NL", "SWE": "SE", "NOR": "NO",
+    "ITA": "IT", "AUT": "AT",  # Note: Jinmen's .AUT is sometimes mislabeled
+                               # (e.g. Nestle/ABInBev); kept for raw passthrough.
+    "NZL": "NZ", "FIN": "HE", "POL": "PL", "ESP": "ES",
+    "BEL": "BE", "PRT": "PT", "IRL": "IE", "GRC": "GR",
+    "IND": "IN", "MYS": "MY", "PHL": "PH", "IDN": "ID",
+    "SGP": "SG", "THA": "TH", "TUR": "TR", "ISR": "IL",
+    "SAU": "SA", "ARE": "AE", "EGY": "EG", "ZAF": "ZA",
+    "QAT": "QA", "HUN": "HU", "CZE": "CZ",
+    "BRA": "BR", "ARG": "AR", "CHL": "CL", "MEX": "MX",
+    "PER": "PE", "COL": "CO",
+    "USA": "US", "HKG": "HK", "CHN": "CN",
+    "RUS": "RU",
+}
+# Fold identity mappings (A → A) for canonical markets ONLY if they don’t
+# already have a non-identity alias set above. This preserves the Jinmen/Reuters
+# conventions for ambiguous suffixes like ``.SA`` (Brazil, not Saudi) and
+# ``.SE`` (Saudi, not Sweden — Sweden uses ``.ST``).
+for _m in _KNOWN_MARKETS:
+    _EXCHANGE_SUFFIX_MAP.setdefault(_m, _m)
+
+
+def _resolve_market_suffix(suffix: str) -> str | None:
+    """Canonicalize any upstream market suffix (Bloomberg/Reuters/Jinmen) → 2-letter."""
+    if not suffix:
+        return None
+    return _EXCHANGE_SUFFIX_MAP.get(suffix.upper())
+
+# --------------------------------------------------------------------------- #
+# Alias tables — bulk (auto-generated) + curated (hand-edited).
+#
+# Layered lookup: ``aliases_bulk.json`` (≈50k entries from Tushare + prod CSV,
+# rebuilt by ``scripts/rebuild_aliases_bulk.py``) seeds the table, then
+# ``aliases.json`` (≈260 hand-curated entries) overlays it. Curated wins on
+# conflict so operator fixes always take precedence over auto-generated data.
 # --------------------------------------------------------------------------- #
 _ALIASES_PATH = Path(__file__).parent / "ticker_data" / "aliases.json"
+_ALIASES_BULK_PATH = Path(__file__).parent / "ticker_data" / "aliases_bulk.json"
 
 
-@lru_cache(maxsize=1)
-def _alias_table() -> dict[str, str]:
-    """Load alias JSON. Values can be string (canonical) or null (known-unmappable)."""
-    if not _ALIASES_PATH.exists():
+# Top-down brand-suffix expansion: for any CN brand-only key in the merged
+# table (e.g. "阿里巴巴"), emit the same value under "<brand>+控股", "<brand>+集团"
+# etc. Catches LLM phrasings like "阿里巴巴控股" / "腾讯股份" that Tushare's
+# bottom-up stem chain doesn't generate.
+_CN_BRAND_SUFFIXES: tuple[str, ...] = (
+    "控股", "集团", "股份", "公司",
+    "集团控股", "集团股份", "股份控股",
+    "股份有限公司", "有限公司",
+)
+_CN_KNOWN_SUFFIX_RE = re.compile(
+    r"(股份有限公司|有限公司|集团股份|集团控股|股份|控股|公司|集团|"
+    r"-W|-SW|-S|-WR)$"
+)
+# Lookup-time English legal-suffix stripper (mirrors rebuild_aliases_bulk.py).
+# Used by ``_parse_bare`` so "Apple Inc" / "NVIDIA Corporation" /
+# "Tencent Holdings Ltd" hit the same canonical as their stem.
+_EN_LEGAL_SUFFIX_RE = re.compile(
+    r"[,\s]+("
+    r"Co\.?,?\s*Ltd\.?|Co\.?,?\s*Limited|"
+    r"Holdings|Holding|Group|"
+    r"Limited|Ltd\.?|Inc\.?|Corp\.?|Corporation|Company|"
+    r"Plc|Pty\.?\s*Ltd\.?|S\.A\.|N\.V\.|AG|SE"
+    r")\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _load_alias_file(path: Path) -> dict[str, str]:
+    if not path.exists():
         return {}
     try:
-        data = json.loads(_ALIASES_PATH.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
     return {k: v for k, v in data.items() if not k.startswith("_") and isinstance(v, str)}
 
 
+def _is_cn_brand_only(key: str) -> bool:
+    """True for CJK keys that don't already end in a known CN legal suffix."""
+    if not key or not isinstance(key, str):
+        return False
+    if not re.search(r"[一-鿿]", key):
+        return False
+    if len(key) < 2 or len(key) > 8:  # 1-char ambiguous, 9+ already specific
+        return False
+    return _CN_KNOWN_SUFFIX_RE.search(key) is None
+
+
+@lru_cache(maxsize=1)
+def _alias_table() -> dict[str, str]:
+    """Bulk-then-curated merged alias table, with CN brand-suffix expansion.
+
+    Layered: ``aliases_bulk.json`` (~50k Tushare-derived) seeds, ``aliases.json``
+    (~270 curated) overrides on conflict. Then a top-down expansion pass adds
+    ``<brand>+控股/集团/股份/公司/...`` for every CN brand-only key — covers
+    colloquial phrasings ("阿里巴巴控股", "腾讯股份") that Tushare's bottom-up
+    stem chain misses because the intermediate string was never an input name.
+    """
+    merged = _load_alias_file(_ALIASES_BULK_PATH)
+    merged.update(_load_alias_file(_ALIASES_PATH))
+
+    expansions: dict[str, str] = {}
+    for k, v in merged.items():
+        if not _is_cn_brand_only(k):
+            continue
+        for suffix in _CN_BRAND_SUFFIXES:
+            ek = k + suffix
+            if ek not in merged and ek not in expansions:
+                expansions[ek] = v
+    merged.update(expansions)
+    return merged
+
+
+@lru_cache(maxsize=1)
+def _alias_lc_index() -> dict[str, str]:
+    """Lower-case key index (case-insensitive lookup, ~50k+ entries)."""
+    return {k.lower(): v for k, v in _alias_table().items()}
+
+
+@lru_cache(maxsize=1)
+def _known_canonicals() -> frozenset[str]:
+    """All canonical tickers (values) from the merged alias tables.
+
+    Used by ``is_known_canonical`` to validate LLM-supplied dotted-form inputs
+    and reject hallucinations like ``BABA.HK`` / ``9988.US`` / ``TSMC.US`` that
+    pass syntactic parsing but don't correspond to a real listing.
+    """
+    return frozenset(_alias_table().values())
+
+
+def is_known_canonical(canonical: str | None) -> bool:
+    """True if ``canonical`` (e.g. ``00700.HK``) appears as a value in alias
+    tables — i.e. is a real listing in our snapshot. Used at the LLM-input
+    boundary to filter out hallucinated CODE.MARKET combinations."""
+    if not canonical:
+        return False
+    return canonical in _known_canonicals()
+
+
+@lru_cache(maxsize=1)
+def _alias_by_length_lc() -> dict[int, frozenset[str]]:
+    """Lower-case alias keys bucketed by string length.
+
+    Used by ``extract_canonicals_from_query`` for greedy longest-match scan
+    over free text. Skips L<2 (ambiguous) and L>20 (unlikely to appear
+    verbatim in a chat-style query).
+    """
+    by_len: dict[int, set[str]] = {}
+    for k in _alias_table():
+        L = len(k)
+        if L < 2 or L > 20:
+            continue
+        by_len.setdefault(L, set()).add(k.lower())
+    return {L: frozenset(s) for L, s in by_len.items()}
+
+
+@lru_cache(maxsize=1)
+def _canonical_to_brands() -> dict[str, frozenset[str]]:
+    """Reverse map ``canonical → set of brand-name keys``.
+
+    Used by ``is_mentioned_in_query`` to detect whether an LLM-supplied
+    ticker is referenced in the query (by code or any known brand name) —
+    a sign that the LLM's choice is intentional rather than hallucinated.
+    """
+    by_value: dict[str, set[str]] = {}
+    for k, v in _alias_table().items():
+        by_value.setdefault(v, set()).add(k)
+    return {v: frozenset(s) for v, s in by_value.items()}
+
+
 def reload_aliases() -> None:
-    """Force re-read the alias JSON (useful after manual edit)."""
+    """Force re-read both alias JSONs (useful after manual edit or rebuild)."""
     _alias_table.cache_clear()
+    _alias_lc_index.cache_clear()
+    _known_canonicals.cache_clear()
+    _alias_by_length_lc.cache_clear()
+    _canonical_to_brands.cache_clear()
+
+
+# --------------------------------------------------------------------------- #
+# Query-side entity extraction (cross-validation against LLM hallucinations)
+# --------------------------------------------------------------------------- #
+# Detects explicit ``CODE.MARKET`` patterns in free text. Stricter than the
+# parenthesized extractor below: requires word boundaries (no leading dot)
+# so that legal forms like ``S.p.A.`` / ``J.P.`` don't false-match.
+_QUERY_DOTTED_RE = re.compile(
+    r"(?<![A-Za-z0-9.])([A-Z0-9]{1,8}\.[A-Z]{1,4})(?![A-Za-z0-9.])"
+)
+# Bare 6-digit A-share code in query (rare but real: "公司 600519 最新动态").
+# 4-5-digit numbers are intentionally NOT auto-treated as HK codes — those
+# are overwhelmingly years / random numerics in query text. HK codes in query
+# come almost always in dotted form (`00700.HK`); the rare bare-HK case is
+# delegated to the LLM's tickers field.
+_QUERY_6DIGIT_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+
+# ASCII tokens that ARE legitimate alias keys but also common
+# technical / financial terms — query-side extraction skips them to avoid
+# false hits on free text. ``is_mentioned_in_query`` still recognises them
+# (so the LLM CAN intentionally pick them via tickers), but they don't get
+# auto-added from query text.
+_QUERY_AMBIGUOUS_ASCII: frozenset[str] = frozenset({
+    # AI / hardware acronyms
+    "HBM", "AI", "ML", "DL", "GPU", "CPU", "TPU", "NPU", "DPU", "FPGA",
+    "DRAM", "NAND", "SSD", "HDD", "RAM", "ROM",
+    "API", "SDK", "OS", "PC", "VR", "AR", "XR", "MR", "OT",
+    "5G", "6G", "IOT", "CDN", "VPN",
+    # Finance acronyms
+    "EPS", "PE", "PB", "PS", "ROE", "ROA", "EBIT", "EBITDA", "FCF",
+    "CAPEX", "OPEX", "GAAP", "IFRS", "GMV", "DAU", "MAU", "WAU", "ARPU",
+    "IPO", "ESG", "VC", "FED", "ECB", "BOJ", "PBOC",
+    # Macro acronyms
+    "GDP", "CPI", "PPI", "PMI", "RMB", "USD", "EUR", "JPY", "CNY",
+    # Time / period — most common false-positive sources
+    "Q1", "Q2", "Q3", "Q4", "H1", "H2", "FY", "YOY", "QOQ", "MOM",
+    # Single 1-letter tokens are too noisy: would match T (AT&T) / F (Ford)
+    # / V (Visa) / X (US Steel) inside any English sentence.
+    "A", "B", "C", "I", "O", "T", "F", "V", "X", "Y", "Z",
+    # NOTE: short real US tickers ARE deliberately allowed through:
+    # LI / MS / MU / JD / NV / GE / GM / PG / BA / CB / SO / BB / IT
+    # Under the per-market policy LLM uses letter codes for US, so when a
+    # user types "LI vs NVDA Q3" we want LI to extract correctly. Users
+    # asking about lithium chemistry / MS Office in this kb_search context
+    # is unlikely; if they do, the worst case is an extra ticker filter.
+})
+
+
+def extract_canonicals_from_query(text: str | None) -> list[str]:
+    """Best-effort entity extraction from a free-text query.
+
+    Detects company references via two passes:
+
+    1. **Substring scan** against the alias table (longest-match first, with
+       greedy span masking). Catches Chinese names ("中际旭创") and English
+       names ("Apple", "NVIDIA Corporation") that appear verbatim. ASCII
+       matches require word boundaries to avoid 'apple' inside 'pineapple'.
+    2. **Explicit code patterns** — ``CODE.MARKET`` (e.g. ``300308.SZ``) and
+       bare 4–6-digit numerics, validated via ``is_known_canonical``.
+
+    Returns canonical tickers in order of first appearance, deduplicated.
+
+    Used by ``kb_service`` to cross-validate LLM-supplied ``tickers`` against
+    entities the LLM actually *mentioned* in the query — disjoint cases are
+    likely LLM hallucinations and get dropped.
+    """
+    if not text or not isinstance(text, str):
+        return []
+    n = len(text)
+    if n == 0:
+        return []
+    text_lc = text.lower()
+    by_len = _alias_by_length_lc()
+    lc = _alias_lc_index()
+
+    matched = bytearray(n)  # 0 = free, 1 = consumed by an earlier longer match
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _is_word_boundary(start: int, end: int) -> bool:
+        before = (start == 0) or not text[start - 1].isalnum()
+        after = (end == n) or not text[end].isalnum()
+        return before and after
+
+    # Pass 1: longest-match alias substring scan
+    for L in sorted((l for l in by_len if l <= n), reverse=True):
+        keys = by_len[L]
+        i = 0
+        limit = n - L
+        while i <= limit:
+            if matched[i]:
+                i += 1
+                continue
+            window = text_lc[i:i + L]
+            if window not in keys:
+                i += 1
+                continue
+            # ASCII keys: require word boundaries (prevents 'apple' in 'pineapple')
+            if window.isascii():
+                if not _is_word_boundary(i, i + L):
+                    i += 1
+                    continue
+                # Skip ambiguous tech/finance terms (HBM, AI, EPS, GDP, ...)
+                # — they pass syntactic match but are clearly not the company.
+                if window.upper() in _QUERY_AMBIGUOUS_ASCII:
+                    i += 1
+                    continue
+            canonical = lc.get(window)
+            if not canonical:
+                i += 1
+                continue
+            if canonical not in seen:
+                seen.add(canonical)
+                out.append(canonical)
+            for j in range(i, i + L):
+                matched[j] = 1
+            i += L
+
+    # Pass 2: explicit code patterns. Only CODE.MARKET (dotted) and 6-digit
+    # A-share codes — bare 4-5 digit numerics are too noisy (years, model
+    # numbers, "8/16/32 GB") to auto-extract as HK codes. The LLM should
+    # supply HK codes via the ``tickers`` field, not embedded in query text.
+    for m in _QUERY_DOTTED_RE.finditer(text):
+        candidate = m.group(1).upper()
+        if is_known_canonical(candidate) and candidate not in seen:
+            seen.add(candidate)
+            out.append(candidate)
+    for m in _QUERY_6DIGIT_RE.finditer(text):
+        digits = m.group(1)
+        cls = _classify_ashare(digits)
+        if cls:
+            cand = f"{digits}.{cls}"
+            if is_known_canonical(cand) and cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+
+    return out
+
+
+def is_mentioned_in_query(canonical: str | None, query: str | None) -> bool:
+    """True iff ``canonical`` is referenced in ``query`` text via either:
+
+    - the canonical itself (``BABA.US`` substring),
+    - just the code part (``BABA`` or ``300308`` substring with word boundaries),
+    - or any known brand name mapping to the canonical (``阿里巴巴`` / ``Alibaba``).
+
+    Used to validate LLM-supplied tickers — if the LLM picked a code whose
+    name/code is nowhere in the query, that's the strongest hallucination
+    signal we can detect from the LLM-input boundary.
+    """
+    if not canonical or not query:
+        return False
+    q_lc = query.lower()
+    c_lc = canonical.lower()
+    if c_lc in q_lc:
+        return True
+    code_part = canonical.rsplit(".", 1)[0]
+    if code_part:
+        cp_lc = code_part.lower()
+        # Code parts need boundary-aware matching for short ASCII codes
+        # (avoid "MU" inside "MUTUAL"); CJK/digit-only is fine substring.
+        if len(cp_lc) >= 4 or not cp_lc.isascii():
+            if cp_lc in q_lc:
+                return True
+        elif code_part.upper() in _QUERY_AMBIGUOUS_ASCII:
+            # Short ASCII code that's also a common acronym (LI / MS / MU /
+            # JD / NV / Q3 ...) — bare appearance in query is too noisy to
+            # count as a mention. Fall through to brand-name match.
+            pass
+        else:
+            # Short ASCII (2-3 chars): require word-boundary
+            for m in re.finditer(re.escape(cp_lc), q_lc):
+                start, end = m.start(), m.end()
+                before = start == 0 or not query[start - 1].isalnum()
+                after = end == len(query) or not query[end].isalnum()
+                if before and after:
+                    return True
+    brands = _canonical_to_brands().get(canonical, frozenset())
+    for b in brands:
+        b_lc = b.lower()
+        if not b_lc or len(b_lc) < 2:
+            continue
+        # Skip short ASCII brands that are also common English words /
+        # acronyms (LI / MS / MU / HBM / Q3 / ...). They're poor signals
+        # of intent — require a more specific brand match instead.
+        if b.isascii() and len(b) <= 3 and b.upper() in _QUERY_AMBIGUOUS_ASCII:
+            continue
+        if b_lc in q_lc:
+            # ASCII brand needs word-boundary too (e.g. "AMD" in "amdahl's")
+            if b_lc.isascii() and len(b_lc) <= 4:
+                for m in re.finditer(re.escape(b_lc), q_lc):
+                    start, end = m.start(), m.end()
+                    before = start == 0 or not query[start - 1].isalnum()
+                    after = end == len(query) or not query[end].isalnum()
+                    if before and after:
+                        return True
+                continue
+            return True
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -172,20 +639,36 @@ def _canonical_from_code_market(raw_code: str, raw_market: str | None) -> str | 
 
 
 def _parse_dotted(raw: str) -> str | None:
-    """Input already looks like `CODE.SUFFIX` (e.g. `603061.SH`, `AAPL.US`)."""
-    m = re.fullmatch(r"([\w\-]+)\.([A-Z]{1,3})", raw.strip())
+    """Input already looks like ``CODE.SUFFIX`` — handles the full
+    Bloomberg / Reuters / Jinmen suffix family via ``_resolve_market_suffix``.
+
+    Examples:
+      - ``603061.SH``  → ``603061.SH``
+      - ``AAPL.US``    → ``AAPL.US``
+      - ``2371.JPN``   → ``2371.JP``       (Jinmen 3-letter)
+      - ``NESN.S``     → ``NESN.CH``       (Bloomberg 1-letter)
+      - ``PLX.PA``     → ``PLX.FR``
+      - ``4190.SE``    → ``4190.SA``       (Jinmen: .SE = Saudi)
+      - ``CAST.ST``    → ``CAST.SE``       (Stockholm)
+    """
+    # Up to 4-letter suffix. Code accepts alphanum + hyphen + internal dot
+    # (for class-share tickers like TECK.B). Non-greedy on code so suffix
+    # claims the final `.XX` not the penultimate.
+    m = re.fullmatch(r"([\w\-\.]+?)\.([A-Z]{1,4})", raw.strip())
     if not m:
         return None
     code, suffix = m.group(1).upper(), m.group(2).upper()
-    # Chinese-name + .US / .HK pattern appears in alphapai (e.g. `苹果.US`) — skip, the sibling `code` field will have the real symbol
     if re.search(r"[\u4e00-\u9fff]", raw):
         return None
-    if suffix in _KNOWN_MARKETS:
-        # If HK, pad
-        if suffix == "HK":
-            return f"{_pad_hk(code)}.HK"
-        return f"{code}.{suffix}"
-    return None
+    canonical = _resolve_market_suffix(suffix)
+    if not canonical:
+        return None
+    if canonical == "CN":
+        cls = _classify_ashare(code)
+        return f"{code}.{cls}" if cls else None
+    if canonical == "HK":
+        return f"{_pad_hk(code)}.HK"
+    return f"{code}.{canonical}"
 
 
 def _parse_reverse_dotted(raw: str) -> str | None:
@@ -200,6 +683,35 @@ def _parse_reverse_dotted(raw: str) -> str | None:
     if prefix == "HK":
         return f"{_pad_hk(code)}.HK"
     return f"{code}.{prefix}"
+
+
+def _parse_colon_suffix(raw: str) -> str | None:
+    """AlphaPai roadshows use colon-separated titles like ``(ARX:CA)``,
+    ``(TECK.B:CA)``. Same logic as ``_parse_dotted`` but with ``:`` separator.
+    """
+    s = raw.strip()
+    if ":" not in s:
+        return None
+    code, _, suffix = s.rpartition(":")
+    if not code or not suffix:
+        return None
+    if not re.fullmatch(r"[A-Z]{1,4}", suffix.upper()):
+        return None
+    if not re.fullmatch(r"[\w\-\.]+", code):
+        return None
+    if re.search(r"[\u4e00-\u9fff]", raw):
+        return None
+    canonical = _resolve_market_suffix(suffix.upper())
+    if not canonical:
+        return None
+    code_clean = code.upper().strip()
+    if canonical == "CN":
+        cls = _classify_ashare(code_clean)
+        return f"{code_clean}.{cls}" if cls else None
+    if canonical == "HK":
+        return f"{_pad_hk(code_clean)}.HK"
+    return f"{code_clean}.{canonical}"
+
 
 
 def _parse_tb_ticker(raw: str) -> str | None:
@@ -253,12 +765,51 @@ def _parse_bare(raw: str) -> str | None:
 
     def _try(token: str) -> str | None:
         table = _alias_table()
-        if token in table:
-            return table[token]
-        lower = token.lower()
-        for k, v in table.items():
-            if k.lower() == lower:
-                return v
+        lc = _alias_lc_index()
+
+        # Layered string lookup — tolerant to case + trailing-period variants.
+        # Handles "Apple Inc" ↔ "Apple Inc." ↔ "APPLE INC" without polluting
+        # the bulk table with every casing permutation.
+        def _lookup(key: str) -> str | None:
+            if not key:
+                return None
+            if key in table:
+                return table[key]
+            lk = key.lower()
+            if lk in lc:
+                return lc[lk]
+            no_dot = key.rstrip(".").strip()
+            if no_dot and no_dot != key:
+                if no_dot in table:
+                    return table[no_dot]
+                if no_dot.lower() in lc:
+                    return lc[no_dot.lower()]
+            with_dot = no_dot + "." if no_dot else None
+            if with_dot and with_dot != key:
+                if with_dot in table:
+                    return table[with_dot]
+                if with_dot.lower() in lc:
+                    return lc[with_dot.lower()]
+            return None
+
+        r = _lookup(token)
+        if r:
+            return r
+
+        # Lookup-time EN legal-suffix stripping. ``Apple Inc`` /
+        # ``NVIDIA Corporation`` / ``Tencent Holdings Ltd`` won't have an exact
+        # entry but their bare-brand stem will. Iteratively peel one suffix per
+        # pass (matches rebuild_aliases_bulk._en_stems shape).
+        cur = token.strip()
+        for _ in range(5):
+            new = _EN_LEGAL_SUFFIX_RE.sub("", cur).strip().rstrip(",")
+            if new == cur or len(new) < 2:
+                break
+            cur = new
+            r = _lookup(cur)
+            if r:
+                return r
+
         if re.fullmatch(r"\d{6}", token):
             cls = _classify_ashare(token)
             if cls:
@@ -406,6 +957,10 @@ def normalize_one(raw: Any) -> str | None:
         r = _parse_reverse_dotted(s)
         if r:
             return r
+        # Colon-suffix (AlphaPai roadshows style: ARX:CA, TECK.B:CA)
+        r = _parse_colon_suffix(s)
+        if r:
+            return r
         # Third-bridge "CODE COUNTRY" (space-separated)
         if " " in s and len(s.split()[-1]) == 2 and s.split()[-1].isupper():
             r = _parse_tb_ticker(s)
@@ -486,6 +1041,75 @@ def normalize_with_unmatched(raw: Any) -> tuple[list[str], list[str]]:
                 if isinstance(label, str) and label.strip():
                     unmatched.append(label.strip())
     return matched, unmatched
+
+
+# --------------------------------------------------------------------------- #
+# Title / free-text extractor (2026-04-24)
+# --------------------------------------------------------------------------- #
+# Catches tickers embedded in parenthesized form inside free text like titles.
+# Supported patterns (from empirical scan of the crawler corpus):
+#   - Pluxee (PLX.PA): ...                   ← dot-separator
+#   - ARC Resources Ltd. (ARX:CA) ...        ← colon-separator (AlphaPai style)
+#   - Kakaku.com Inc.(2371.JPN)              ← 3-letter market (Jinmen style)
+#   - Best Buy (BBY.N)                       ← 1-letter Bloomberg exchange
+#   - 沙特阿美 (2222.SE)                       ← Saudi .SE (not Stockholm)
+# Supports half-width `()` and full-width `（）` parens (mixed too).
+# Skips empty parens and short legal-entity tokens to avoid "S.p.A." / "J.P." false hits.
+_TEXT_TICKER_PAREN_RE = re.compile(
+    r"[（(]"                                # open paren (half/full width)
+    r"\s*"
+    r"([0-9A-Z][0-9A-Za-z\.\-]{0,7}?)"             # code: starts with digit or CAP letter
+    r"\s*[\.:]\s*"                                 # separator: dot or colon
+    r"([A-Z]{1,4})"                                   # market suffix: 1-4 uppercase
+    r"\s*"
+    r"[）)]"                                # close paren (half/full width)
+)
+
+
+def extract_tickers_from_text(text: str | None) -> list[str]:
+    """Scan free text for ``(CODE.MARKET)`` / ``(CODE:MARKET)`` patterns and return
+    their canonical equivalents. Designed to be called as a fallback when the
+    structured extractor returns nothing (e.g. jinmen.oversea_reports with empty
+    ``stocks[]`` but ticker in title).
+
+    Safety:
+      - Ignores matches where MARKET doesn't resolve via ``_resolve_market_suffix``
+      - Won't match bare ``CODE.MARKET`` outside parens (too many false positives
+        from "S.p.A.", "N.V.", "J.P." in free text)
+    """
+    if not text or not isinstance(text, str):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _TEXT_TICKER_PAREN_RE.finditer(text):
+        code, suffix = m.group(1), m.group(2)
+        canonical = _resolve_market_suffix(suffix.upper())
+        if not canonical:
+            continue
+        code_u = code.upper().strip(".")
+        # Reject degenerate codes (e.g. only punctuation)
+        if not re.search(r"[0-9A-Z]", code_u):
+            continue
+        # Reject very short all-caps codes that are likely legal-form abbreviations
+        # (1-letter codes with 1-letter markets are suspicious)
+        if len(code_u) == 1 and len(suffix) == 1:
+            continue
+        # Build canonical
+        if canonical == "CN":
+            cls = _classify_ashare(code_u)
+            if not cls:
+                continue
+            canonical_str = f"{code_u}.{cls}"
+        elif canonical == "HK":
+            canonical_str = f"{_pad_hk(code_u)}.HK"
+        elif canonical in ("SH", "SZ", "BJ"):
+            canonical_str = f"{code_u}.{canonical}"
+        else:
+            canonical_str = f"{code_u}.{canonical}"
+        if canonical_str not in seen:
+            seen.add(canonical_str)
+            out.append(canonical_str)
+    return out
 
 
 # --------------------------------------------------------------------------- #

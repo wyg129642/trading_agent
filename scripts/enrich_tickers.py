@@ -44,10 +44,12 @@ _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from motor.motor_asyncio import AsyncIOMotorClient  # noqa: E402
+from pymongo import UpdateOne  # noqa: E402
 
 from backend.app.config import get_settings  # noqa: E402
 from backend.app.services.ticker_normalizer import (  # noqa: E402
     EXTRACTORS,
+    extract_tickers_from_text,
     normalize_with_unmatched,
     reload_aliases,
 )
@@ -105,7 +107,8 @@ async def enrich_collection(
     dry_run: bool = False,
     limit: int | None = None,
     incremental: bool = False,
-) -> tuple[int, int, int, Counter]:
+    only_empty: bool = False,
+) -> tuple[int, int, int, Counter, int]:
     """Enrich one collection.
 
     Returns (scanned, updated, with_tickers, unmatched_counter).
@@ -117,11 +120,16 @@ async def enrich_collection(
     scanned = 0
     updated = 0
     with_tickers = 0
+    with_tickers_from_title = 0
     unmatched_counter: Counter = Counter()
 
     query: dict = {}
     if incremental:
         query = {"_canonical_tickers_at": {"$exists": False}}
+    elif only_empty:
+        # Re-process only docs currently marked empty — useful after the
+        # normalizer gets a new suffix-alias table or title fallback.
+        query = {"_canonical_tickers": []}
 
     # Don't pull the heavy fields into memory — only what the extractor needs
     projection = {
@@ -155,6 +163,11 @@ async def enrich_collection(
         "subtitle": 1,
         "truncated_body_text": 1,
         "detail_result.postTags": 1,
+        # Title fallback (2026-04-24): for every doc where the structured
+        # extractor finds nothing, scan title for parenthesized `(CODE.MARKET)`
+        # or `(CODE:MARKET)` patterns. Additional title-bearing fields follow.
+        "title_cn": 1,
+        "title_en": 1,
     }
 
     cursor = coll.find(query, projection=projection)
@@ -162,34 +175,68 @@ async def enrich_collection(
         cursor = cursor.limit(limit)
 
     now = datetime.now(timezone.utc)
+    BATCH = 500
+    pending: list[UpdateOne] = []
+
+    async def _flush() -> None:
+        nonlocal updated
+        if not pending:
+            return
+        result = await coll.bulk_write(pending, ordered=False)
+        updated += (result.matched_count or 0)
+        pending.clear()
+
     async for doc in cursor:
         scanned += 1
         raw = extractor(doc, coll_name)
         matched, unmatched = normalize_with_unmatched(raw)
+        extract_source = source_key
+
+        # --- Title fallback (2026-04-24) -------------------------------------
+        # If the structured extractor found nothing, scan titles for embedded
+        # CODE.MARKET / CODE:MARKET parenthesized forms. Covers:
+        #   - jinmen.oversea_reports: `Kakaku.com Inc.(2371.JPN)`
+        #   - alphapai.roadshows: `Best Buy (BBY.N）`, `ARC Resources (ARX:CA)`
+        #   - gangtise.researches / chief_opinions: `Pluxee (PLX.PA):`
+        #   - alphaengine.foreign_reports: `Helmerich & Payne Inc. (HP)` …
+        if not matched:
+            for field in ("title", "title_cn", "title_en"):
+                title = doc.get(field)
+                if not isinstance(title, str) or not title.strip():
+                    continue
+                title_hits = extract_tickers_from_text(title)
+                if title_hits:
+                    matched = title_hits
+                    extract_source = f"{source_key}_title"
+                    break
+        # --------------------------------------------------------------------
 
         if matched:
             with_tickers += 1
+            if extract_source.endswith("_title"):
+                with_tickers_from_title += 1
         for u in unmatched:
             unmatched_counter[u] += 1
 
         if dry_run:
             continue
 
-        # Always $set — idempotent. Empty list is a valid answer (means: scanned, found nothing).
-        await coll.update_one(
+        pending.append(UpdateOne(
             {"_id": doc["_id"]},
-            {
-                "$set": {
-                    "_canonical_tickers": matched,
-                    "_canonical_tickers_at": now,
-                    "_unmatched_raw": unmatched,
-                    "_canonical_extract_source": source_key,
-                }
-            },
-        )
-        updated += 1
+            {"$set": {
+                "_canonical_tickers": matched,
+                "_canonical_tickers_at": now,
+                "_unmatched_raw": unmatched,
+                "_canonical_extract_source": extract_source,
+            }},
+        ))
+        if len(pending) >= BATCH:
+            await _flush()
 
-    return scanned, updated, with_tickers, unmatched_counter
+    if not dry_run:
+        await _flush()
+
+    return scanned, updated, with_tickers, unmatched_counter, with_tickers_from_title
 
 
 async def ensure_index(client: AsyncIOMotorClient, db_name: str, coll_name: str) -> None:
@@ -225,13 +272,14 @@ async def main_async(args: argparse.Namespace) -> int:
     total_scanned = 0
     total_updated = 0
     total_with = 0
+    total_from_title = 0
     total_unmatched: Counter = Counter()
 
     # One shared client with URI per source (motor pools connections anyway)
     clients_by_uri: dict[str, AsyncIOMotorClient] = {}
 
-    print(f"{'SOURCE / COLLECTION':<38} {'scanned':>10} {'updated':>10} {'with-ticker':>13}")
-    print("-" * 80)
+    print(f"{'SOURCE / COLLECTION':<36} {'scanned':>10} {'updated':>10} {'w/ticker':>9} {'of-title':>9}")
+    print("-" * 85)
     for source_key, (uri_attr, db_attr, collections) in targets.items():
         uri = getattr(settings, uri_attr)
         db_name = getattr(settings, db_attr)
@@ -241,7 +289,7 @@ async def main_async(args: argparse.Namespace) -> int:
         extractor = EXTRACTORS[source_key]
 
         for coll_name in collections:
-            scanned, updated, with_tickers, unmatched = await enrich_collection(
+            scanned, updated, with_tickers, unmatched, from_title = await enrich_collection(
                 client,
                 db_name,
                 coll_name,
@@ -250,21 +298,24 @@ async def main_async(args: argparse.Namespace) -> int:
                 dry_run=args.dry_run,
                 limit=args.limit,
                 incremental=args.incremental,
+                only_empty=args.only_empty,
             )
             total_scanned += scanned
             total_updated += updated
             total_with += with_tickers
+            total_from_title += from_title
             total_unmatched.update(unmatched)
 
             tag = f"{source_key}.{coll_name}"
             pct = f"({100 * with_tickers // scanned}%)" if scanned else "—"
-            print(f"{tag:<38} {scanned:>10} {updated:>10} {with_tickers:>7} {pct:>5}")
+            print(f"{tag:<36} {scanned:>10} {updated:>10} {with_tickers:>5} {pct:>5} {from_title:>8}")
 
             if not args.dry_run:
                 await ensure_index(client, db_name, coll_name)
 
-    print("-" * 80)
-    print(f"{'TOTAL':<38} {total_scanned:>10} {total_updated:>10} {total_with:>7}")
+    print("-" * 85)
+    print(f"{'TOTAL':<36} {total_scanned:>10} {total_updated:>10} {total_with:>9} {total_from_title:>9}")
+    print(f"  of which {total_from_title:,} tagged via title-fallback regex (2026-04-24 feature)")
     if not args.dry_run:
         print("Indexes created: _canonical_tickers on every collection listed above.")
 
@@ -293,6 +344,12 @@ def main() -> int:
         "--incremental",
         action="store_true",
         help="Only process docs missing _canonical_tickers_at (fast nightly mode).",
+    )
+    ap.add_argument(
+        "--only-empty",
+        action="store_true",
+        help="Only re-process docs currently marked _canonical_tickers:[] — "
+             "useful after extending the market-suffix alias table or title regex.",
     )
     ap.add_argument("--dry-run", action="store_true", help="Don't write any fields")
     ap.add_argument(

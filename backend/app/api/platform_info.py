@@ -444,7 +444,7 @@ async def acecamp_summary(_: User = Depends(get_current_user)):
 
 
 # ============================================================
-# Gangtise 港推 主页快照 —— 从 MongoDB gangtise.homepage 直接读.
+# Gangtise 岗底斯 主页快照 —— 从 MongoDB gangtise.homepage 直接读.
 # Scraper: crawl/gangtise/scraper_home.py (每 10min 落库一次 8 个模块).
 # ============================================================
 
@@ -498,7 +498,7 @@ def _shape_gangtise(doc: Optional[dict]) -> Optional[dict]:
     }
 
 
-@router.get("/gangtise", summary="Gangtise 港推 主页快照")
+@router.get("/gangtise", summary="Gangtise 岗底斯 主页快照")
 async def gangtise_snapshot(
     include_raw: bool = Query(False),
     _: User = Depends(get_current_user),
@@ -537,7 +537,7 @@ async def gangtise_snapshot(
             newest = ts
     return {
         "platform": "gangtise",
-        "platform_label": "Gangtise 港推",
+        "platform_label": "Gangtise 岗底斯",
         "modules": ordered,
         "module_count": len(ordered),
         "ok_count": ok_count,

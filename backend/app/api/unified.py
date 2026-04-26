@@ -180,7 +180,7 @@ _SOURCES: list[SourceSpec] = [
         time_field="release_time",
         url_field="web_url",
         preview_field="content_md",
-        source_label="港推 · 纪要",
+        source_label="岗底斯 · 纪要",
     ),
     SourceSpec(
         source="gangtise",
@@ -190,7 +190,7 @@ _SOURCES: list[SourceSpec] = [
         time_field="release_time",
         url_field="web_url",
         preview_field="brief_md",
-        source_label="港推 · 研报",
+        source_label="岗底斯 · 研报",
     ),
     SourceSpec(
         source="gangtise",
@@ -200,7 +200,7 @@ _SOURCES: list[SourceSpec] = [
         time_field="release_time",
         url_field="web_url",
         preview_field="content_md",
-        source_label="港推 · 首席观点",
+        source_label="岗底斯 · 首席观点",
     ),
     SourceSpec(
         source="acecamp",

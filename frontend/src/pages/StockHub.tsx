@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useSearchParams, useNavigate } from 'react-router-dom'
 import {
-  Tag, Typography, Empty, Skeleton, Segmented, Button, Tooltip, Badge, Space,
-  Input, message,
+  Tag, Typography, Empty, Skeleton, Button, Tooltip, Space,
+  Input, message, Drawer, Spin, Alert, Segmented,
 } from 'antd'
 import {
   FilePdfOutlined, LinkOutlined, ReloadOutlined, ArrowLeftOutlined,
   SearchOutlined, ThunderboltOutlined, BookOutlined, MessageOutlined,
-  AudioOutlined, SolutionOutlined,
+  AudioOutlined, SolutionOutlined, DownloadOutlined, CloseOutlined,
 } from '@ant-design/icons'
 import api from '../services/api'
+import MarkdownRenderer from '../components/MarkdownRenderer'
 
 const { Text, Title } = Typography
 
@@ -46,6 +47,35 @@ interface HubResponse {
   next_before_ms: number | null
 }
 
+interface DocSection { label: string; markdown: string }
+
+interface DocPdfAttachment {
+  index: number
+  name: string
+  size_bytes: number
+  url: string
+}
+
+interface DocDetailResponse {
+  source: string
+  source_label: string
+  collection: string
+  category: string
+  category_label: string
+  id: string
+  title: string
+  release_time: string | null
+  release_time_ms: number | null
+  organization: string
+  url: string | null
+  pdf_url: string | null
+  pdf_urls: DocPdfAttachment[]
+  tickers: string[]
+  sections: DocSection[]
+  sentiment?: string | null
+  impact_magnitude?: string | null
+}
+
 // ── Constants ────────────────────────────────────────────
 
 const CATEGORY_META: Record<
@@ -62,7 +92,7 @@ const CATEGORY_META: Record<
 const SOURCE_LABELS: Record<string, string> = {
   alphapai:    'AlphaPai',
   jinmen:      '进门',
-  gangtise:    '港推',
+  gangtise:    '岗底斯',
   funda:       'Funda',
   alphaengine: 'AlphaEngine',
   acecamp:     '本营',
@@ -148,6 +178,23 @@ export default function StockHub() {
   const [hoverIndex, setHoverIndex] = useState<number>(-1)
   const cardRefs = useRef<Array<HTMLDivElement | null>>([])
 
+  // Detail drawer state — fetched lazily on card click.
+  // The list endpoint returns only a 320-char preview; the drawer shows
+  // everything the backend has (markdown sections + embedded PDF).
+  const [detailItem, setDetailItem] = useState<HubItem | null>(null)
+  const [detail, setDetail] = useState<DocDetailResponse | null>(null)
+  const [detailLoading, setDetailLoading] = useState(false)
+  const [detailError, setDetailError] = useState<string | null>(null)
+  const [pdfView, setPdfView] = useState<'sections' | 'pdf'>('sections')
+  const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null)
+  const [pdfLoading, setPdfLoading] = useState(false)
+  const [pdfError, setPdfError] = useState<string | null>(null)
+  const [pdfProgress, setPdfProgress] = useState<{ loaded: number; total: number } | null>(null)
+  const [activePdfIdx, setActivePdfIdx] = useState(0)  // for meritco multi-attachment
+  // Track the in-flight PDF URL so duplicate fetches (StrictMode double-effect,
+  // user re-clicking) collapse instead of stacking on the slow GridFS path.
+  const inflightPdfRef = useRef<string | null>(null)
+
   const load = useCallback(
     async (opts?: { category?: Category; append?: boolean; beforeMs?: number }) => {
       const cat = opts?.category ?? activeCategory
@@ -180,6 +227,155 @@ export default function StockHub() {
     load()
   }, [canonicalId])
 
+  // ── Detail drawer ────────────────────────────────────────
+  // Strip leading "/api" because axios has baseURL: '/api'. If we pass
+  // "/api/foo" axios would call "/api/api/foo".
+  const trimApi = (u: string) => (u.startsWith('/api/') ? u.slice(4) : u)
+
+  const clearPdf = useCallback(() => {
+    setPdfError(null)
+    setPdfProgress(null)
+    inflightPdfRef.current = null
+    setPdfBlobUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev)
+      return null
+    })
+  }, [])
+
+  const openDetail = useCallback(async (item: HubItem) => {
+    setDetailItem(item)
+    setDetail(null)
+    setDetailError(null)
+    setDetailLoading(true)
+    setPdfView('sections')
+    setActivePdfIdx(0)
+    clearPdf()
+    try {
+      const path =
+        item.source === 'newsfeed'
+          ? `/stock-hub/newsfeed/${encodeURIComponent(item.id)}`
+          : `/stock-hub/doc/${encodeURIComponent(item.source)}/${encodeURIComponent(item.collection)}/${encodeURIComponent(item.id)}`
+      const { data: resp } = await api.get<DocDetailResponse>(path, { timeout: 30000 })
+      setDetail(resp)
+    } catch (e: any) {
+      const msg = e?.response?.data?.detail || e?.message || '加载详情失败'
+      setDetailError(typeof msg === 'string' ? msg : JSON.stringify(msg))
+    } finally {
+      setDetailLoading(false)
+    }
+  }, [clearPdf])
+
+  const closeDetail = useCallback(() => {
+    setDetailItem(null)
+    setDetail(null)
+    setDetailError(null)
+    clearPdf()
+  }, [clearPdf])
+
+  const loadPdf = useCallback(async (pdfUrl: string) => {
+    // Collapse duplicate concurrent loads for the same URL. The PDF endpoint
+    // is on the slow Mongo GridFS path (~50-250 s for ~10 MB) so stacking
+    // requests just compounds the wait.
+    if (inflightPdfRef.current === pdfUrl) return
+    inflightPdfRef.current = pdfUrl
+    setPdfLoading(true)
+    setPdfError(null)
+    setPdfProgress(null)
+    try {
+      const res = await api.get(trimApi(pdfUrl), {
+        responseType: 'blob',
+        // GridFS reads have measured at 0.2-0.5 MB/s, so a 10 MB PDF can
+        // legitimately take 1-3 minutes. 10 min covers the worst case
+        // without giving up early.
+        timeout: 600000,
+        onDownloadProgress: (e) => {
+          // e.total is set when Content-Length is known (always, for PDFs).
+          if (e.total) setPdfProgress({ loaded: e.loaded, total: e.total })
+          else setPdfProgress({ loaded: e.loaded, total: 0 })
+        },
+      })
+      // Ignore stale responses if the user moved on.
+      if (inflightPdfRef.current !== pdfUrl) return
+      const blob = new Blob([res.data], { type: 'application/pdf' })
+      const url = URL.createObjectURL(blob)
+      setPdfBlobUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev)
+        return url
+      })
+    } catch (err: any) {
+      // Don't surface errors from a request the user has already abandoned.
+      if (inflightPdfRef.current !== pdfUrl) return
+      const status = err?.response?.status
+      let msg = err?.response?.data?.detail
+      // When axios gets a Blob error response, data is a Blob — decode it
+      if (err?.response?.data instanceof Blob) {
+        try {
+          const text = await err.response.data.text()
+          const j = JSON.parse(text)
+          msg = j?.detail || text
+        } catch {
+          msg = `HTTP ${status ?? '?'}`
+        }
+      }
+      msg = msg || (status ? `HTTP ${status}` : err?.message) || '加载 PDF 失败'
+      setPdfError(typeof msg === 'string' ? msg : JSON.stringify(msg))
+    } finally {
+      if (inflightPdfRef.current === pdfUrl) {
+        inflightPdfRef.current = null
+        setPdfLoading(false)
+        setPdfProgress(null)
+      }
+    }
+  }, [])
+
+  const downloadPdf = useCallback(async (pdfUrl: string, filename: string) => {
+    const hide = message.loading('正在下载 PDF…', 0)
+    try {
+      // Append download=1 to signal Content-Disposition: attachment on platforms
+      // that honor it (alphapai/gangtise/jinmen/alphaengine). Meritco's /pdf
+      // already forces download via its route.
+      const sep = pdfUrl.includes('?') ? '&' : '?'
+      const res = await api.get(trimApi(`${pdfUrl}${sep}download=1`), {
+        responseType: 'blob',
+        // Same 10-min ceiling as loadPdf — slow GridFS path applies here too.
+        timeout: 600000,
+      })
+      const blob = new Blob([res.data], { type: 'application/pdf' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${filename.replace(/[\\/:*?"<>|\r\n\t]/g, '_').slice(0, 120)}.pdf`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      hide()
+      message.success('下载完成')
+    } catch (err: any) {
+      hide()
+      let msg = err?.response?.data?.detail
+      if (err?.response?.data instanceof Blob) {
+        try {
+          const text = await err.response.data.text()
+          const j = JSON.parse(text)
+          msg = j?.detail || text
+        } catch {
+          msg = `HTTP ${err?.response?.status ?? '?'}`
+        }
+      }
+      msg = msg || err?.message || '下载失败'
+      message.error(`下载失败: ${msg}`)
+    }
+  }, [])
+
+  // Revoke blob URL on unmount
+  useEffect(() => {
+    return () => {
+      if (pdfBlobUrl) URL.revokeObjectURL(pdfBlobUrl)
+    }
+
+  }, [])
+
   // Keyboard shortcuts: 1-6 for filters, j/k to navigate
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -202,13 +398,14 @@ export default function StockHub() {
         cardRefs.current[next]?.scrollIntoView({ behavior: 'smooth', block: 'center' })
       } else if (e.key === 'Enter' && hoverIndex >= 0) {
         const it = items[hoverIndex]
-        if (it?.url) window.open(it.url, '_blank')
-        else if (it?.pdf_url) window.open(it.pdf_url, '_blank')
+        if (it) openDetail(it)
+      } else if (e.key === 'Escape' && detailItem) {
+        closeDetail()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [items, hoverIndex])
+  }, [items, hoverIndex, detailItem, openDetail, closeDetail])
 
   function switchCategory(cat: Category) {
     setActiveCategory(cat)
@@ -238,8 +435,11 @@ export default function StockHub() {
 
   const grouped = useMemo(() => groupByDay(filteredItems), [filteredItems])
   const byCat = data?.by_category || {}
-  const total =
-    data?.total ?? Object.values(byCat).reduce((s, x) => s + x, 0)
+  // "全部" must aggregate across all categories regardless of active filter.
+  // The backend collapses `data.total` to the filtered category's count, so
+  // recompute from by_category which the backend always populates fully.
+  const allTotal = Object.values(byCat).reduce<number>((s, x) => s + (x || 0), 0)
+  const filterTotal = data?.total ?? allTotal  // active filter's total (for load-more progress)
 
   const categoryButton = (c: Category, count: number, label: string, meta?: typeof CATEGORY_META[keyof typeof CATEGORY_META]) => {
     const active = activeCategory === c
@@ -271,11 +471,6 @@ export default function StockHub() {
         >
           {count.toLocaleString()}
         </span>
-        {meta && (
-          <span style={{ opacity: 0.55, fontSize: 10, marginLeft: 2 }}>
-            {meta.shortcut}
-          </span>
-        )}
       </button>
     )
   }
@@ -319,7 +514,7 @@ export default function StockHub() {
             )}
           </div>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            汇聚 {total.toLocaleString()} 条资料 · 研报 / 点评 / 会议纪要 / 专家访谈 / 突发新闻
+            汇聚 {allTotal.toLocaleString()} 条资料 · 研报 / 点评 / 会议纪要 / 专家访谈 / 突发新闻
           </Text>
         </div>
         <Space>
@@ -346,7 +541,7 @@ export default function StockHub() {
           display: 'flex', gap: 8, flexWrap: 'wrap',
         }}
       >
-        {categoryButton('all', total, '全部')}
+        {categoryButton('all', allTotal, '全部')}
         {(['research', 'commentary', 'minutes', 'interview', 'breaking'] as const).map((c) =>
           categoryButton(c, byCat[c] || 0, CATEGORY_META[c].label, CATEGORY_META[c]),
         )}
@@ -450,15 +645,12 @@ export default function StockHub() {
                         </span>
                       </div>
 
-                      {/* Title — clickable */}
+                      {/* Title — clickable (opens detail drawer with full content) */}
                       <div
-                        onClick={() => {
-                          const dest = it.pdf_url || it.url
-                          if (dest) window.open(dest, '_blank')
-                        }}
+                        onClick={() => openDetail(it)}
                         style={{
                           fontSize: 15, fontWeight: 600, color: '#0f172a',
-                          marginBottom: 6, cursor: (it.url || it.pdf_url) ? 'pointer' : 'default',
+                          marginBottom: 6, cursor: 'pointer',
                           lineHeight: 1.45,
                         }}
                       >
@@ -494,13 +686,26 @@ export default function StockHub() {
 
                       {/* Actions */}
                       <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+                        <Button
+                          size="small"
+                          type="primary"
+                          ghost
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            openDetail(it)
+                          }}
+                        >
+                          查看详情
+                        </Button>
                         {it.pdf_url && (
                           <Button
                             size="small"
                             icon={<FilePdfOutlined />}
                             onClick={(e) => {
                               e.stopPropagation()
-                              window.open(it.pdf_url!, '_blank')
+                              openDetail(it)
+                              // Pre-select PDF tab for the drawer
+                              setPdfView('pdf')
                             }}
                           >
                             PDF
@@ -512,10 +717,10 @@ export default function StockHub() {
                             icon={<LinkOutlined />}
                             onClick={(e) => {
                               e.stopPropagation()
-                              window.open(it.url!, '_blank')
+                              window.open(it.url!, '_blank', 'noopener,noreferrer')
                             }}
                           >
-                            查看原文
+                            原文链接
                           </Button>
                         )}
                       </div>
@@ -538,7 +743,7 @@ export default function StockHub() {
                 加载更多
               </Button>
               <div style={{ color: '#94a3b8', fontSize: 11, marginTop: 6 }}>
-                已加载 {items.length.toLocaleString()} / {total.toLocaleString()}
+                已加载 {items.length.toLocaleString()} / {filterTotal.toLocaleString()}
               </div>
             </div>
           )}
@@ -550,17 +755,341 @@ export default function StockHub() {
         </div>
       )}
 
-      {/* Keyboard hint footer */}
+      <DetailDrawer
+        item={detailItem}
+        detail={detail}
+        loading={detailLoading}
+        error={detailError}
+        view={pdfView}
+        setView={setPdfView}
+        pdfBlobUrl={pdfBlobUrl}
+        pdfLoading={pdfLoading}
+        pdfError={pdfError}
+        pdfProgress={pdfProgress}
+        activePdfIdx={activePdfIdx}
+        setActivePdfIdx={setActivePdfIdx}
+        onClose={closeDetail}
+        onLoadPdf={loadPdf}
+        onDownloadPdf={downloadPdf}
+        clearPdf={clearPdf}
+      />
+    </div>
+  )
+}
+
+
+// ── Detail Drawer ───────────────────────────────────────────
+// Fetches full doc on open; tabs between markdown sections and the live
+// PDF iframe. PDF loads lazily the first time the PDF tab is selected and
+// is cached in a blob URL for the lifetime of the drawer.
+
+interface DetailDrawerProps {
+  item: HubItem | null
+  detail: DocDetailResponse | null
+  loading: boolean
+  error: string | null
+  view: 'sections' | 'pdf'
+  setView: (v: 'sections' | 'pdf') => void
+  pdfBlobUrl: string | null
+  pdfLoading: boolean
+  pdfError: string | null
+  pdfProgress: { loaded: number; total: number } | null
+  activePdfIdx: number
+  setActivePdfIdx: (i: number) => void
+  onClose: () => void
+  onLoadPdf: (url: string) => void | Promise<void>
+  onDownloadPdf: (url: string, filename: string) => void | Promise<void>
+  clearPdf: () => void
+}
+
+function DetailDrawer({
+  item, detail, loading, error,
+  view, setView,
+  pdfBlobUrl, pdfLoading, pdfError, pdfProgress,
+  activePdfIdx, setActivePdfIdx,
+  onClose, onLoadPdf, onDownloadPdf, clearPdf,
+}: DetailDrawerProps) {
+  // Resolve which pdf URL to fetch (single-pdf vs. meritco multi-attachment)
+  const pdfCandidates: DocPdfAttachment[] = useMemo(() => {
+    if (!detail) return []
+    if (detail.pdf_urls.length) return detail.pdf_urls
+    if (detail.pdf_url) {
+      return [{ index: 0, name: 'PDF', size_bytes: 0, url: detail.pdf_url }]
+    }
+    return []
+  }, [detail])
+
+  const activePdf = pdfCandidates[activePdfIdx] || null
+
+  // Track which URL the current blob represents so attachment switches force
+  // a reload but otherwise we don't refetch on unrelated rerenders.
+  const loadedUrlRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (pdfBlobUrl) return  // updated below when we successfully load
+    loadedUrlRef.current = null
+  }, [pdfBlobUrl])
+
+  // Auto-load PDF when the PDF tab becomes active, or when the active
+  // attachment changes (meritco multi-PDF). If a previous blob was loaded
+  // for a different URL, drop it before fetching the new one.
+  useEffect(() => {
+    if (view !== 'pdf') return
+    if (!activePdf) return
+    if (pdfLoading) return
+    if (pdfBlobUrl && loadedUrlRef.current === activePdf.url) return
+    if (pdfBlobUrl && loadedUrlRef.current !== activePdf.url) clearPdf()
+    loadedUrlRef.current = activePdf.url
+    onLoadPdf(activePdf.url)
+  }, [view, activePdf, pdfBlobUrl, pdfLoading, onLoadPdf, clearPdf])
+
+  const open = item != null
+  const metaRow = (label: string, value: React.ReactNode) =>
+    value ? (
+      <div style={{ display: 'flex', gap: 10, fontSize: 12, color: '#64748b', marginBottom: 4 }}>
+        <span style={{ flexShrink: 0, width: 56, color: '#94a3b8' }}>{label}</span>
+        <span style={{ color: '#334155' }}>{value}</span>
+      </div>
+    ) : null
+
+  return (
+    <Drawer
+      open={open}
+      onClose={onClose}
+      width={Math.min(900, Math.floor(window.innerWidth * 0.92))}
+      closable={false}
+      title={null}
+      destroyOnClose
+      styles={{ body: { padding: 0 } }}
+    >
+      {/* Header */}
       <div
         style={{
-          position: 'fixed', bottom: 12, right: 16,
-          background: 'rgba(15,23,42,.88)', color: '#cbd5e1',
-          padding: '6px 12px', borderRadius: 6, fontSize: 11,
-          backdropFilter: 'blur(6px)',
-          pointerEvents: 'none',
+          padding: '14px 20px 10px', borderBottom: '1px solid #e2e8f0',
+          background: '#fff', position: 'sticky', top: 0, zIndex: 5,
         }}
       >
-        <kbd>1–6</kbd> 切换分类 · <kbd>j/k</kbd> 浏览 · <kbd>Enter</kbd> 打开
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10 }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {item && (
+              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 6 }}>
+                <Tag color={SOURCE_COLORS[item.source] || 'default'} style={{ margin: 0 }}>
+                  {item.source_label}
+                </Tag>
+                {detail?.category_label && (
+                  <Tag
+                    color={CATEGORY_META[(detail.category as Exclude<Category, 'all'>)]?.color}
+                    style={{ margin: 0 }}
+                  >
+                    {detail.category_label}
+                  </Tag>
+                )}
+                {detail?.organization && (
+                  <span style={{ color: '#64748b', fontSize: 12, alignSelf: 'center' }}>
+                    · {detail.organization}
+                  </span>
+                )}
+                {detail?.release_time && (
+                  <span style={{ color: '#94a3b8', fontSize: 12, alignSelf: 'center' }}>
+                    · {detail.release_time}
+                  </span>
+                )}
+              </div>
+            )}
+            <div style={{ fontSize: 18, fontWeight: 600, color: '#0f172a', lineHeight: 1.4 }}>
+              {detail?.title || item?.title || '...'}
+            </div>
+          </div>
+          <Button
+            type="text"
+            icon={<CloseOutlined />}
+            onClick={onClose}
+            style={{ flexShrink: 0 }}
+          />
+        </div>
+
+        {/* Tabs + top actions */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 12 }}>
+          <Segmented
+            size="small"
+            value={view}
+            onChange={(v) => setView(v as 'sections' | 'pdf')}
+            options={[
+              { label: '全文', value: 'sections' },
+              ...(pdfCandidates.length ? [{ label: 'PDF', value: 'pdf' as const }] : []),
+            ]}
+          />
+          <div style={{ flex: 1 }} />
+          {detail?.url && (
+            <Tooltip title="在新标签打开原文">
+              <Button
+                size="small"
+                icon={<LinkOutlined />}
+                onClick={() => window.open(detail.url!, '_blank', 'noopener,noreferrer')}
+              >
+                原文
+              </Button>
+            </Tooltip>
+          )}
+          {activePdf && (
+            <Tooltip title="下载 PDF">
+              <Button
+                size="small"
+                icon={<DownloadOutlined />}
+                onClick={() => onDownloadPdf(activePdf.url, detail?.title || item?.title || 'document')}
+              >
+                下载
+              </Button>
+            </Tooltip>
+          )}
+        </div>
+      </div>
+
+      {/* Body */}
+      <div style={{ padding: view === 'pdf' ? 0 : '20px 24px 60px' }}>
+        {loading ? (
+          <div style={{ padding: 40, textAlign: 'center' }}>
+            <Spin tip="加载中..." />
+          </div>
+        ) : error ? (
+          <Alert type="error" showIcon message="加载失败" description={error} style={{ margin: 20 }} />
+        ) : !detail ? null : view === 'sections' ? (
+          <>
+            {detail.sections.length === 0 ? (
+              <Empty
+                description={
+                  <div>
+                    <div>该文档暂无全文内容可展示</div>
+                    {pdfCandidates.length > 0 && (
+                      <div style={{ marginTop: 8, color: '#64748b', fontSize: 12 }}>
+                        切换至 PDF 标签查看原始文件
+                      </div>
+                    )}
+                  </div>
+                }
+                style={{ padding: '40px 0' }}
+              />
+            ) : (
+              detail.sections.map((sec, i) => (
+                <section key={i} style={{ marginBottom: 28 }}>
+                  <div
+                    style={{
+                      fontSize: 13, fontWeight: 600, color: '#475569',
+                      padding: '6px 10px', borderRadius: 4,
+                      background: '#f1f5f9', marginBottom: 10,
+                      display: 'inline-block',
+                    }}
+                  >
+                    {sec.label}
+                  </div>
+                  <div style={{ fontSize: 14, color: '#1e293b', lineHeight: 1.75 }}>
+                    <MarkdownRenderer content={sec.markdown} />
+                  </div>
+                </section>
+              ))
+            )}
+            {detail.tickers.length > 0 && (
+              <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid #e2e8f0' }}>
+                <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 6 }}>涉及标的</div>
+                <Space wrap size={4}>
+                  {detail.tickers.map((t) => (
+                    <Tag key={t} style={{ margin: 0, fontSize: 11 }}>{t}</Tag>
+                  ))}
+                </Space>
+              </div>
+            )}
+          </>
+        ) : (
+          <PdfPane
+            attachments={pdfCandidates}
+            activeIdx={activePdfIdx}
+            setActiveIdx={setActivePdfIdx}
+            blobUrl={pdfBlobUrl}
+            loading={pdfLoading}
+            progress={pdfProgress}
+            error={pdfError}
+            onRetry={() => activePdf && onLoadPdf(activePdf.url)}
+          />
+        )}
+      </div>
+    </Drawer>
+  )
+}
+
+interface PdfPaneProps {
+  attachments: DocPdfAttachment[]
+  activeIdx: number
+  setActiveIdx: (i: number) => void
+  blobUrl: string | null
+  loading: boolean
+  progress: { loaded: number; total: number } | null
+  error: string | null
+  onRetry: () => void
+}
+
+function PdfPane({
+  attachments, activeIdx, setActiveIdx,
+  blobUrl, loading, progress, error, onRetry,
+}: PdfPaneProps) {
+  if (attachments.length === 0) {
+    return <Empty description="无 PDF 附件" style={{ padding: 60 }} />
+  }
+  const fmtMB = (n: number) => `${(n / (1024 * 1024)).toFixed(1)} MB`
+  const progressLabel = progress
+    ? progress.total
+      ? `加载 PDF... ${fmtMB(progress.loaded)} / ${fmtMB(progress.total)} (${Math.floor((progress.loaded / progress.total) * 100)}%)`
+      : `加载 PDF... ${fmtMB(progress.loaded)}`
+    : '加载 PDF...'
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 140px)' }}>
+      {attachments.length > 1 && (
+        <div
+          style={{
+            padding: '8px 16px', borderBottom: '1px solid #e2e8f0',
+            display: 'flex', gap: 6, flexWrap: 'wrap', background: '#fafafa',
+          }}
+        >
+          {attachments.map((att, i) => (
+            <Button
+              key={att.index}
+              size="small"
+              type={i === activeIdx ? 'primary' : 'default'}
+              onClick={() => setActiveIdx(i)}
+            >
+              {att.name}
+            </Button>
+          ))}
+        </div>
+      )}
+      <div style={{ flex: 1, position: 'relative', background: '#f8fafc' }}>
+        {loading ? (
+          <div
+            style={{
+              position: 'absolute', inset: 0, display: 'flex',
+              flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+              gap: 12, padding: 24, textAlign: 'center',
+            }}
+          >
+            <Spin size="large" />
+            <div style={{ color: '#475569', fontSize: 13 }}>{progressLabel}</div>
+            <div style={{ color: '#94a3b8', fontSize: 11, maxWidth: 360 }}>
+              首次加载从远端 GridFS 拉取，约需 1-3 分钟；缓存命中后秒开。
+            </div>
+          </div>
+        ) : error ? (
+          <Alert
+            type="error" showIcon
+            message="PDF 加载失败"
+            description={error}
+            action={<Button size="small" onClick={onRetry}>重试</Button>}
+            style={{ margin: 20 }}
+          />
+        ) : blobUrl ? (
+          <iframe
+            src={blobUrl}
+            title="PDF"
+            style={{ width: '100%', height: '100%', border: 'none' }}
+          />
+        ) : null}
       </div>
     </div>
   )

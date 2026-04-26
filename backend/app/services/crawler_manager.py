@@ -142,13 +142,14 @@ SPECS: dict[str, CrawlerSpec] = {
     # opinions 保留 detail (内容很短 ~几十字, 不依赖独立 detail quota 池 — opinions
     #   的 opinion_info 和 articles 的 article_info 走不同端点, 实测不互相吃配额).
     "acecamp":     CrawlerSpec("acecamp", "AceCamp", {
+        # 2026-04-25 (v2.2): --daily-cap 移除 — 实时档不靠数量闸, 靠
+        # SoftCooldown (10003/10040 自动触发) + --skip-detail (detail 不触 quota).
         "articles": ("--watch", "--resume", "--since-hours", "24",
                      "--interval", "120",
                      "--throttle-base", "3.0", "--throttle-jitter", "2.0",
                      "--burst-size", "20",
                      "--burst-cooldown-min", "15",
                      "--burst-cooldown-max", "40",
-                     "--daily-cap", "300",
                      "--type", "articles",
                      "--skip-detail"),
         "opinions": ("--watch", "--resume", "--since-hours", "24",
@@ -157,7 +158,6 @@ SPECS: dict[str, CrawlerSpec] = {
                      "--burst-size", "20",
                      "--burst-cooldown-min", "15",
                      "--burst-cooldown-max", "40",
-                     "--daily-cap", "200",
                      "--type", "opinions"),
     }),
     "alphaengine": CrawlerSpec("alphaengine", "alphaengine", {
@@ -197,18 +197,20 @@ SPECS: dict[str, CrawlerSpec] = {
                           "--category", "all",
                           "--interval", "3600",      # 1h between passes
                           "--throttle-base", "1.5", "--throttle-jitter", "1",
-                          "--burst-size", "0", "--daily-cap", "200",
-                          "--backfill-max", "100"),  # per-category cap per round
+                          "--burst-size", "0",
+                          # 2026-04-25 (v2.2): --daily-cap 移除, 靠节奏 + SoftCooldown
+                          "--backfill-max", "100"),  # 业务参数: per-category cap per round
     }),
     "thirdbridge": CrawlerSpec("thirdbridge", "third_bridge",
                                # third_bridge 单 variant; WAF 敏感, interval 拉长
                                {"default": ("--watch", "--resume", "--interval", "1800",
                                             "--throttle-base", "4", "--throttle-jitter", "3")}),
     "semianalysis": CrawlerSpec("semianalysis", "semianalysis", {
+        # 2026-04-25 (v2.2): --daily-cap 移除, 实时档不再数量闸.
         "default": ("--watch", "--resume", "--since-hours", "72",
                     "--interval", "1800",
                     "--throttle-base", "3.0", "--throttle-jitter", "2.0",
-                    "--burst-size", "30", "--daily-cap", "200"),
+                    "--burst-size", "30"),
     }),
 }
 

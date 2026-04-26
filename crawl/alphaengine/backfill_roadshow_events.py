@@ -12,7 +12,7 @@ Usage:
   python3 backfill_roadshow_events.py --watch --interval 600   # 持续盯 (实时补)
 """
 from __future__ import annotations
-import argparse, sys, time, json, hashlib
+import argparse, os, sys, time, json, hashlib
 from datetime import datetime, timedelta, timezone
 
 _BJ_TZ = timezone(timedelta(hours=8))
@@ -187,7 +187,7 @@ def main():
                      extra=f"acct={acct_id} role={lock_role}")
 
     sess = create_session(token)
-    mdb = MongoClient("mongodb://localhost:27017")["alphaengine"]
+    mdb = MongoClient(os.environ.get("MONGO_URI", "mongodb://localhost:27018"))["alphaengine"]
 
     # Ensure indexes
     mdb.roadshow_events.create_index([("date", DESCENDING)])

@@ -6,8 +6,7 @@ reports a [N] citation with a URL or source_id, we don't trust it until
 an independent LLM pass re-reads the source document and confirms the
 snippet is present (or at least the claim is supported by the doc).
 
-Writes to ``citation_audit_log`` for historical tracking; the weekly
-summary is surfaced on the admin ResearchLogs page.
+Writes to ``citation_audit_log`` for historical tracking.
 """
 from __future__ import annotations
 

@@ -33,7 +33,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, AsyncIterator, Iterable
 
 from langchain_text_splitters import (
     MarkdownHeaderTextSplitter,
@@ -341,6 +341,38 @@ def build_rows_for_doc(spec: CollectionSpec, doc: dict) -> list[dict]:
     return rows
 
 
+# ── Async cursor helper ────────────────────────────────────────────────
+# Sync pymongo cursors block the event loop on every `next()` (each one is a
+# network read; over a 40k-doc collection the loop stays pinned for minutes
+# and FastAPI requests time out). Drain the cursor on a worker thread instead
+# and yield to the loop in batches — small enough that other tasks (chat
+# requests, quote warmer) get scheduled regularly, large enough that the
+# thread-hop overhead stays negligible.
+async def _aiter_cursor(cursor, batch_size: int = 200) -> AsyncIterator[dict]:
+    def _next_batch() -> list[dict]:
+        out: list[dict] = []
+        try:
+            for _ in range(batch_size):
+                out.append(next(cursor))
+        except StopIteration:
+            pass
+        return out
+    while True:
+        batch = await asyncio.to_thread(_next_batch)
+        if not batch:
+            return
+        # The consumer's per-doc work (build_rows_for_doc → markdown chunking,
+        # hashing, Milvus prefetch lookups) is sync. Without an explicit await
+        # every few docs the loop stays pinned for the whole 200-doc batch —
+        # tens of seconds at observed rates — and unrelated FastAPI handlers
+        # (sentimentrader cards, quote warmer) time out. sleep(0) is just a
+        # tick yield, not a real sleep.
+        for i, doc in enumerate(batch):
+            yield doc
+            if (i & 7) == 7:
+                await asyncio.sleep(0)
+
+
 # ── Milvus helpers (sync, wrapped in asyncio.to_thread for async callers) ──
 
 
@@ -459,12 +491,15 @@ def delete_doc(mv: MilvusClient, collection: str, doc_id: str) -> int:
 
 # ── Sync state / lease ──────────────────────────────────────────
 #
-# Originally stored in `admin.vector_sync_state` on local Mongo (pre-migration).
-# After the 2026-04-23 crawler Mongo migration, the remote `u_spider` account
-# has NO read/write access to the `admin` database, so the state store is
-# routed to a LOCAL Mongo instance (localhost:27017, no auth) in a dedicated
-# `kb_vector_sync` database. This keeps ops state independent of the remote
-# crawler Mongo's auth policy and lets the poller own its own space.
+# Sync state lives in a separate Mongo instance from the crawler corpus:
+# `ta-mongo-state` container on `mongodb://localhost:27017` (no auth) →
+# database `kb_vector_sync`. Keeping the lease/tombstone store split from
+# the crawler corpus (`ta-mongo-crawl` :27018) means the poller owns its
+# own ops space and no scraper can stomp the lease docs by accident.
+# Originally introduced in the 2026-04-23 remote-Mongo era when the remote
+# `u_spider` account had no `admin`-DB write permission; the split is
+# kept after the 2026-04-26 back-migration because it remains the cleaner
+# separation of concerns.
 
 
 SYNC_STATE_URI = os.environ.get("KB_VECTOR_STATE_URI", "mongodb://localhost:27017")
@@ -532,17 +567,99 @@ def acquire_lease(mc: MongoClient, spec: CollectionSpec, ttl_seconds: int = 7200
         return False
 
 
+def get_last_watermark(spec: CollectionSpec) -> int | None:
+    """Return the last successful ``release_time_ms`` watermark for this spec.
+
+    Used by the auto-sync loop to cap each poll to docs newer than the last
+    successful cycle (``ingest_collection(since_ms=...)``). Returns ``None``
+    if we've never run a successful cycle for this spec — the caller should
+    treat that as "ingest from the beginning" (subject to its own ``limit``).
+    """
+    doc = _load_sync_state_doc(spec)
+    if not doc:
+        return None
+    wm = doc.get("last_release_time_ms")
+    try:
+        return int(wm) if wm is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def get_last_watermark_str(spec: CollectionSpec) -> str | None:
+    """Return the last successful ``release_time`` *string* watermark.
+
+    Five specs don't have an epoch-ms field (``alphapai/*`` and
+    ``jinmen/meetings``). For those, ``ingest_collection`` can take a
+    ``since_str`` argument and filter in Mongo via ``{date_str_field:
+    {"$gt": since_str}}``, which relies on the canonical
+    ``YYYY-MM-DD HH:MM[:SS]`` format being lexicographically sortable.
+    """
+    doc = _load_sync_state_doc(spec)
+    if not doc:
+        return None
+    wm = doc.get("last_release_time_str")
+    if wm is None:
+        return None
+    wm = str(wm).strip()
+    return wm or None
+
+
+def get_last_pdf_watermark(spec: CollectionSpec) -> int | None:
+    """Return the last ``pdf_text_extracted_at`` epoch-ms watermark.
+
+    Closes the back-fill gap: the parser writes ``pdf_text_md`` +
+    ``pdf_text_extracted_at`` onto docs whose ``release_time_ms`` is
+    months old, which the date-watermark cursor never re-reads. The auto-
+    sync loop ORs this watermark with the date-watermark for ``has_pdf``
+    specs so freshly-parsed docs flow into Milvus within one cycle.
+    """
+    if not spec.has_pdf:
+        return None
+    doc = _load_sync_state_doc(spec)
+    if not doc:
+        return None
+    wm = doc.get("last_pdf_extracted_ms")
+    try:
+        return int(wm) if wm is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_sync_state_doc(spec: CollectionSpec) -> dict | None:
+    try:
+        return _state_client()[SYNC_STATE_DB]["vector_sync_state"].find_one(
+            {"_id": _sync_state_key(spec)},
+        )
+    except Exception as e:
+        logger.debug("sync state read %s failed: %s", _sync_state_key(spec), e)
+        return None
+
+
 def release_lease(
     mc: MongoClient, spec: CollectionSpec, watermark_ms: int | None = None,
-    stats: dict | None = None,
+    stats: dict | None = None, watermark_str: str | None = None,
+    pdf_watermark_ms: int | None = None,
 ) -> None:
-    """Release the lease; optionally bump the watermark + record run stats."""
+    """Release the lease; optionally bump the watermark + record run stats.
+
+    Supports both epoch-ms and string watermarks — five specs (alphapai/*,
+    jinmen/meetings) sort by ``publish_time``/``release_time`` strings, not
+    ms, so the caller may set ``watermark_str`` instead of ``watermark_ms``.
+
+    ``pdf_watermark_ms`` (only meaningful for ``has_pdf=True`` specs) tracks
+    the high-water mark of ``pdf_text_extracted_at`` seen this cycle so the
+    next poll can OR-filter for fresh PDF parses on otherwise-old docs.
+    """
     update: dict[str, Any] = {
         "in_progress": False,
         "last_run_at_ms": int(time.time() * 1000),
     }
     if watermark_ms is not None:
         update["last_release_time_ms"] = watermark_ms
+    if watermark_str is not None:
+        update["last_release_time_str"] = watermark_str
+    if pdf_watermark_ms is not None:
+        update["last_pdf_extracted_ms"] = pdf_watermark_ms
     if stats is not None:
         update["last_run_stats"] = stats
     try:
@@ -605,6 +722,8 @@ async def ingest_collection(
     *,
     limit: int | None = None,
     since_ms: int | None = None,
+    since_str: str | None = None,
+    since_pdf_ms: int | None = None,
     force: bool = False,
     batch_size: int = 32,
     use_lease: bool = True,
@@ -649,7 +768,7 @@ async def ingest_collection(
 
     # ── Lease ─────────────────────────────────────────────────
     if use_lease:
-        if not acquire_lease(mc, spec):
+        if not await asyncio.to_thread(acquire_lease, mc, spec):
             logger.warning("ingest %s SKIPPED — another process holds lease", key)
             return {"skipped_due_to_lease": 1, "elapsed_s": 0,
                     "docs_seen": 0, "docs_chunked": 0, "docs_unchanged": 0,
@@ -662,8 +781,29 @@ async def ingest_collection(
     query: dict[str, Any] = {
         "_id": {"$not": {"$regex": r"^(crawler_|daily_|_probe$|_state$|account$|test$)"}},
     }
+    # Build watermark clauses. For has_pdf specs we OR the date-watermark with
+    # a separate pdf_text_extracted_at watermark — old docs that just got their
+    # PDF parsed (release_time_ms unchanged) must still flow through ingest.
+    clauses: list[dict[str, Any]] = []
     if since_ms and spec.date_ms_field:
-        query[spec.date_ms_field] = {"$gt": since_ms}
+        clauses.append({spec.date_ms_field: {"$gt": since_ms}})
+    elif since_str and spec.date_str_field:
+        # String watermark path (specs without epoch-ms). Relies on the
+        # canonical `YYYY-MM-DD HH:MM[:SS]` format crawlers produce being
+        # lexicographically sortable — verified for alphapai's publish_time
+        # and jinmen meetings' release_time.
+        clauses.append({spec.date_str_field: {"$gt": since_str}})
+    if spec.has_pdf and since_pdf_ms is not None:
+        # `since_pdf_ms == 0` is meaningful — it means "first cycle, catch
+        # every PDF-back-filled doc whose pdf_text_extracted_at is set." Treat
+        # as a sentinel rather than the falsy "skip this clause" value.
+        from datetime import datetime as _dt, timezone as _tz
+        pdf_dt = _dt.fromtimestamp(since_pdf_ms / 1000.0, tz=_tz.utc)
+        clauses.append({"pdf_text_extracted_at": {"$gt": pdf_dt}})
+    if len(clauses) == 1:
+        query.update(clauses[0])
+    elif len(clauses) > 1:
+        query["$or"] = clauses
 
     projection: dict[str, int] = {
         "_id": 1,
@@ -684,6 +824,10 @@ async def ingest_collection(
         projection["stocks"] = 1
     if spec.ticker_fallback_path == "companies":
         projection["companies"] = 1
+    if spec.has_pdf:
+        # Needed to advance the pdf-watermark per doc, regardless of whether
+        # this doc's text content actually changed this cycle.
+        projection["pdf_text_extracted_at"] = 1
 
     sort_field = spec.date_ms_field or spec.date_str_field
     cursor = coll.find(query, projection=projection)
@@ -693,7 +837,11 @@ async def ingest_collection(
         cursor = cursor.limit(limit)
 
     # ── Prefetch existing chunks into memory (avoids per-doc Milvus RPC) ──
-    existing_by_doc = _prefetch_existing_by_doc(mv, milvus_coll, spec.db, spec.collection)
+    # Sync Milvus query — wrap so the multi-second paginated load doesn't pin
+    # the event loop on collections with tens of thousands of chunks.
+    existing_by_doc = await asyncio.to_thread(
+        _prefetch_existing_by_doc, mv, milvus_coll, spec.db, spec.collection,
+    )
 
     # ── Counters ──────────────────────────────────────────────
     docs_seen = 0
@@ -703,6 +851,8 @@ async def ingest_collection(
     chunks_upserted = 0
     chunks_deleted = 0
     max_release_ms = since_ms or 0
+    max_release_str = since_str or ""
+    max_pdf_extracted_ms = since_pdf_ms or 0
     chunks_pending: list[dict] = []
     t0 = time.monotonic()
     last_log = t0
@@ -744,15 +894,20 @@ async def ingest_collection(
         chunks_pending = []
 
     # ── Main loop ─────────────────────────────────────────────
-    logger.info("ingest %s start (force=%s, since_ms=%s, limit=%s)",
-                key, force, since_ms, limit)
+    logger.info("ingest %s start (force=%s, since_ms=%s, since_pdf_ms=%s, limit=%s)",
+                key, force, since_ms, since_pdf_ms, limit)
 
     try:
-        for doc in cursor:
+        async for doc in _aiter_cursor(cursor, batch_size=200):
             docs_seen += 1
             doc_id = ""
             try:
-                rows = build_rows_for_doc(spec, doc)
+                # Per-doc work (markdown chunking, hashing, language detect) is
+                # CPU-bound sync that can run hundreds of ms on big PDFs. Off-
+                # loading to a thread keeps the event loop free for unrelated
+                # FastAPI handlers (e.g. the workbench's sentimentrader cards)
+                # that would otherwise stall behind ingest cycles.
+                rows = await asyncio.to_thread(build_rows_for_doc, spec, doc)
                 if not rows:
                     continue
                 doc_id = rows[0]["doc_id"]
@@ -765,6 +920,27 @@ async def ingest_collection(
                 rms = int(rows[0].get("release_time_ms") or 0)
                 if rms > max_release_ms:
                     max_release_ms = rms
+                # Also track the string watermark when the spec doesn't carry
+                # an epoch-ms field — the poller persists either one depending
+                # on spec shape so incremental polls advance correctly.
+                if spec.date_str_field and not spec.date_ms_field:
+                    rstr = str(doc.get(spec.date_str_field) or "")
+                    if rstr and rstr > max_release_str:
+                        max_release_str = rstr
+
+                # PDF watermark: docs whose pdf_text_extracted_at is fresher
+                # than the date-watermark must still flow through next cycle if
+                # the parser back-fills more docs after this run. The cursor
+                # isn't ordered on this field, so the bump is "max-of-seen".
+                if spec.has_pdf:
+                    pdf_ts = doc.get("pdf_text_extracted_at")
+                    if pdf_ts is not None:
+                        try:
+                            pdf_ms = int(pdf_ts.timestamp() * 1000)
+                            if pdf_ms > max_pdf_extracted_ms:
+                                max_pdf_extracted_ms = pdf_ms
+                        except (AttributeError, TypeError, ValueError):
+                            pass
 
                 # Existing chunks from prefetch (O(1) dict lookup).
                 existing = existing_by_doc.get(doc_id, [])
@@ -831,6 +1007,37 @@ async def ingest_collection(
             cursor.close()
         except Exception:
             pass
+        # Always release the lease + advance the watermark, even if an
+        # exception interrupted the loop. A leaked lease would otherwise
+        # block subsequent cycles for the full 2h TTL.
+        if use_lease:
+            try:
+                partial_elapsed = int(time.monotonic() - t0)
+                # has_pdf specs always persist a non-None pdf_watermark so the
+                # next cycle's OR-clause stays armed. Non-PDF specs persist None.
+                pdf_wm_persist = max_pdf_extracted_ms if spec.has_pdf else None
+                partial_stats = {
+                    "docs_seen": docs_seen,
+                    "docs_chunked": docs_chunked,
+                    "docs_unchanged": docs_unchanged,
+                    "docs_errored": docs_errored,
+                    "chunks_upserted": chunks_upserted,
+                    "chunks_deleted": chunks_deleted,
+                    "elapsed_s": partial_elapsed,
+                    "watermark_ms": max_release_ms,
+                    "watermark_str": max_release_str or None,
+                    "pdf_watermark_ms": pdf_wm_persist,
+                }
+                await asyncio.to_thread(
+                    release_lease,
+                    mc, spec,
+                    watermark_ms=max_release_ms,
+                    watermark_str=max_release_str or None,
+                    pdf_watermark_ms=pdf_wm_persist,
+                    stats=partial_stats,
+                )
+            except Exception:
+                logger.exception("release_lease failed in finally (lease may leak)")
 
     elapsed = time.monotonic() - t0
     stats = {
@@ -842,10 +1049,9 @@ async def ingest_collection(
         "chunks_deleted": chunks_deleted,
         "elapsed_s": int(elapsed),
         "watermark_ms": max_release_ms,
+        "watermark_str": max_release_str or None,
+        "pdf_watermark_ms": max_pdf_extracted_ms if spec.has_pdf else None,
     }
-
-    if use_lease:
-        release_lease(mc, spec, watermark_ms=max_release_ms, stats=stats)
 
     _log_progress(force_log=True)
     logger.info("ingest %s DONE: %s", key, stats)
@@ -870,20 +1076,24 @@ async def sweep_deleted_docs(
     milvus_coll = s.effective_milvus_collection
     t0 = time.monotonic()
 
-    if use_lease and not acquire_lease(mc, spec):
+    if use_lease and not await asyncio.to_thread(acquire_lease, mc, spec):
         logger.warning("sweep %s SKIPPED — lease held", key)
         return {"skipped_due_to_lease": 1}
 
     try:
-        # Mongo IDs
-        mongo_ids = set()
-        for d in mc[mongo_db_name_for(spec)][spec.collection].find(
+        # Mongo IDs — drain on worker thread so the loop stays responsive over
+        # large collections (some have 40k+ docs).
+        mongo_cursor = mc[mongo_db_name_for(spec)][spec.collection].find(
             {"_id": {"$not": {"$regex": r"^(crawler_|daily_|_probe$|_state$|account$|test$)"}}},
             projection={"_id": 1},
-        ):
+        )
+        mongo_ids: set[str] = set()
+        async for d in _aiter_cursor(mongo_cursor, batch_size=500):
             mongo_ids.add(_vector_doc_id(spec.db, spec.collection, d["_id"]))
 
-        # Milvus doc_ids for this collection (paginate by chunk_id ordering)
+        # Milvus doc_ids for this collection (paginate by chunk_id ordering).
+        # Each mv.query is a sync gRPC call — wrap in to_thread so 16K-row
+        # pages don't pin the loop.
         milvus_doc_ids: set[str] = set()
         last_pk = ""
         while True:
@@ -891,7 +1101,8 @@ async def sweep_deleted_docs(
             if last_pk:
                 filt += f' and chunk_id > "{last_pk}"'
             try:
-                page = mv.query(
+                page = await asyncio.to_thread(
+                    mv.query,
                     collection_name=milvus_coll,
                     filter=filt,
                     output_fields=["chunk_id", "doc_id"],
@@ -918,7 +1129,7 @@ async def sweep_deleted_docs(
         deleted = 0
         if tombstones and not dry_run:
             for did in sorted(tombstones):
-                deleted += delete_doc(mv, milvus_coll, did)
+                deleted += await asyncio.to_thread(delete_doc, mv, milvus_coll, did)
             # Audit
             try:
                 _state_client()[SYNC_STATE_DB]["vector_tombstones"].insert_one({
@@ -941,7 +1152,10 @@ async def sweep_deleted_docs(
         }
     finally:
         if use_lease:
-            release_lease(mc, spec)
+            try:
+                await asyncio.to_thread(release_lease, mc, spec)
+            except Exception:
+                logger.exception("sweep release_lease failed (lease may leak)")
 
 
 # ── CLI ──────────────────────────────────────────────────────────
@@ -953,6 +1167,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                     help="e.g. alphapai/roadshows. Use 'all' to ingest every spec in SPECS_LIST in order.")
     ap.add_argument("--limit", type=int, help="Cap docs processed per collection")
     ap.add_argument("--since", type=int, help="Ingest docs with release_time_ms > this")
+    ap.add_argument("--since-str", type=str, dest="since_str",
+                    help="String watermark for specs without release_time_ms (alphapai/*, jinmen/meetings). "
+                         "Format must match the crawler field: 'YYYY-MM-DD HH:MM' or '... :SS'.")
     ap.add_argument("--force", action="store_true",
                     help="Re-embed even if chunk_id exists with current model version")
     ap.add_argument("--batch-size", type=int, default=32,
@@ -982,6 +1199,7 @@ async def _main(argv: list[str] | None = None) -> int:
                     spec,
                     limit=args.limit,
                     since_ms=args.since,
+                    since_str=args.since_str,
                     force=args.force,
                     batch_size=args.batch_size,
                     use_lease=not args.no_lease,

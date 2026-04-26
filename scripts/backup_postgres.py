@@ -3,9 +3,11 @@
 
 - pg_dump runs inside the ta-postgres-dev container (no host pg_dump required)
 - local copy:  /home/ygwang/backups/postgres/trading_agent_YYYY-MM-DD_HHMM.sql.gz
-- remote copy: GridFS bucket `pg_backup` inside Mongo
-               mongodb://u_spider@192.168.31.176:35002/ti-user-knowledge-base
-- retention: local 30 days, remote 90 days
+- GridFS copy: `pg_backup` bucket inside Mongo
+               mongodb://127.0.0.1:27018/ti-user-knowledge-base
+               (was on remote 192.168.31.176:35002 from 2026-04-24 to
+               2026-04-26, then migrated back with the rest of the corpus)
+- retention: local 30 days, GridFS 90 days
 
 Install via cron:
     10 3 * * *  /usr/bin/python3 /home/ygwang/trading_agent/scripts/backup_postgres.py >> /home/ygwang/backups/postgres/backup.log 2>&1
@@ -56,7 +58,7 @@ EXCLUDE_TABLES = [
 LOCAL_DIR = Path("/home/ygwang/backups/postgres")
 LOCAL_RETENTION_DAYS = 30
 
-REMOTE_URI = "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin"
+REMOTE_URI = "mongodb://127.0.0.1:27018/"
 REMOTE_DB = "ti-user-knowledge-base"
 REMOTE_BUCKET = "pg_backup"
 REMOTE_RETENTION_DAYS = 90

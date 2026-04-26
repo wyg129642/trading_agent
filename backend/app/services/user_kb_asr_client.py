@@ -31,13 +31,23 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
 from backend.app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+# Classifications for the probe result, used by the frontend to pick a banner
+# severity and message. Keep in sync with MyKnowledgeBase.tsx.
+#   ok           — service is reachable, model loaded, GPU present
+#   loading      — reachable but the model is still warming up; transient on boot
+#   transient    — single request timed out / connection reset; tunnel blip
+#   unreachable  — every retry failed; tunnel almost certainly down
+#   misconfigured — asr_service_url blank or returns a non-JSON response
+ProbeClass = str
 
 
 class AsrUnavailable(RuntimeError):
@@ -164,36 +174,166 @@ def _job_to_progress(job: dict) -> AsrProgress:
 # ── Public API ────────────────────────────────────────────────
 
 
-async def probe() -> tuple[bool, str]:
-    """Health check. Returns (ok, reason).
+@dataclass
+class AsrProbeResult:
+    """Rich ASR health snapshot surfaced to the UI banner.
 
-    Used by a /ping-style endpoint so the UI can show a banner when the
-    ASR service is down, so users understand why their upload hasn't
-    made progress.
+    ``ok`` is a convenience boolean for the simple green/red decision; every
+    other field is optional context so the frontend can render a useful
+    status pill when healthy and an actionable message when not.
+    """
+    ok: bool
+    reason: str
+    classification: ProbeClass  # one of: ok | loading | transient | unreachable | misconfigured
+    latency_ms: Optional[int] = None
+    model_loaded: Optional[bool] = None
+    model_error: Optional[str] = None
+    model_path: Optional[str] = None
+    gpu: Optional[bool] = None
+    gpu_count: Optional[int] = None
+    queue_size: Optional[int] = None
+    jobs_in_memory: Optional[int] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "reason": self.reason,
+            "classification": self.classification,
+            "latency_ms": self.latency_ms,
+            "model_loaded": self.model_loaded,
+            "model_error": self.model_error,
+            "model_path": self.model_path,
+            "gpu": self.gpu,
+            "gpu_count": self.gpu_count,
+            "queue_size": self.queue_size,
+            "jobs_in_memory": self.jobs_in_memory,
+        }
+
+
+async def probe_detailed() -> AsrProbeResult:
+    """Health check with rich detail. Used by /asr/ping.
+
+    Hardened against the dominant failure mode in production: the SSH tunnel
+    briefly reconnects (``ServerAliveInterval=30`` keepalive probes can stall
+    the link for 1-3 s) and a single 5 s httpx call returns ``ReadTimeout``.
+    Previously this lit the banner red for the entire session because the
+    frontend pinged only on mount. Now:
+
+    * timeout is 8 s per attempt (up from 5 s)
+    * up to 2 attempts on transient errors (ReadTimeout, ConnectTimeout,
+      RemoteProtocolError, ConnectError) with a 300 ms nap between tries
+    * result is classified so the UI can pick banner severity intelligently
     """
     settings = get_settings()
     if not settings.asr_service_url:
-        return False, "asr_service_url not configured"
-    try:
-        # trust_env=False: the ASR service is always on local-loopback via
-        # an SSH tunnel. The shell's HTTP_PROXY/ALL_PROXY env vars (Clash at
-        # 127.0.0.1:7890) otherwise hijack the request and manifest as
-        # ReadTimeout / 502s even when the tunnel is healthy. NO_PROXY was
-        # only set for uppercase on uvicorn; lowercase ``all_proxy`` still
-        # leaked through. Force-disabling env-driven proxies removes the
-        # whole class of bug.
-        async with httpx.AsyncClient(
-            timeout=5.0, headers=_build_headers(), trust_env=False,
-        ) as client:
-            r = await client.get(f"{_base_url()}/health")
-            r.raise_for_status()
-            data = r.json()
-    except httpx.HTTPError as e:
-        return False, f"{type(e).__name__}: {e}"
-    if not data.get("model_loaded"):
-        err = data.get("model_error") or "(model still loading)"
-        return False, f"model not ready: {err}"
-    return True, "ok"
+        return AsrProbeResult(
+            ok=False,
+            reason="asr_service_url not configured",
+            classification="misconfigured",
+        )
+
+    url = f"{_base_url()}/health"
+    # trust_env=False: the ASR service is always on local-loopback via an SSH
+    # tunnel. Shell's HTTP_PROXY/ALL_PROXY env vars (Clash at 127.0.0.1:7890)
+    # otherwise hijack the request and manifest as ReadTimeout / 502s even
+    # when the tunnel is healthy.
+    last_exc: Optional[httpx.HTTPError] = None
+    data: Optional[dict] = None
+    t0 = time.monotonic()
+    async with httpx.AsyncClient(
+        timeout=8.0, headers=_build_headers(), trust_env=False,
+    ) as client:
+        for attempt in range(2):
+            try:
+                r = await client.get(url)
+                r.raise_for_status()
+                data = r.json()
+                last_exc = None
+                break
+            except (
+                httpx.ReadTimeout, httpx.ConnectTimeout,
+                httpx.RemoteProtocolError, httpx.ConnectError,
+                httpx.NetworkError,
+            ) as e:
+                last_exc = e
+                # Brief nap — just enough to let an SSH keepalive round-trip
+                # settle. Don't go longer: the UI is waiting on this call.
+                if attempt == 0:
+                    await asyncio.sleep(0.3)
+                continue
+            except httpx.HTTPError as e:
+                # Non-transient (e.g. 4xx/5xx): surface immediately.
+                last_exc = e
+                break
+    latency_ms = int((time.monotonic() - t0) * 1000)
+
+    if last_exc is not None or data is None:
+        exc_name = type(last_exc).__name__ if last_exc else "Unknown"
+        # Transient family — tunnel blip, SSH keepalive, jumpbox hiccup.
+        transient_types = (
+            httpx.ReadTimeout, httpx.ConnectTimeout,
+            httpx.RemoteProtocolError, httpx.ConnectError,
+            httpx.NetworkError,
+        )
+        if isinstance(last_exc, transient_types):
+            return AsrProbeResult(
+                ok=False,
+                reason=f"{exc_name}: {last_exc}",
+                classification="unreachable",
+                latency_ms=latency_ms,
+            )
+        return AsrProbeResult(
+            ok=False,
+            reason=f"{exc_name}: {last_exc}",
+            classification="unreachable",
+            latency_ms=latency_ms,
+        )
+
+    model_loaded = bool(data.get("model_loaded"))
+    model_error = data.get("model_error")
+    gpu = bool(data.get("gpu")) if data.get("gpu") is not None else None
+    gpu_count = data.get("gpu_count")
+    queue_size = data.get("queue_size")
+    jobs_in_memory = data.get("jobs_in_memory")
+    model_path = data.get("model_path")
+
+    if not model_loaded:
+        err = model_error or "模型仍在加载中…"
+        return AsrProbeResult(
+            ok=False,
+            reason=f"model not ready: {err}",
+            classification="loading",
+            latency_ms=latency_ms,
+            model_loaded=False,
+            model_error=err if model_error else None,
+            model_path=model_path,
+            gpu=gpu,
+            gpu_count=gpu_count,
+            queue_size=queue_size,
+            jobs_in_memory=jobs_in_memory,
+        )
+
+    return AsrProbeResult(
+        ok=True,
+        reason="ok",
+        classification="ok",
+        latency_ms=latency_ms,
+        model_loaded=True,
+        model_path=model_path,
+        gpu=gpu,
+        gpu_count=gpu_count,
+        queue_size=queue_size,
+        jobs_in_memory=jobs_in_memory,
+    )
+
+
+async def probe() -> tuple[bool, str]:
+    """Back-compat shim for callers that only want (ok, reason).
+
+    New callers should use :func:`probe_detailed`.
+    """
+    result = await probe_detailed()
+    return result.ok, result.reason
 
 
 async def transcribe(

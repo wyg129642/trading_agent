@@ -130,7 +130,9 @@ and `src/tools/web_search.py`.
   `run_chat_memory_processor.py` (chat feedback → long-term memory). Staging starts **only** uvicorn;
   engine/scanner/memory blocked by `_prod_only_guard`.
 - **crawl** — `crawler_monitor.py --web --port 8080` + ~18 scraper watchers across 8 platforms
-  (auto-spawned via `/api/start-all`). **Prod-only** — staging reads remote Mongo read-only.
+  (auto-spawned via `/api/start-all`). Crawlers now run in **staging** — the real invariant is
+  "exactly one worktree writes per credential" (enforced by `_check_other_worktree_clear` in
+  `start_web.sh`). Both worktrees see the same shared Mongo at `127.0.0.1:27018`.
 
 **Staging bootstrap:** `./start_web.sh init-staging` (idempotent) — `CREATE DATABASE
 trading_agent_staging` + Alembic migrations. Milvus/Mongo collections lazy-created.
@@ -165,7 +167,7 @@ All health/status `curl` calls use `--noproxy '*'` because shell has `HTTP_PROXY
   disables the poller/delete-sweep/reaper. Stack under `scripts/kb_vector/` + `docker-compose.vector.yml`.
 
 ### Personal Knowledge Base — per-team uploads (`user_kb_search` / `user_kb_fetch_document`)
-- User-uploaded files (PDF/MD/DOCX/XLSX/TXT/audio) → chunks → remote Mongo `ti-user-knowledge-base`
+- User-uploaded files (PDF/MD/DOCX/XLSX/TXT/audio) → chunks → local Mongo `ti-user-knowledge-base`
   (see `user_kb_remote_mongo` memory). Collections `documents`, `chunks`, `fs.files`, `fs.chunks`
   scoped by `user_id` in shared collections (per-user collections would split GridFS bucket). Dense
   vectors in Milvus `user_kb_chunks` (OpenAI `text-embedding-3-small`, 1536-dim).
@@ -186,11 +188,13 @@ All health/status `curl` calls use `--noproxy '*'` because shell has `HTTP_PROXY
 ## Crawler System
 
 Raw research data scraped from **8 external platforms** (~18 watcher variants). All under `crawl/`:
-one subdir + `scraper.py` per platform, shared throttle/monitor/auto-login. **Mongo target is remote
-ops cluster `192.168.31.176:35002`** (u_spider auth) — migrated 2026-04-23 from localhost; PDFs in
-GridFS. See `crawler_data_remote_mongo` memory for DB-name mapping.
+one subdir + `scraper.py` per platform, shared throttle/monitor/auto-login. **Mongo target is local
+`ta-mongo-crawl` container on `127.0.0.1:27018`** (no auth, data dir
+`/home/ygwang/crawl_data/mongo`); PDFs in GridFS. The 8 DBs migrated to the remote ops cluster
+2026-04-23 then back to local 2026-04-26 — DB names retained the `-full` suffixes from the remote
+era. See `crawler_data_local_mongo` memory for the mapping.
 
-| Platform | Dir | Remote Mongo DB | Collections | Auth |
+| Platform | Dir | Mongo DB | Collections | Auth |
 |---|---|---|---|---|
 | AlphaPai | `crawl/alphapai_crawl/` | `alphapai-full` | `roadshows`, `reports`, `comments`, `wechat_articles` | JWT bearer (localStorage `token`) |
 | Jinmen | `crawl/jinmen/` | `jinmen-full` | `meetings`, `reports`, `oversea_reports` | base64 JSON + AES-CBC decryption |
@@ -250,7 +254,7 @@ skipped (only native scripts) and AU has no source. `kb_search` tool description
 LLM Chinese/English company names work, so passing `'英伟达'` or `'宁德时代'` resolves before
 hitting Mongo `_canonical_tickers` / Milvus `tickers`.
 
-**PDF storage** — GridFS on each platform's remote Mongo DB (`fs.files`/`fs.chunks`); `filename` is
+**PDF storage** — GridFS on each platform's local Mongo DB (`fs.files`/`fs.chunks`); `filename` is
 original relative path. `backend/app/services/pdf_storage.py::stream_pdf_or_file` reads GridFS first,
 falls back to local disk for un-migrated new PDFs. Local
 `/home/ygwang/crawl_data/{alphapai,jinmen,gangtise,meritco,alphaengine,acecamp}_pdfs/` kept as
@@ -278,8 +282,11 @@ Five stores, distinct roles:
    `backend/app/config.py`.
 2. **Redis 7** (`localhost:6379`) — rate-limit counters, login session state, OTP relay, scraper
    PIDs, quote cache, consensus cache.
-3. **Remote Mongo** at `192.168.31.176:35002` (u_spider) — crawler output (8 platforms), personal KB
-   (`ti-user-knowledge-base`).
+3. **MongoDB** at `127.0.0.1:27018` (local `ta-mongo-crawl` container, no auth, data dir
+   `/home/ygwang/crawl_data/mongo`) — crawler output (8 platforms), personal KB
+   (`ti-user-knowledge-base`). Backed up to remote ops cluster `192.168.31.176:35002` for failover.
+   A second tiny instance `ta-mongo-state` on `127.0.0.1:27017` holds the kb_vector_sync lease /
+   tombstone state (separate from the corpus on purpose).
 4. **Milvus 2.5** (`docker-compose.vector.yml`, persisted to `/home/ygwang/crawl_data/milvus_data/`)
    — hybrid vector + BM25. `kb_chunks` (Qwen3-Embedding-8B 4096-dim) shared corpus; `user_kb_chunks`
    (OpenAI `text-embedding-3-small` 1536-dim) personal KB.

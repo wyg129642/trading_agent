@@ -117,16 +117,41 @@ WEB_SEARCH_SYSTEM_PROMPT = """## 联网搜索与网页阅读能力
 4. 需要**核心业务拆分、产能规划、招标细节**等摘要难以覆盖的内容 → 读纪要或路演页原文
 5. 用户提供了具体 URL → 直接 read_webpage
 
+### 来源权威性分级（强制采纳此分级判断每条信息）
+- **🟢 高权威（可直接采用，无需特别说明）**：
+  - 上市公司官方披露：cninfo / sse / szse / hkex / sec.gov 公告 PDF、IR 网站、年报/季报/招股书
+  - 监管机构与官方统计：人民银行、证监会、交易所、统计局、Fed、ECB、BLS、Bloomberg/Reuters/WSJ/FT 主站
+  - 头部券商深度研报：中金、中信、华泰、国君、招商、海通、广发、Goldman、Morgan Stanley、JPM、UBS 等
+  - 权威财经媒体：财新、第一财经、证券时报、上海证券报、财联社官方、东方财富网研报频道
+  - 内部知识库（kb_search / user_kb_*）：纪要、路演、调研、官方研报库
+- **🟡 中等权威（可参考，但需结合多源交叉验证）**：
+  - 主流财经门户原创栏目（新浪财经/网易财经/腾讯财经/搜狐财经的署名记者稿）
+  - 行业垂直媒体：钛媒体、36氪、虎嗅、雪球大V署名长文、Seeking Alpha 编辑稿
+  - 知名分析师个人专栏（有可核实身份）
+- **🔴 低权威（默认不采用；如确无更好来源被迫使用，必须显式标注置信度）**：
+  - **以下站点已在系统层面硬过滤，搜索结果中不会再出现**：百家号 / 搜狐 (sohu.com) / 网易 (163.com) / 知乎 (zhihu.com) / 雪球 (xueqiu.com) / 东方财富股吧 (guba.eastmoney.com) / 百度贴吧·知道·文库
+  - 仍可能出现需谨慎判断的来源：头条号、企鹅号、凤凰网、腾讯网自媒体频道、来源不明的"小道消息"/"内部人士"/SEO 内容农场/无作者署名的转载稿
+  - 维基百科作为唯一来源（可作为背景但不可作为关键事实唯一支撑）
+
+### 采纳规则（硬约束）
+1. **优先级**：高权威 > 中等权威 > 低权威。同一事实有高权威来源时，**忽略**低权威来源，不要并列引用。
+2. **关键数字（财务、产能、市占率、估值）**：必须来自高权威来源（官方披露 / 头部券商研报 / 内部 KB），否则禁止引用具体数字。
+3. **被迫使用低/中权威来源时**：在该事实后**显式注明置信度**，格式如下（使用括号 + 中文）：
+   - `（置信度：低，来源为自媒体/未经核实的转载，建议交叉验证）`
+   - `（置信度：中，来源为财经门户原创但缺少官方披露佐证）`
+   不要在每条事实后机械追加；仅当该条信息确实来自中/低权威源时才标注。
+4. **来源冲突**：高权威与低权威矛盾 → 采信高权威，并简短说明 `（注：自媒体XX口径不同，已忽略）`。多家高权威之间矛盾 → 并列呈现并指出分歧。
+5. **完全没有可靠来源**：直接告知用户"暂无权威披露"，**不要用低权威来源拼凑结论**，更不要编造。
+
 ### read_webpage — 选择策略
-- 优先级：**官方公告 > 定期报告 PDF > 券商深度研报 > 权威财经网站新闻（证券时报/财联社/东财）> 聚合百家号**
-- 避开：新浪/网易的纯聚合页、百度百家号二次转载、广告多的 SEO 站点
+- 优先抓取上面"高权威"清单中的 URL；中等权威按需抓 1-2 篇做交叉验证；低权威 URL 不要抓（即便 web_search 返回了也跳过）
 - 一次研究中通常挑 2-4 个最硬核的 URL 深读，不要贪多。**每次 read_webpage 后先判断内容是否已足够，再决定是否再读**
 
 ### 引用与信息不足
-- **统一引用系统**：web_search / read_webpage / alphapai_recall / jinmen_* 返回的每条结果前都带 `[N]` 引用编号，全局唯一。
+- **统一引用系统**：web_search / read_webpage / kb_search / user_kb_* 返回的每条结果前都带 `[N]` 引用编号，全局唯一。
 - 回答中必须用行内 `[N]` 标注来源（例如 "数据中心电源收入同比增长 80% [5]"），系统会自动渲染为可点击链接。
 - **不要**在回答末尾手动罗列 "来源引用" 列表——UI 会自动展示。
-- 若搜索+阅读后仍无法回答，如实告知用户缺失的数据，不要编造。"""
+- 若搜索+阅读后仍无法回答，如实告知用户缺失的数据，**绝不允许使用低权威来源凑数或编造**。"""
 
 WEB_SEARCH_FORCE_PROMPT = "\n\n用户要求联网搜索。请务必使用web_search工具搜索相关信息后再回答。"
 
@@ -188,14 +213,55 @@ def _set_cache(key: str, results: list[dict]):
 
 # ── Result re-ranking ──────────────────────────────────────────
 
+# Low-authority hosts that survive the source-side filter (e.g. surfaced by
+# Tavily/Jina under a different netloc) get heavily downranked here so they
+# only appear if no better source exists. Hard-blocked aggregators
+# (baijiahao / sohu / 163 / zhihu / xueqiu / guba.eastmoney …) live in
+# `src/tools/web_search.py::_LOW_TRUST_HOSTS` and never reach this stage.
+_DOWNRANK_HOSTS: frozenset[str] = frozenset({
+    "ifeng.com",          # 凤凰网，资讯质量参差
+    "qq.com",             # 腾讯网（含腾讯新闻自媒体频道）
+    "toutiao.com",        # 头条号
+    "kuaibao.qq.com",     # 腾讯快报（自媒体）
+})
+
+
+def _host_of(url: str, website: str = "") -> str:
+    if url:
+        try:
+            host = urlparse(url).netloc.lower().lstrip(".")
+            if host.startswith("www."):
+                host = host[4:]
+            if host:
+                return host
+        except Exception:
+            pass
+    return (website or "").lower().lstrip(".")
+
+
+def _is_downrank_host(url: str, website: str = "") -> bool:
+    host = _host_of(url, website)
+    if not host:
+        return False
+    # Match exact host or any parent domain in the blocklist.
+    parts = host.split(".")
+    for i in range(len(parts) - 1):
+        if ".".join(parts[i:]) in _DOWNRANK_HOSTS:
+            return True
+    return False
+
+
 def _rerank_results(results: list[dict], max_results: int = 8) -> list[dict]:
-    """Sort results by relevance score > authority > recency, filter low quality."""
+    """Sort by trust tier > relevance > authority > recency; filter empty."""
     def sort_key(r: dict) -> tuple:
         score = r.get("score", 0) or 0
         authority = r.get("authority", 0) or 0
-        # Prefer results with dates (more recent)
         has_date = 1 if r.get("date") else 0
-        return (score, authority, has_date)
+        # Trust tier: 1 = trusted (default), 0 = downranked aggregator/forum.
+        # Putting trust first guarantees a single low-authority article never
+        # outranks a real news/research result regardless of relevance score.
+        trust = 0 if _is_downrank_host(r.get("url", ""), r.get("website", "")) else 1
+        return (trust, score, authority, has_date)
 
     # Filter out empty content
     results = [r for r in results if r.get("content", "").strip()]

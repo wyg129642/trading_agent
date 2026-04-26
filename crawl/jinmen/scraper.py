@@ -46,7 +46,7 @@ from antibot import (  # noqa: E402
     add_antibot_args, throttle_from_args, cap_from_args,
     AccountBudget, SoftCooldown, detect_soft_warning,
     headers_for_platform, log_config_stamp, budget_from_args,
-    account_id_for_jinmen,
+    account_id_for_jinmen, warmup_session,
 )
 
 # 模块级 throttle, main() 用 CLI 覆盖. jinmen 之前是 0.3s 硬节流, 改成 3s 基线
@@ -112,7 +112,7 @@ OVERSEA_REPORT_DETAIL_API = f"{API_BASE}/json_oversea-research_preview"
 # MongoDB 配置
 MONGO_URI_DEFAULT = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 MONGO_DB_DEFAULT = os.environ.get("MONGO_DB", "jinmen-full")
 COL_MEETINGS = "meetings"
@@ -236,6 +236,8 @@ def create_session(auth: dict) -> requests.Session:
         "uc": "comein-p",
     })
     s.headers.update(h)
+    # Warmup: 先 GET brm landing 再 POST 业务 API
+    warmup_session(s, "jinmen")
     return s
 
 
@@ -2097,9 +2099,9 @@ def parse_args():
                    help=f"MongoDB URI (默认 {MONGO_URI_DEFAULT}, 或环境变量 MONGO_URI)")
     p.add_argument("--mongo-db", default=MONGO_DB_DEFAULT,
                    help=f"MongoDB 数据库名 (默认 {MONGO_DB_DEFAULT}, 或环境变量 MONGO_DB)")
-    # 反爬节流 (crawl/antibot.py)
+    # 反爬节流 (crawl/antibot.py) — default_cap 2026-04-25 500→0: 实时档不再数量闸
     add_antibot_args(p, default_base=3.0, default_jitter=2.0,
-                     default_burst=40, default_cap=500, platform="jinmen")
+                     default_burst=40, default_cap=0, platform="jinmen")
     return p.parse_args()
 
 

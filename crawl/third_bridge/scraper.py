@@ -79,7 +79,7 @@ CREDS_FILE = Path(__file__).resolve().parent / "credentials.json"
 # MongoDB
 MONGO_URI_DEFAULT = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 MONGO_DB_DEFAULT = os.environ.get("MONGO_DB", "third-bridge")
 COL_INTERVIEWS = "interviews"
@@ -150,7 +150,12 @@ def parse_cookies(cookie_str: str) -> dict:
 
 def create_client(cookie: str, user_agent: str,
                   timeout: float = DEFAULT_TIMEOUT) -> httpx.Client:
-    """trust_env=False 绕系统代理; cookie jar 用 dict 注入."""
+    """trust_env=False 绕系统代理; cookie jar 用 dict 注入.
+
+    **故意不调 antibot.warmup_session**:AWS Cognito cookie jar 极度敏感,
+    warmup 一次额外 GET 可能触发 forum Cognito challenge 或覆盖带认证的 cookie.
+    third_bridge 的 --interval 1800s 已经足够稀疏, 不靠 warmup 模拟浏览器启动.
+    """
     headers = headers_for_platform("thirdbridge")
     if user_agent:
         headers["User-Agent"] = user_agent
@@ -1000,9 +1005,11 @@ def parse_args() -> argparse.Namespace:
                    help=f"MongoDB URI (默认 {MONGO_URI_DEFAULT}, env MONGO_URI)")
     p.add_argument("--mongo-db", default=MONGO_DB_DEFAULT,
                    help=f"MongoDB 数据库名 (默认 {MONGO_DB_DEFAULT}, env MONGO_DB)")
-    # 反爬节流 (crawl/antibot.py) — third_bridge 检测最严, 默认最保守
+    # 反爬节流 (crawl/antibot.py) — third_bridge 检测最严, 节奏保守;
+    # default_cap 2026-04-25 300→0: 数量闸反爬价值≈0, 靠节奏/指纹/SoftCooldown.
+    # 裸跑长时间回填仍可 CLI 传 --daily-cap N 自保.
     add_antibot_args(p, default_base=4.0, default_jitter=3.0,
-                     default_burst=30, default_cap=300, platform="thirdbridge")
+                     default_burst=30, default_cap=0, platform="thirdbridge")
     return p.parse_args()
 
 

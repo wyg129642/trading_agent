@@ -594,6 +594,16 @@ export default function Portfolio() {
                   <Card
                     size="small"
                     hoverable
+                    onMouseEnter={() => {
+                      // Speculative prefetch — warms the backend's 5-min cache
+                      // so the click that follows feels instant.
+                      const canonical = toCanonical(h.stock_ticker, h.stock_market)
+                      if (canonical) {
+                        api.get(`/stock-hub/${canonical}`, {
+                          params: { limit: 80, stock_name: h.stock_name || undefined },
+                        }).catch(() => {})
+                      }
+                    }}
                     onClick={() => {
                       const canonical = toCanonical(h.stock_ticker, h.stock_market)
                       if (canonical) {

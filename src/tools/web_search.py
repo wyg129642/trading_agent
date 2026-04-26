@@ -61,6 +61,67 @@ def _jina_proxy() -> str | None:
     return _jina_proxy_cache
 
 
+# ── Source quality filters ────────────────────────────────────
+# Aggregator / SEO-farm / UGC hosts whose content is overwhelmingly second-hand
+# self-media or unverified retail-investor chatter. The LLM should never see
+# these — they republish the same content across thousands of low-trust
+# accounts and pollute the citation list. Hosts in this set are matched at the
+# parent-domain level (e.g. `dy.163.com` and `news.163.com` both match `163.com`,
+# `zhuanlan.zhihu.com` matches `zhihu.com`).
+_LOW_TRUST_HOSTS: frozenset[str] = frozenset({
+    # Baidu aggregators
+    "baijiahao.baidu.com",
+    "mbd.baidu.com",
+    "haokan.baidu.com",
+    "tieba.baidu.com",
+    "zhidao.baidu.com",
+    "jingyan.baidu.com",
+    "wenku.baidu.com",
+    # Self-media / UGC platforms (entire site is user-generated; even "news"
+    # subdomains are mostly aggregated republishes)
+    "sohu.com",                # 搜狐号 + sohu 全站
+    "163.com",                 # 网易号 + 163 全站
+    "zhihu.com",               # 知乎问答与专栏
+    "xueqiu.com",              # 雪球散户讨论
+    "guba.eastmoney.com",      # 东方财富股吧（保留 eastmoney 主站）
+})
+
+
+def _is_low_trust_url(url: str, website: str = "") -> bool:
+    """Return True if the URL/website maps to an excluded aggregator/UGC host.
+
+    Matches at the parent-domain level so subdomains are caught automatically:
+      `dy.163.com`           → matches `163.com`
+      `zhuanlan.zhihu.com`   → matches `zhihu.com`
+      `author.baijiahao...`  → matches `baijiahao.baidu.com`
+
+    `eastmoney.com` itself is *not* in the list — only `guba.eastmoney.com`
+    is — so legitimate eastmoney news/research pages survive.
+    """
+    candidates: list[str] = []
+    if url:
+        try:
+            host = urlparse(url).netloc.lower()
+            if host:
+                candidates.append(host.lstrip("."))
+        except Exception:
+            pass
+    if website:
+        candidates.append(website.lower().lstrip("."))
+    for cand in candidates:
+        cand = cand[4:] if cand.startswith("www.") else cand
+        # Substring fallback for renamed/aliased baijiahao subdomains.
+        if "baijiahao" in cand:
+            return True
+        # Parent-domain match: walk up the dotted hierarchy and check each
+        # suffix against the blocklist.
+        parts = cand.split(".")
+        for i in range(len(parts) - 1):
+            if ".".join(parts[i:]) in _LOW_TRUST_HOSTS:
+                return True
+    return False
+
+
 
 async def baidu_search(
     query: str,
@@ -102,20 +163,29 @@ async def baidu_search(
 
         references = data.get("references", [])
         results = []
+        dropped = 0
         for ref in references:
             if ref.get("type") != "web":
                 continue
+            url = ref.get("url", "")
+            website = ref.get("website") or ref.get("web_anchor", "")
+            if _is_low_trust_url(url, website):
+                dropped += 1
+                continue
             results.append({
                 "title": ref.get("title", ""),
-                "url": ref.get("url", ""),
+                "url": url,
                 "content": ref.get("content", "")[:2000],
                 "date": ref.get("date", ""),
                 "score": ref.get("rerank_score", 0),
                 "authority": ref.get("authority_score", 0),
                 "source": "baidu",
-                "website": ref.get("website") or ref.get("web_anchor", ""),
+                "website": website,
             })
-        logger.info("[BaiduSearch] query='%s' -> %d results", query[:50], len(results))
+        logger.info(
+            "[BaiduSearch] query='%s' -> %d results (dropped %d low-trust)",
+            query[:50], len(results), dropped,
+        )
         return results
 
     except httpx.TimeoutException:
@@ -170,8 +240,11 @@ async def tavily_search(
         tavily_results = data.get("results", [])
         results = []
         for item in tavily_results:
-            parsed_url = urlparse(item.get("url", ""))
+            item_url = item.get("url", "")
+            parsed_url = urlparse(item_url)
             website = parsed_url.netloc.replace("www.", "")
+            if _is_low_trust_url(item_url, website):
+                continue
 
             # Extract date if available
             date_str = item.get("published_date", "") or ""
@@ -180,7 +253,7 @@ async def tavily_search(
 
             results.append({
                 "title": item.get("title", ""),
-                "url": item.get("url", ""),
+                "url": item_url,
                 "content": (item.get("content", "") or "")[:2000],
                 "date": date_str,
                 "score": item.get("score", 0),
@@ -195,12 +268,23 @@ async def tavily_search(
         logger.warning("Tavily search timeout for: %s", query[:50])
         return []
     except httpx.HTTPStatusError as e:
-        if e.response.status_code in (401, 403, 433):
-            logger.error("[TavilySearch] AUTH FAILURE (%d) — check API key! query='%s'",
-                         e.response.status_code, query[:50])
+        sc = e.response.status_code
+        try:
+            body = (e.response.text or "")[:200].replace("\n", " ").strip()
+        except Exception:
+            body = ""
+        if sc in (401, 403, 433):
+            logger.error("[TavilySearch] AUTH FAILURE (%d) — check API key! query='%s' body=%s",
+                         sc, query[:50], body)
+        elif sc in (402, 429, 432):
+            # 402 Payment Required / 429 rate limit / 432 Tavily plan-limit exceeded
+            logger.error("[TavilySearch] QUOTA/RATE LIMIT (%d) — %s | query='%s'",
+                         sc, body, query[:50])
         else:
-            logger.error("Tavily search failed for '%s': %s", query[:50], e)
-        return []
+            logger.error("Tavily search failed (%d) for '%s': %s", sc, query[:50], body or e)
+        # Re-raise so the caller's asyncio.gather(return_exceptions=True) records
+        # this engine as FAILED in the chat trace, instead of mislabeling it OK:0.
+        raise RuntimeError(f"Tavily HTTP {sc}{(' | ' + body) if body else ''}") from e
     except Exception as e:
         logger.error("Tavily search failed for '%s': %s", query[:50], e)
         return []
@@ -249,6 +333,8 @@ async def jina_search(
             item_url = item.get("url", "")
             parsed_url = urlparse(item_url)
             website = parsed_url.netloc.replace("www.", "")
+            if _is_low_trust_url(item_url, website):
+                continue
 
             # Jina returns full content; truncate for consistency
             content = item.get("content", "") or item.get("description", "") or ""
@@ -343,11 +429,14 @@ async def duckduckgo_search(
                 # Text search for general results
                 text_results = list(ddgs.text(query, max_results=max_results))
                 for r in text_results:
-                    parsed_url = urlparse(r.get("href", ""))
+                    href = r.get("href", "")
+                    parsed_url = urlparse(href)
                     website = parsed_url.netloc.replace("www.", "")
+                    if _is_low_trust_url(href, website):
+                        continue
                     all_results.append({
                         "title": r.get("title", ""),
-                        "url": r.get("href", ""),
+                        "url": href,
                         "content": r.get("body", ""),
                         "date": "",
                         "score": 0,
@@ -360,11 +449,14 @@ async def duckduckgo_search(
                 try:
                     news_results = list(ddgs.news(query, max_results=min(max_results, 5)))
                     for r in news_results:
-                        parsed_url = urlparse(r.get("url", ""))
+                        n_url = r.get("url", "")
+                        parsed_url = urlparse(n_url)
                         website = parsed_url.netloc.replace("www.", "")
+                        if _is_low_trust_url(n_url, website):
+                            continue
                         all_results.append({
                             "title": r.get("title", ""),
-                            "url": r.get("url", ""),
+                            "url": n_url,
                             "content": r.get("body", ""),
                             "date": r.get("date", ""),
                             "score": 0,

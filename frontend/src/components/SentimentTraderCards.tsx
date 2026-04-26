@@ -212,6 +212,31 @@ function Sparkline({ points, color }: { points: SparklinePoint[]; color: string 
   )
 }
 
+// Module-level blob URL cache, keyed by image_url. Cards in this dashboard
+// remount on every navigation back to the workbench; without this every
+// remount fired a fresh authenticated XHR for each chart even when the
+// backend's HTTP Cache-Control would have happily returned 304. axios with
+// responseType:'blob' + Bearer Authorization tends to bypass the disk HTTP
+// cache in Chromium. Stash the object URL once per session.
+const _imageBlobCache = new Map<string, string>()
+const _imageInflight = new Map<string, Promise<string>>()
+
+async function fetchChartBlobUrl(imageUrl: string): Promise<string> {
+  const cached = _imageBlobCache.get(imageUrl)
+  if (cached) return cached
+  const existing = _imageInflight.get(imageUrl)
+  if (existing) return existing
+  const p = api.get(imageUrl, { responseType: 'blob' })
+    .then((r) => {
+      const url = URL.createObjectURL(r.data)
+      _imageBlobCache.set(imageUrl, url)
+      return url
+    })
+    .finally(() => { _imageInflight.delete(imageUrl) })
+  _imageInflight.set(imageUrl, p)
+  return p
+}
+
 // ── One card ──────────────────────────────────────────────────────────
 
 function IndicatorCard({ ind, langZh, token }: { ind: Indicator; langZh: boolean; token: string | null }) {
@@ -238,23 +263,25 @@ function IndicatorCard({ ind, langZh, token }: { ind: Indicator; langZh: boolean
   // The chart endpoint is auth-gated; we fetch as a blob with the bearer token
   // and render via an object URL. Falls back to the lightweight sparkline if
   // the image hasn't been captured yet (older doc, or scraper pre-screenshot).
-  const [imageBlobUrl, setImageBlobUrl] = useState<string | null>(null)
+  // Module-level cache (see fetchChartBlobUrl) keeps the blob URL alive across
+  // remounts so the workbench's 4 cards don't refetch on every navigation.
+  const [imageBlobUrl, setImageBlobUrl] = useState<string | null>(
+    ind.image_url ? _imageBlobCache.get(ind.image_url) ?? null : null,
+  )
   const [imageErr, setImageErr] = useState(false)
   useEffect(() => {
     if (!ind.image_url || !token) return
-    let cancelled = false
-    let url: string | null = null
-    api.get(ind.image_url, { responseType: 'blob' })
-      .then((r) => {
-        if (cancelled) return
-        url = URL.createObjectURL(r.data)
-        setImageBlobUrl(url)
-      })
-      .catch(() => { if (!cancelled) setImageErr(true) })
-    return () => {
-      cancelled = true
-      if (url) URL.revokeObjectURL(url)
+    if (_imageBlobCache.has(ind.image_url)) {
+      setImageBlobUrl(_imageBlobCache.get(ind.image_url)!)
+      return
     }
+    let cancelled = false
+    fetchChartBlobUrl(ind.image_url)
+      .then((url) => { if (!cancelled) setImageBlobUrl(url) })
+      .catch(() => { if (!cancelled) setImageErr(true) })
+    return () => { cancelled = true }
+    // Intentionally do NOT revoke the object URL on unmount — it's shared via
+    // the module-level cache and other mounts in this session reuse it.
   }, [ind.image_url, token])
 
   return (
@@ -365,9 +392,20 @@ function IndicatorCard({ ind, langZh, token }: { ind: Indicator; langZh: boolean
 
 // ── Strip ─────────────────────────────────────────────────────────────
 
+// Module-level snapshot of the last-loaded indicators payload so navigating
+// away from the workbench and back doesn't re-show a spinner for fresh data
+// the user just saw. Backend caches its response 60s; we treat anything within
+// 5 min as fresh-enough to skip the loading state. Sentimentrader updates once
+// daily so this is conservative.
+const _INDICATORS_FRESH_MS = 5 * 60_000
+let _indicatorsSnapshot: { ts: number; data: IndicatorsResponse } | null = null
+
 export default function SentimentTraderCards() {
-  const [data, setData] = useState<IndicatorsResponse | null>(null)
-  const [loading, setLoading] = useState(true)
+  const seeded = _indicatorsSnapshot && (Date.now() - _indicatorsSnapshot.ts < _INDICATORS_FRESH_MS)
+    ? _indicatorsSnapshot.data
+    : null
+  const [data, setData] = useState<IndicatorsResponse | null>(seeded)
+  const [loading, setLoading] = useState(seeded == null)
   const [err, setErr] = useState<string | null>(null)
   const { i18n } = useTranslation()
   const langZh = (i18n.language || 'zh').startsWith('zh')
@@ -375,12 +413,16 @@ export default function SentimentTraderCards() {
 
   useEffect(() => {
     let cancelled = false
-    setLoading(true)
     api.get<IndicatorsResponse>('/sentimentrader/indicators')
-      .then(r => { if (!cancelled) setData(r.data) })
-      .catch(e => { if (!cancelled) setErr(e?.response?.data?.detail || e?.message || 'error') })
+      .then(r => {
+        if (cancelled) return
+        _indicatorsSnapshot = { ts: Date.now(), data: r.data }
+        setData(r.data)
+      })
+      .catch(e => { if (!cancelled && !seeded) setErr(e?.response?.data?.detail || e?.message || 'error') })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   if (loading) {

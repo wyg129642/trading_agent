@@ -101,7 +101,20 @@ def _log(msg: str) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 async def _new_context(pw, headless: bool = True) -> tuple[Browser, BrowserContext]:
-    browser = await pw.chromium.launch(headless=headless, args=["--no-sandbox"])
+    # SentimenTrader's login + chart pages embed www.google.com/recaptcha/api.js
+    # which is GFW-blocked from the China host. Without a proxy the script
+    # never resolves, DOMContentLoaded never fires, and goto() times out at
+    # 45s. Read the proxy from env (cron must set HTTPS_PROXY) and pass it
+    # to chromium.launch explicitly — Chromium does not always inherit
+    # *_PROXY env vars in headless mode.
+    launch_kwargs: dict[str, Any] = {"headless": headless, "args": ["--no-sandbox"]}
+    proxy_url = (
+        os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+        or os.environ.get("https_proxy") or os.environ.get("http_proxy")
+    )
+    if proxy_url:
+        launch_kwargs["proxy"] = {"server": proxy_url}
+    browser = await pw.chromium.launch(**launch_kwargs)
     # Locale aligned to SentimenTrader's US subscriber base (en-US / NY).
     # Mismatched defaults (UTC timezone in headless Chromium) is a subtle
     # fingerprint tell; also Cloudflare + SentimenTrader's own session
@@ -394,9 +407,11 @@ def _trim_history(pairs: list, max_points: int = 750) -> list:
 
 def _mongo_collection(uri: str, db_name: str):
     from pymongo import MongoClient
-    # 2026-04-23: 迁移后 sentimentrader 合并进 funda DB (u_spider 无权限 sentimentrader DB).
-    # 当 db_name == "funda" 时 collection 用 "sentimentrader_indicators" 避撞;
-    # 旧 db_name == "sentimentrader" 时保持 "indicators"。
+    # 2026-04-23: 迁移期间 sentimentrader 合并进 funda DB (远端 u_spider 无权限
+    # 创建 sentimentrader DB), 2026-04-26 迁回本机后保留同样布局以避免触发
+    # 重新爬取与去重逻辑变更。当 db_name == "funda" 时 collection 用
+    # "sentimentrader_indicators" 避撞; 旧 db_name == "sentimentrader" 时保持
+    # "indicators"。
     coll_name = os.environ.get("SENTIMENTRADER_COLLECTION")
     if not coll_name:
         coll_name = "sentimentrader_indicators" if db_name == "funda" else "indicators"
@@ -600,9 +615,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--password", default=os.environ.get("SENTIMENTRADER_PASSWORD", file_password))
     p.add_argument("--mongo-uri", default=os.environ.get(
         "MONGO_URI",
-        "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+        "mongodb://127.0.0.1:27018/",
     ))
-    # 2026-04-23: 迁移后 sentimentrader 合并到 funda DB 的 sentimentrader_indicators
+    # sentimentrader 合并在 funda DB 的 sentimentrader_indicators 集合下
     p.add_argument("--mongo-db", default=os.environ.get("SENTIMENTRADER_DB", "funda"))
     p.add_argument("--once", action="store_true", default=True, help="(default) run one pass")
     p.add_argument("--watch", action="store_true", help="run on interval")

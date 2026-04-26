@@ -34,6 +34,7 @@ from typing import Any
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
 
 from backend.app.config import get_settings
+from backend.app.services import ticker_normalizer
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ def _build_specs() -> list[CollectionSpec]:
         CollectionSpec(
             db="alphapai", collection="reports",
             doc_type="report", doc_type_cn="券商研报",
-            title_field="title", text_fields=("content",),
+            title_field="title", text_fields=("pdf_text_md", "content"),
             date_str_field="publish_time", date_ms_field=None,
             ticker_field="_canonical_tickers", ticker_fallback_path=None,
             institution_field="institution", institution_kind="list_dict_name",
@@ -123,7 +124,7 @@ def _build_specs() -> list[CollectionSpec]:
             db="jinmen", collection="reports",
             doc_type="jinmen_report", doc_type_cn="进门研报",
             title_field="title",
-            text_fields=("summary_md", "summary_point_md"),
+            text_fields=("pdf_text_md", "summary_md", "summary_point_md"),
             date_str_field=None, date_ms_field="release_time_ms",
             ticker_field="_canonical_tickers", ticker_fallback_path="companies",
             institution_field="organization_name", institution_kind="str",
@@ -133,7 +134,7 @@ def _build_specs() -> list[CollectionSpec]:
             db="jinmen", collection="oversea_reports",
             doc_type="jinmen_oversea_report", doc_type_cn="进门海外研报",
             title_field="title",
-            text_fields=("summary_md", "summary_point_md", "content_md"),
+            text_fields=("pdf_text_md", "summary_md", "summary_point_md", "content_md"),
             date_str_field=None, date_ms_field="release_time_ms",
             ticker_field="_canonical_tickers", ticker_fallback_path="companies",
             institution_field="organization_name", institution_kind="str",
@@ -145,11 +146,11 @@ def _build_specs() -> list[CollectionSpec]:
             db="meritco", collection="forum",
             doc_type="expert_call", doc_type_cn="专家交流",
             title_field="title",
-            text_fields=("content_md", "insight_md", "summary_md"),
+            text_fields=("pdf_text_md", "content_md", "insight_md", "summary_md"),
             date_str_field=None, date_ms_field="release_time_ms",
             ticker_field="_canonical_tickers", ticker_fallback_path=None,
             institution_field="author", institution_kind="str",
-            url_field=None, has_pdf=False,
+            url_field=None, has_pdf=True,
         ),
         CollectionSpec(
             db="meritco", collection="research",
@@ -202,7 +203,7 @@ def _build_specs() -> list[CollectionSpec]:
             url_field="web_url", has_pdf=False,
         ),
         # (funda.sentiments has no text — skipped from search; still usable via facets.)
-        # ─── Gangtise (港推) ────────────────────────────────────
+        # ─── Gangtise (岗底斯) ──────────────────────────────────
         CollectionSpec(
             db="gangtise", collection="chief_opinions",
             doc_type="chief_opinion", doc_type_cn="首席观点",
@@ -214,8 +215,8 @@ def _build_specs() -> list[CollectionSpec]:
         ),
         CollectionSpec(
             db="gangtise", collection="researches",
-            doc_type="gangtise_research", doc_type_cn="港推研报",
-            title_field="title", text_fields=("content_md", "brief_md"),
+            doc_type="gangtise_research", doc_type_cn="岗底斯研报",
+            title_field="title", text_fields=("pdf_text_md", "content_md", "brief_md"),
             date_str_field=None, date_ms_field="release_time_ms",
             ticker_field="_canonical_tickers", ticker_fallback_path="stocks",
             institution_field="organization", institution_kind="str",
@@ -223,7 +224,7 @@ def _build_specs() -> list[CollectionSpec]:
         ),
         CollectionSpec(
             db="gangtise", collection="summaries",
-            doc_type="gangtise_summary", doc_type_cn="港推纪要",
+            doc_type="gangtise_summary", doc_type_cn="岗底斯纪要",
             title_field="title", text_fields=("content_md", "brief_md"),
             date_str_field=None, date_ms_field="release_time_ms",
             ticker_field="_canonical_tickers", ticker_fallback_path="stocks",
@@ -268,7 +269,7 @@ def _build_specs() -> list[CollectionSpec]:
             db="alphaengine", collection="china_reports",
             doc_type="alphaengine_china_report", doc_type_cn="阿尔法引擎内资研报",
             title_field="title",
-            text_fields=("content_md", "doc_introduce"),
+            text_fields=("pdf_text_md", "content_md", "doc_introduce"),
             date_str_field=None, date_ms_field="release_time_ms",
             ticker_field="_canonical_tickers", ticker_fallback_path=None,
             institution_field="organization", institution_kind="str",
@@ -279,7 +280,7 @@ def _build_specs() -> list[CollectionSpec]:
             db="alphaengine", collection="foreign_reports",
             doc_type="alphaengine_foreign_report", doc_type_cn="阿尔法引擎外资研报",
             title_field="title",
-            text_fields=("content_md", "doc_introduce"),
+            text_fields=("pdf_text_md", "content_md", "doc_introduce"),
             date_str_field=None, date_ms_field="release_time_ms",
             ticker_field="_canonical_tickers", ticker_fallback_path=None,
             institution_field="organization", institution_kind="str",
@@ -297,7 +298,7 @@ def _build_specs() -> list[CollectionSpec]:
             url_field="web_url", has_pdf=False,
             milvus_indexed=False,
         ),
-        # SemiAnalysis (co-hosted inside funda DB, see MONGO_DB_ALIASES)
+        # SemiAnalysis — lives in its own foreign-website DB (see MONGO_DB_ALIASES)
         CollectionSpec(
             db="semianalysis", collection="semianalysis_posts",
             doc_type="semianalysis_post", doc_type_cn="SemiAnalysis 研究",
@@ -327,8 +328,9 @@ ALL_DOC_TYPES_WITH_LOW_QUALITY = [s.doc_type for s in SPECS_LIST]
 # ── Mongo client + DB name mapping ──────────────────────────────
 #
 # The crawler Mongo was migrated to the remote node 192.168.31.176:35002 on
-# 2026-04-23 and the databases were renamed with `-full` suffixes (plus
-# meritco → jiuqian-full and thirdbridge → third-bridge).
+# 2026-04-23 (databases renamed with `-full` suffixes, meritco → jiuqian-full,
+# thirdbridge → third-bridge) and migrated back to local ta-mongo-crawl
+# :27018 on 2026-04-26. The `-full` DB names persisted across both moves.
 #
 # CollectionSpec.db values stay at the OLD short names ("alphapai", "jinmen",
 # ...) because those strings are baked into:
@@ -348,8 +350,8 @@ MONGO_DB_ALIASES: dict[str, str] = {
     "thirdbridge": "third-bridge",
     "gangtise":    "gangtise-full",
     # funda, acecamp unchanged — no entry means "use spec.db verbatim".
-    # semianalysis is co-hosted inside funda DB.
-    "semianalysis": "funda",
+    # semianalysis lives in its own foreign-website DB (2026-04-24 迁出 funda).
+    "semianalysis": "foreign-website",
 }
 
 
@@ -366,11 +368,10 @@ def mongo_db_name_for(spec: "CollectionSpec | str") -> str:
 
 @lru_cache(maxsize=1)
 def _get_client() -> AsyncIOMotorClient:
-    """Singleton Motor client. Post-2026-04-23 all crawler DBs live on the
-    remote node 192.168.31.176:35002; `alphapai_mongo_uri` (and the other
-    per-platform URIs) resolve to that URL via `REMOTE_CRAWL_MONGO_URI` in
-    config.py.
-    """
+    """Singleton Motor client. All 11 per-platform `*_mongo_uri` settings
+    resolve to a single URI from `REMOTE_CRAWL_MONGO_URI` (in turn the
+    `MONGO_URI` env var, default `mongodb://127.0.0.1:27018/` =
+    `ta-mongo-crawl` container — see config.py)."""
     settings = get_settings()
     return AsyncIOMotorClient(
         settings.alphapai_mongo_uri,
@@ -402,41 +403,93 @@ def normalize_ticker_input(raw: str) -> list[str]:
     Accepts:
       - Canonical form: ``NVDA.US``, ``00700.HK``, ``600519.SH``
       - HK short form: ``0700.HK`` → ``00700.HK``
-      - Bare ticker: ``NVDA`` → ``NVDA.US``; ``0700`` → ``00700.HK``;
-        ``600519`` → ``600519.SH`` / ``.SZ`` / ``.BJ`` (all three, let DB prune)
+      - Bare ticker: ``NVDA`` → ``NVDA.US``; ``0700`` → ``00700.HK``
+      - 6-digit A-share code: ``600519`` → ``600519.SH`` (resolved via prefix
+        classification; falls back to all three markets when prefix unknown)
+      - Chinese company name: ``英伟达`` → ``NVDA.US`` (via curated alias table)
+      - English company name: ``Intel`` → ``INTC.US``, ``Apple`` → ``AAPL.US``
 
-    Returns both the padded and original form when ambiguous, so a corpus that
-    stores either variant still matches.
+    Routes through ``ticker_normalizer.normalize_one`` first — it handles the
+    Bloomberg/Reuters/Jinmen suffix family plus the alias JSON. Falls back to a
+    local heuristic only for inputs the curated parsers cannot resolve.
+
+    **Hallucination guard (LLM-input boundary):** when the input looks like
+    ``CODE.MARKET`` but the resulting canonical isn't a known listing in our
+    snapshot (e.g. LLM-fabricated ``BABA.HK`` / ``9988.US`` / ``TSMC.US``), we
+    try recovering by parsing the code-part as a name (``BABA`` → ``BABA.US``)
+    and otherwise drop the filter so the search degrades to pure semantic
+    rather than returning zero hits on a syntactically valid but nonexistent
+    ticker.
     """
     if not raw:
         return []
-    t = raw.strip().upper()
-    if not t:
+    s = raw.strip()
+    if not s:
         return []
-    # Canonical-looking form: CODE.MARKET
+    # Heuristic: input looks like CODE.MARKET (no spaces, no Chinese, single
+    # dot followed by 1-4 letters). Used only to decide whether to validate.
+    looks_dotted = bool(re.fullmatch(r"[A-Za-z0-9\-]+\.[A-Za-z]{1,4}", s))
+
+    # Primary path: curated alias table + multi-format parsers handle Chinese
+    # names, English company names, dotted/colon/space variants, etc.
+    canonical = ticker_normalizer.normalize_one(s)
+    if canonical:
+        if looks_dotted and not ticker_normalizer.is_known_canonical(canonical):
+            # Recovery: parse just the code-part (`BABA` from `BABA.HK`) — if
+            # it resolves to a *known* canonical, prefer that. This rescues
+            # market-suffix hallucinations (`BABA.HK` → `BABA.US`,
+            # `9988.US` → `09988.HK`).
+            code_part = s.rsplit(".", 1)[0]
+            recovered = ticker_normalizer.normalize_one(code_part)
+            if (recovered and recovered != canonical
+                    and ticker_normalizer.is_known_canonical(recovered)):
+                logger.info(
+                    "normalize_ticker_input: recovered hallucinated %r → %r "
+                    "(was %r, no such listing)",
+                    s, recovered, canonical,
+                )
+                return [recovered]
+            logger.info(
+                "normalize_ticker_input: dropping hallucinated %r → %r "
+                "(no such listing in alias snapshot)",
+                s, canonical,
+            )
+            return []
+        return [canonical]
+
+    # Fallback heuristic — reached only for inputs the alias table does not
+    # cover (e.g. brand-new IPOs, unknown 6-digit codes).
+    t = s.upper()
     if _CANONICAL_TICKER_RE.match(t):
         code, market = t.split(".", 1)
-        # Special case: HK codes must be 5-digit zero-padded
         if market == "HK" and code.isdigit() and len(code) < 5:
             padded = f"{code.zfill(5)}.HK"
-            # Return padded first (what corpus uses), keep original as fallback
-            return [padded, t] if padded != t else [t]
-        return [t]
-    # Pure digits — likely A-share or HK
+            if ticker_normalizer.is_known_canonical(padded):
+                return [padded]
+            return []
+        if ticker_normalizer.is_known_canonical(t):
+            return [t]
+        return []  # syntactic CODE.MARKET but not a known listing → drop
     if t.isdigit():
         variants: list[str] = []
-        if len(t) <= 5:  # HK: pad to 5
+        if len(t) <= 5:
             variants.append(f"{t.zfill(5)}.HK")
-        if len(t) == 6:  # A-share: all three markets
+        if len(t) == 6:
             variants += [f"{t}.SH", f"{t}.SZ", f"{t}.BJ"]
         elif len(t) < 6:
             padded = t.zfill(6)
             variants += [f"{padded}.SH", f"{padded}.SZ"]
-        return variants
-    # Letters — default to US
+        # Filter to known when we have a hit; otherwise fall back to all
+        # candidates so brand-new IPOs (not yet in our alias snapshot) still
+        # match if the corpus has them.
+        valid = [v for v in variants if ticker_normalizer.is_known_canonical(v)]
+        return valid or variants
     if re.match(r"^[A-Z][A-Z0-9.]*$", t):
-        return [f"{t}.US"]
-    return [t]  # unknown — pass through
+        guess = f"{t}.US"
+        if ticker_normalizer.is_known_canonical(guess):
+            return [guess]
+        return []  # drop fabricated US tickers (e.g. BYTEDANCE.US)
+    return []  # garbage — drop, let semantic search take over
 
 
 # ── Date handling ───────────────────────────────────────────────
@@ -1367,7 +1420,7 @@ KB_TOOLS = [
                 "检索公司聚合投研知识库——**所有平台数据均已同步到本库，不要再调用 alphapai_recall 或 jinmen_* 工具**。"
                 "覆盖 8 个来源平台：Alpha派(券商点评/券商研报/路演纪要)、进门财经(会议纪要/研报/海外研报)、"
                 "久谦中台(专家交流/研究)、第三方桥(专家访谈)、Funda(业绩会纪要/业绩研报/点评)、"
-                "港推(首席观点/研报/纪要)、峰会(峰会文章/观点)、阿尔法引擎(纪要/内资研报/外资研报/资讯)。"
+                "岗底斯(首席观点/研报/纪要)、峰会(峰会文章/观点)、阿尔法引擎(纪要/内资研报/外资研报/资讯)。"
                 "**采用 vector 向量检索 + BM25 关键词检索双引擎并行**，按 RRF 融合排序，对长尾、同义表达、"
                 "专业术语均能高精度命中。支持按股票代码、日期、文档类型、来源任意组合筛选。"
                 "返回每条带 doc_id 和摘要片段；如需完整内容请调用 kb_fetch_document。"
@@ -1385,8 +1438,27 @@ KB_TOOLS = [
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "股票代码列表。建议使用规范形式 CODE.MARKET，如 'NVDA.US'、'0700.HK'、"
-                            "'600519.SH'、'03896.HK'。裸代码如 'NVDA' 或 '0700' 会被自动补全。"
+                            "股票标识列表。**首选填名字**——别名表覆盖 5 万+ 条目（Tushare A/HK/US "
+                            "全表 + 人工纠错）。\n"
+                            "- 中文公司名（强烈推荐）：'英伟达'、'腾讯'、'比亚迪'、'阿里巴巴控股'、"
+                            "'宁德时代'、'茅台'、'招行' 等都识别。简称/全称/带后缀('控股/集团/股份/"
+                            "公司/-W')都自动归一。\n"
+                            "- 英文公司名：'Intel'、'Apple Inc'、'NVIDIA Corporation'、"
+                            "'Tencent Holdings Ltd' 全部支持；大小写、句号、Inc/Corp/Ltd 后缀宽容。\n"
+                            "- 代码：'NVDA.US'、'00700.HK'、'600519.SH'；裸代码 'NVDA'/'0700'/"
+                            "'600519' 也行。\n\n"
+                            "**自动校验机制（不必担心代码错配 / 幻觉）**：\n"
+                            "1. 后端会从 `query` 文本中自动抽取公司实体（substring 匹配 5 万+ 别名 + "
+                            "识别 `CODE.MARKET` 与 6 位 A 股代码），所以**当 query 已经写了公司名时，"
+                            "tickers 字段可以直接留空**——后端会替你补上。\n"
+                            "2. 如果你填了代码但代码对应的公司既没出现在 query 文本里、也无法通过 query "
+                            "里的公司名映射到，说明很可能是幻觉，会被自动丢弃。例：query='中际旭创 业绩' "
+                            "tickers=['300750.SZ']→ 检测到 300750=宁德时代未在 query 出现，丢弃，"
+                            "用 query 解析的 300308.SZ。\n"
+                            "3. 错配后缀（'BABA.HK'/'9988.US'/'TSMC.US'）先尝试自动恢复"
+                            "（'BABA.HK'→'BABA.US'），失败则丢弃。\n\n"
+                            "**最佳实践**：把要找的公司名直接写在 query 里，tickers 留空或仅填你 100% "
+                            "确定的代码。永远不要猜测代码的市场后缀。"
                         ),
                     },
                     "doc_types": {
@@ -1497,7 +1569,7 @@ KB_SYSTEM_PROMPT = (
     "- 久谦中台：专家交流 / 研究报告\n"
     "- 第三方桥：海外专家访谈\n"
     "- Funda：美股业绩会纪要 / 业绩研报 / Funda点评\n"
-    "- 港推：港股首席观点 / 研报 / 纪要\n"
+    "- 岗底斯：港股首席观点 / 研报 / 纪要\n"
     "- 峰会(AceCamp)：峰会文章 / 观点\n"
     "- 阿尔法引擎：纪要 / 内资研报 / 外资研报 / 资讯\n\n"
     "### 检索技术栈\n"
@@ -1549,7 +1621,9 @@ async def execute_tool(
     # Lazy import to avoid a circular import at module load time.
     try:
         from backend.app.services.chat_debug import chat_trace, get_current_trace_id
-        trace = chat_trace(get_current_trace_id())
+        # Keyword args matter: chat_trace's first positional is user_id.
+        # model_id is picked up from the per-model contextvar set by chat_llm.
+        trace = chat_trace(trace_id=get_current_trace_id())
     except Exception:  # chat_debug not configured → still operate
         trace = None
 
@@ -1565,14 +1639,52 @@ async def execute_tool(
             # If the LLM explicitly asks for a low-quality doc_type, _pick_specs
             # already honors it; the explicit flag here is an escape hatch.
             include_low_quality = bool(arguments.get("include_low_quality") or False)
+
+            # Cross-validate LLM tickers against entities mentioned in query.
+            # Defends against hallucinations like:
+            #   query="中际旭创 业绩" tickers=["300750.SZ"]  → wrong company
+            # Strategy: drop LLM tickers whose code/brand is NOT mentioned
+            # anywhere in the query (likely hallucinated), then augment with
+            # entities extracted from the query text. When query has no
+            # extractable entities, LLM tickers are trusted as-is.
+            llm_tickers_raw = list(tickers) if tickers else []
+            normalized_llm: list[str] = []
+            for t in llm_tickers_raw:
+                normalized_llm.extend(normalize_ticker_input(t))
+            normalized_llm = list(dict.fromkeys(normalized_llm))
+
+            query_entities = ticker_normalizer.extract_canonicals_from_query(query)
+            if query_entities:
+                trusted_llm = [
+                    t for t in normalized_llm
+                    if ticker_normalizer.is_mentioned_in_query(t, query)
+                ]
+                dropped = [t for t in normalized_llm if t not in trusted_llm]
+                if dropped:
+                    logger.warning(
+                        "kb_search: dropped LLM tickers %s — not mentioned in query "
+                        "%r (possible hallucination). Query entities: %s",
+                        dropped, query[:160], query_entities,
+                    )
+                final_tickers = list(dict.fromkeys(trusted_llm + query_entities))
+            else:
+                final_tickers = normalized_llm
+
+            if final_tickers != normalized_llm:
+                logger.info(
+                    "kb_search: ticker cross-validation. raw=%s normalized=%s "
+                    "query_entities=%s final=%s",
+                    llm_tickers_raw, normalized_llm, query_entities, final_tickers,
+                )
+
             if trace and hasattr(trace, "log_kb_request"):
                 trace.log_kb_request(
-                    query=query, tickers=tickers, doc_types=doc_types,
+                    query=query, tickers=final_tickers or None, doc_types=doc_types,
                     sources=sources, date_range=date_range, top_k=top_k,
                 )
             hits = await search(
                 query,
-                tickers=tickers,
+                tickers=final_tickers or None,
                 doc_types=doc_types,
                 sources=sources,
                 date_range=date_range,

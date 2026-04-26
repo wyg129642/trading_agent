@@ -1,14 +1,14 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import {
-  Card, Col, Row, Statistic, Tag, Typography, Spin, Space,
-  Collapse, Empty, Tooltip, Select, Switch,
+  Card, Col, Row, Tag, Typography, Spin, Space,
+  Collapse, Empty, Tooltip, Select,
 } from 'antd'
 import {
   ThunderboltOutlined, RiseOutlined, FallOutlined,
   CheckCircleOutlined, CloseCircleOutlined, StockOutlined,
   ClockCircleOutlined, FireOutlined, AlertOutlined,
   SearchOutlined, BellOutlined,
-  FundOutlined, SyncOutlined, EyeOutlined,
+  FundOutlined, SyncOutlined,
   WifiOutlined, DisconnectOutlined, NotificationOutlined,
   LinkOutlined, HistoryOutlined,
 } from '@ant-design/icons'
@@ -144,6 +144,63 @@ interface ConsensusData {
   yoy_net_profit: number | null  // YoY NP growth %
 }
 
+// funda · 推特情绪因子 — /api/funda-db/sentiment/my-watchlist
+// 0-10 分, twitter_score 主, reddit_score 副; ai_summary 是当日要点
+interface FundaSentimentItem {
+  ticker: string                    // 持仓 ticker (裸码, upper)
+  funda_ticker?: string             // funda 原始 (可能带 .HK/.SS 后缀)
+  date: string                      // YYYY-MM-DD
+  company: string
+  sector: string
+  industry: string
+  reddit_score: number | null
+  reddit_count: number
+  twitter_score: number | null
+  twitter_count: number
+  ai_summary: string
+}
+
+interface FundaSentimentTrend {
+  delta: number | null              // (latest - earliest) twitter_score in window
+  scored_days: number               // # of days with twitter_score in window
+  earliest_score: number | null
+  earliest_date: string | null
+}
+
+/* ── Helpers ── */
+
+// Map portfolio (stock_ticker, stock_market) to CODE.MARKET canonical id.
+// Mirrors backend ticker_normalizer._canonical_from_code_market and the same
+// helper in Portfolio.tsx — kept inline here to keep this diff small.
+function classifyAshare(code: string): 'SH' | 'SZ' | 'BJ' | null {
+  if (!/^\d{6}$/.test(code)) return null
+  const p3 = code.slice(0, 3)
+  const p2 = code.slice(0, 2)
+  if (['600', '601', '603', '605', '688', '900'].includes(p3)) return 'SH'
+  if (['000', '001', '002', '003', '300', '301', '200'].includes(p3)) return 'SZ'
+  if (['43', '83', '87', '88', '92'].includes(p2)) return 'BJ'
+  return null
+}
+
+function toCanonical(ticker: string, market: string): string | null {
+  const t = (ticker || '').trim()
+  if (!t) return null
+  if (market === '美股') return `${t.toUpperCase()}.US`
+  if (market === '港股') {
+    const digits = t.replace(/\D/g, '').padStart(5, '0')
+    return digits ? `${digits}.HK` : null
+  }
+  if (market === '主板' || market === '创业板' || market === '科创板') {
+    const cls = classifyAshare(t)
+    return cls ? `${t}.${cls}` : null
+  }
+  if (market === '韩股') return `${t.toUpperCase()}.KS`
+  if (market === '日股') return `${t.toUpperCase()}.JP`
+  if (market === '澳股') return `${t.toUpperCase()}.AU`
+  if (market === '德股') return `${t.toUpperCase()}.DE`
+  return null
+}
+
 /* ── Constants ── */
 
 const MATERIALITY_CONFIG: Record<string, { color: string; bg: string; icon: React.ReactNode; label: string }> = {
@@ -171,6 +228,33 @@ const MARKET_TAG_COLORS: Record<string, string> = {
 const UP_COLOR = '#f5222d'
 const DOWN_COLOR = '#00a854'
 const FLAT_COLOR = '#8c8c8c'
+
+/* funda 情绪因子配色 — 与 FundaSentimentCard.tsx 保持一致.
+ * 注意: 情绪 ≠ 涨跌, 不套用 A 股红绿; 0-10 分高分用绿色 (国际惯例: 看多=正面=绿). */
+function fundaScoreColor(score: number | null | undefined): string {
+  if (score == null) return '#94a3b8'
+  if (score >= 7) return '#10b981'
+  if (score >= 4) return '#f59e0b'
+  return '#ef4444'
+}
+
+function fundaScoreLabel(score: number | null | undefined): string {
+  if (score == null) return '—'
+  if (score >= 7) return '看多'
+  if (score >= 5.5) return '偏多'
+  if (score >= 4.5) return '中性'
+  if (score >= 3) return '偏空'
+  return '看空'
+}
+
+/* 7 日趋势箭头 — delta = latest_score - earliest_score (twitter).
+ * 阈值 ±0.5 与 funda_db.py::_classify_trend 的 WARMING/COOLING 起点对齐. */
+function fundaTrendArrow(delta: number | null): { glyph: string; color: string } {
+  if (delta == null) return { glyph: '·', color: '#bfbfbf' }
+  if (delta >= 0.5) return { glyph: '↗', color: '#10b981' }
+  if (delta <= -0.5) return { glyph: '↘', color: '#ef4444' }
+  return { glyph: '→', color: '#bfbfbf' }
+}
 
 /* Region grouping for portfolio overview. 主板/科创板/创业板 collapse into A股. */
 const REGION_MAP: Record<string, string> = {
@@ -512,12 +596,13 @@ export default function Dashboard() {
   const [holdings, setHoldings] = useState<PortfolioHolding[]>([])
   const [quotes, setQuotes] = useState<Record<string, StockQuote>>({})
   const [consensus, setConsensus] = useState<Record<string, ConsensusData>>({})
+  const [fundaLatest, setFundaLatest] = useState<Record<string, FundaSentimentItem>>({})
+  const [fundaTrends, setFundaTrends] = useState<Record<string, FundaSentimentTrend>>({})
   const [sources, setSources] = useState<SourceHealth[]>([])
   const [scanner, setScanner] = useState<ScannerStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [hours, setHours] = useState(168)
   const [refreshing, setRefreshing] = useState(false)
-  const [autoRefresh, setAutoRefresh] = useState(true)
   const [apiError, setApiError] = useState<string | null>(null)
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -536,6 +621,48 @@ export default function Dashboard() {
     api.get('/sources/portfolio/consensus')
       .then((res) => setConsensus(res.data.consensus || {}))
       .catch((err) => console.warn('[consensus] fetch failed', err))
+  }, [role])
+
+  // funda 推特情绪 — 持仓覆盖列表 + 7 日历史. 数据每日刷新, 无需高频轮询.
+  const fetchFundaSentiment = useCallback(() => {
+    if (role !== 'boss' && role !== 'admin') return
+    api.get('/funda-db/sentiment/my-watchlist', { params: { days: 7 } })
+      .then((res) => {
+        const data = res.data || {}
+        const latestArr: FundaSentimentItem[] = data.latest || []
+        const historyArr: FundaSentimentItem[] = data.history || []
+        const latestMap: Record<string, FundaSentimentItem> = {}
+        latestArr.forEach((it) => { if (it.ticker) latestMap[it.ticker] = it })
+
+        // 趋势: 取每只股 history 里有 twitter_score 的最早 / 最晚两天, 算 delta
+        const grouped: Record<string, FundaSentimentItem[]> = {}
+        historyArr.forEach((it) => {
+          if (!it.ticker) return
+          if (!grouped[it.ticker]) grouped[it.ticker] = []
+          grouped[it.ticker].push(it)
+        })
+        const trendMap: Record<string, FundaSentimentTrend> = {}
+        Object.entries(grouped).forEach(([ticker, items]) => {
+          const scored = items
+            .filter((x) => x.twitter_score != null)
+            .sort((a, b) => a.date.localeCompare(b.date))
+          if (scored.length === 0) {
+            trendMap[ticker] = { delta: null, scored_days: 0, earliest_score: null, earliest_date: null }
+            return
+          }
+          const first = scored[0]
+          const last = scored[scored.length - 1]
+          trendMap[ticker] = {
+            delta: scored.length > 1 ? (last.twitter_score! - first.twitter_score!) : null,
+            scored_days: scored.length,
+            earliest_score: first.twitter_score,
+            earliest_date: first.date,
+          }
+        })
+        setFundaLatest(latestMap)
+        setFundaTrends(trendMap)
+      })
+      .catch((err) => console.warn('[funda-sentiment] fetch failed', err))
   }, [role])
 
   const fetchData = useCallback((h: number, silent = false) => {
@@ -572,27 +699,20 @@ export default function Dashboard() {
     fetchData(hours).finally(() => setLoading(false))
     fetchQuotes()
     fetchConsensus()
+    fetchFundaSentiment()
   }, [role]) // eslint-disable-line
   useEffect(() => { if (!loading) { setRefreshing(true); fetchData(hours).finally(() => setRefreshing(false)) } }, [hours]) // eslint-disable-line
   useEffect(() => {
     if (timerRef.current) clearInterval(timerRef.current)
-    if (autoRefresh && !loading) {
+    if (!loading) {
       timerRef.current = setInterval(() => { fetchData(hours, true); fetchQuotes() }, AUTO_REFRESH_INTERVAL)
     }
     return () => { if (timerRef.current) clearInterval(timerRef.current) }
-  }, [autoRefresh, hours, loading, fetchData, fetchQuotes])
+  }, [hours, loading, fetchData, fetchQuotes])
 
   if (loading) return <div style={{ textAlign: 'center', padding: 100 }}><Spin size="large" /></div>
 
-  /* ── Stats ── */
   const totalAlerts = breakingNews.length
-  const criticalCount = breakingNews.filter((n) => n.news_materiality === 'critical').length
-  const materialCount = breakingNews.filter((n) => n.news_materiality === 'material').length
-  const bullishCount = breakingNews.filter((n) => ['bullish', 'very_bullish'].includes(n.sentiment)).length
-  const bearishCount = breakingNews.filter((n) => ['bearish', 'very_bearish'].includes(n.sentiment)).length
-  const bullBearRatio = bearishCount > 0 ? (bullishCount / bearishCount).toFixed(1) : bullishCount > 0 ? '∞' : '—'
-  const tickersAffected = new Set(breakingNews.map((n) => n.ticker)).size
-  const feishuAlerted = breakingNews.filter((n) => n.should_alert).length
 
   return (
     <div>
@@ -606,13 +726,7 @@ export default function Dashboard() {
           </div>
           <Text type="secondary" style={{ fontSize: 13 }}>{t('dashboard.subtitle')}</Text>
         </div>
-        <Space size={8}>
-          <Tooltip title={t('dashboard.autoRefresh')}>
-            <Switch size="small" checked={autoRefresh} onChange={setAutoRefresh}
-              checkedChildren={<SyncOutlined />} unCheckedChildren={<SyncOutlined />} />
-          </Tooltip>
-          <Select value={hours} onChange={setHours} style={{ width: 90 }} options={HOURS_OPTIONS} size="small" />
-        </Space>
+        <Select value={hours} onChange={setHours} style={{ width: 90 }} options={HOURS_OPTIONS} size="small" />
       </div>
 
       {/* ── Error ── */}
@@ -622,46 +736,6 @@ export default function Dashboard() {
           <Text style={{ color: '#d4380d', fontSize: 13 }}><CloseCircleOutlined style={{ marginRight: 6 }} />{apiError}</Text>
         </Card>
       )}
-
-      {/* ── Metrics ── */}
-      <Row gutter={[12, 12]} style={{ marginBottom: 16 }}>
-        <Col xs={12} sm={6}>
-          <Card className="stat-card" styles={{ body: { padding: '16px 20px' } }}>
-            <Statistic title={t('dashboard.totalAlerts')} value={totalAlerts}
-              prefix={<ThunderboltOutlined style={{ color: '#fa8c16' }} />} valueStyle={{ fontSize: 28 }}
-              suffix={feishuAlerted > 0 ? (
-                <Tooltip title={t('dashboard.feishuAlerted')}>
-                  <Text style={{ fontSize: 13, color: '#52c41a' }}><NotificationOutlined style={{ marginRight: 2 }} />{feishuAlerted}</Text>
-                </Tooltip>
-              ) : undefined} />
-          </Card>
-        </Col>
-        <Col xs={12} sm={6}>
-          <Card className="stat-card" styles={{ body: { padding: '16px 20px' } }}>
-            <Statistic title={t('dashboard.criticalAlerts')} value={criticalCount}
-              prefix={<FireOutlined style={{ color: '#f5222d' }} />}
-              valueStyle={{ color: criticalCount > 0 ? '#f5222d' : undefined, fontSize: 28 }}
-              suffix={materialCount > 0 ? <Text type="secondary" style={{ fontSize: 13 }}>+ {materialCount} {t('dashboard.materialSuffix')}</Text> : undefined} />
-          </Card>
-        </Col>
-        <Col xs={12} sm={6}>
-          <Card className="stat-card" styles={{ body: { padding: '16px 20px' } }}>
-            <Statistic title={t('dashboard.bullBearRatio')} value={bullBearRatio}
-              prefix={<RiseOutlined style={{ color: '#52c41a' }} />} valueStyle={{ fontSize: 28 }}
-              suffix={<Text type="secondary" style={{ fontSize: 13 }}>
-                {bullishCount}<RiseOutlined style={{ color: '#52c41a', margin: '0 2px' }} />
-                {bearishCount}<FallOutlined style={{ color: '#f5222d', margin: '0 2px' }} />
-              </Text>} />
-          </Card>
-        </Col>
-        <Col xs={12} sm={6}>
-          <Card className="stat-card" styles={{ body: { padding: '16px 20px' } }}>
-            <Statistic title={t('dashboard.tickersAffected')} value={tickersAffected}
-              prefix={<EyeOutlined style={{ color: '#1890ff' }} />} valueStyle={{ fontSize: 28 }}
-              suffix={<Text type="secondary" style={{ fontSize: 13 }}>/ {scanner?.total_stocks ?? Object.keys(newsSummary).length}</Text>} />
-          </Card>
-        </Col>
-      </Row>
 
       {/* ── News Feed (single-column collapsible list) ── */}
       {totalAlerts === 0 ? (
@@ -793,6 +867,12 @@ export default function Dashboard() {
                         ? ((cons!.target_price - quote.latest_price) / quote.latest_price) * 100
                         : null
                       const rcol = hasConsensus ? ratingColor(cons!.rating_label) : FLAT_COLOR
+                      const fundaSent = fundaLatest[h.stock_ticker]
+                      const fundaTrend = fundaTrends[h.stock_ticker]
+                      const hasFunda = !!fundaSent && fundaSent.twitter_score != null
+                      const fundaCol = fundaScoreColor(fundaSent?.twitter_score)
+                      const fundaLab = fundaScoreLabel(fundaSent?.twitter_score)
+                      const fundaArr = fundaTrendArrow(fundaTrend?.delta ?? null)
 
                       return (
                         <Col key={`${h.stock_market}-${h.stock_ticker}`} xs={12} sm={8} md={6} lg={6} xl={4}>
@@ -802,7 +882,27 @@ export default function Dashboard() {
                               borderLeft: `3px solid ${hasQuote ? col : '#f0f0f0'}`,
                             }}
                             styles={{ body: { padding: '10px 12px' } }}
-                            onClick={() => navigate(`/stock-search?q=${encodeURIComponent(h.stock_ticker)}`)}>
+                            onMouseEnter={() => {
+                              // Speculative prefetch — warms the backend's
+                              // 5-min Redis cache so the click that follows
+                              // loads from cache instead of paying the full
+                              // 21-way Mongo fan-out.
+                              const canonical = toCanonical(h.stock_ticker, h.stock_market)
+                              if (canonical) {
+                                api.get(`/stock-hub/${canonical}`, {
+                                  params: { limit: 80, stock_name: h.stock_name || undefined },
+                                }).catch(() => {})
+                              }
+                            }}
+                            onClick={() => {
+                              const canonical = toCanonical(h.stock_ticker, h.stock_market)
+                              if (canonical) {
+                                const url = `/stock/${canonical}?name=${encodeURIComponent(h.stock_name || '')}`
+                                window.open(url, '_blank', 'noopener,noreferrer')
+                              } else {
+                                navigate(`/stock-search?q=${encodeURIComponent(h.stock_ticker)}`)
+                              }
+                            }}>
                             {/* Top: name + optional submarket tag */}
                             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 6, marginBottom: 2 }}>
                               <div style={{ flex: 1, minWidth: 0 }}>
@@ -960,6 +1060,87 @@ export default function Dashboard() {
                                       {t('dashboard.consensusForwardPE')} <span style={{ color: '#262626', fontWeight: 600 }}>{formatPE(cons!.fy1.pe)}</span>
                                     </span>
                                   </div>
+                                </div>
+                              </Tooltip>
+                            )}
+
+                            {/* funda · 推特情绪因子 (仅当有当日数据) */}
+                            {hasFunda && (
+                              <Tooltip
+                                title={
+                                  <div style={{ fontSize: 12, maxWidth: 340 }}>
+                                    <div style={{ fontWeight: 700, marginBottom: 6, borderBottom: '1px solid rgba(255,255,255,0.2)', paddingBottom: 4 }}>
+                                      <FundOutlined style={{ marginRight: 4 }} />
+                                      funda · {t('dashboard.fundaSentimentTitle')} · {h.stock_name}
+                                    </div>
+                                    <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '3px 10px', fontVariantNumeric: 'tabular-nums' }}>
+                                      <span style={{ opacity: 0.7 }}>Twitter</span>
+                                      <span>
+                                        <b style={{ color: fundaCol }}>{fundaSent!.twitter_score!.toFixed(1)}</b>
+                                        <span style={{ marginLeft: 4 }}>{fundaLab}</span>
+                                        <span style={{ opacity: 0.7, marginLeft: 6 }}>· {fundaSent!.twitter_count} {t('dashboard.fundaSentimentTweets')}</span>
+                                      </span>
+                                      <span style={{ opacity: 0.7 }}>{t('dashboard.fundaSentimentDate')}</span>
+                                      <span>{fundaSent!.date}</span>
+                                      {fundaTrend && fundaTrend.delta != null && fundaTrend.scored_days > 1 && (
+                                        <>
+                                          <span style={{ opacity: 0.7 }}>{t('dashboard.fundaSentimentTrend')}</span>
+                                          <span style={{ color: fundaArr.color }}>
+                                            {fundaArr.glyph} {fundaTrend.delta > 0 ? '+' : ''}{fundaTrend.delta.toFixed(2)}
+                                            <span style={{ opacity: 0.7, color: 'inherit' }}> ({t('dashboard.fundaSentimentFrom')} {fundaTrend.earliest_score?.toFixed(1)}, {fundaTrend.scored_days} {t('dashboard.fundaSentimentDays')})</span>
+                                          </span>
+                                        </>
+                                      )}
+                                      {fundaSent!.reddit_score != null && (
+                                        <>
+                                          <span style={{ opacity: 0.7 }}>Reddit</span>
+                                          <span>
+                                            <b style={{ color: fundaScoreColor(fundaSent!.reddit_score) }}>{fundaSent!.reddit_score.toFixed(1)}</b>
+                                            <span style={{ opacity: 0.7, marginLeft: 6 }}>· {fundaSent!.reddit_count} {t('dashboard.fundaSentimentPosts')}</span>
+                                          </span>
+                                        </>
+                                      )}
+                                      {(fundaSent!.sector || fundaSent!.industry) && (
+                                        <>
+                                          <span style={{ opacity: 0.7 }}>{t('dashboard.fundaSentimentSector')}</span>
+                                          <span>{fundaSent!.sector}{fundaSent!.industry ? ` / ${fundaSent!.industry}` : ''}</span>
+                                        </>
+                                      )}
+                                    </div>
+                                    {fundaSent!.ai_summary && (
+                                      <div style={{ marginTop: 8, paddingTop: 6, borderTop: '1px solid rgba(255,255,255,0.2)', whiteSpace: 'pre-wrap', fontSize: 11, lineHeight: 1.5 }}>
+                                        {fundaSent!.ai_summary}
+                                      </div>
+                                    )}
+                                  </div>
+                                }
+                              >
+                                <div style={{
+                                  marginTop: 6,
+                                  padding: '3px 6px',
+                                  background: '#fafafa',
+                                  border: '1px solid #f0f0f0',
+                                  borderRadius: 4,
+                                  fontSize: 10,
+                                  color: '#595959',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'space-between',
+                                  gap: 4,
+                                  fontVariantNumeric: 'tabular-nums',
+                                }}>
+                                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+                                    <FundOutlined style={{ color: fundaCol, fontSize: 11 }} />
+                                    <span style={{ fontWeight: 700, color: fundaCol }}>{fundaSent!.twitter_score!.toFixed(1)}</span>
+                                    <span style={{
+                                      display: 'inline-block', padding: '0 4px', borderRadius: 2,
+                                      background: fundaCol, color: '#fff', fontWeight: 600, fontSize: 9,
+                                    }}>{fundaLab}</span>
+                                  </span>
+                                  <span style={{ color: '#8c8c8c', fontSize: 9, display: 'inline-flex', alignItems: 'center', gap: 3 }}>
+                                    {fundaSent!.twitter_count}{t('dashboard.fundaSentimentPostShort')}
+                                    <span style={{ color: fundaArr.color, fontWeight: 700, fontSize: 11 }}>{fundaArr.glyph}</span>
+                                  </span>
                                 </div>
                               </Tooltip>
                             )}

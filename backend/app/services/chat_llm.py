@@ -924,9 +924,7 @@ async def call_model_stream_with_tools(
     or the round limit is reached.
     """
     from backend.app.services.chat_debug import chat_trace
-    from backend.app.services.research_interaction_log import get_recorder
     trace = chat_trace(model_id=model_id, trace_id=trace_id or "")
-    recorder = get_recorder()
 
     # Route Gemini to native API with function calling
     if _is_gemini(model_id):
@@ -1005,39 +1003,16 @@ async def call_model_stream_with_tools(
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
             if name in ("web_search", "read_webpage"):
                 trace.log_tool_exec_done(name, result[0], elapsed_ms)
-                result_text = result[0]
-                if trace_id:
-                    recorder.record_tool_result(
-                        trace_id, model_id, round_num, name, arguments,
-                        result_text, elapsed_ms,
-                    )
-                return result_text
+                return result[0]
             trace.log_tool_exec_done(name, result, elapsed_ms)
-            if trace_id:
-                recorder.record_tool_result(
-                    trace_id, model_id, round_num, name, arguments,
-                    result, elapsed_ms,
-                )
             return result
         except asyncio.TimeoutError:
-            elapsed_ms = int((time.monotonic() - tool_start) * 1000)
             trace.log_tool_timeout(name, _TOOL_EXEC_TIMEOUT)
             logger.warning("Tool %s timed out after %.0fs", name, _TOOL_EXEC_TIMEOUT)
-            if trace_id:
-                recorder.record_tool_result(
-                    trace_id, model_id, round_num, name, arguments,
-                    f"Tool timed out after {int(_TOOL_EXEC_TIMEOUT)}s",
-                    elapsed_ms, error="timeout",
-                )
             return f"Tool {name} timed out after {int(_TOOL_EXEC_TIMEOUT)} seconds."
         except Exception as e:
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
             trace.log_tool_exec_done(name, f"ERROR: {e}", elapsed_ms, error=True)
-            if trace_id:
-                recorder.record_tool_result(
-                    trace_id, model_id, round_num, name, arguments,
-                    f"ERROR: {e}", elapsed_ms, error=str(e)[:300],
-                )
             raise
 
     start = time.monotonic()
@@ -1077,8 +1052,6 @@ async def call_model_stream_with_tools(
 
         # API call with retry on transient errors (matching call_model_stream pattern)
         trace.log_llm_request(current_messages, tools, mode, round_num=tool_round)
-        if trace_id:
-            recorder.record_round_start(trace_id, model_id, tool_round, current_messages, tools, mode)
         base_url, api_headers = _api_config(model_id)
         round_success = False
         for attempt in range(_MAX_RETRIES + 1):
@@ -1240,12 +1213,8 @@ async def call_model_stream_with_tools(
         # Log the model's reasoning text (if any) emitted before these tool calls
         if round_content:
             trace.log_model_reasoning(round_num=tool_round, text=round_content)
-            if trace_id:
-                recorder.record_reasoning(trace_id, model_id, tool_round, round_content)
         # Log the tool calls the LLM decided to make
         trace.log_tool_calls_detected(assistant_msg["tool_calls"], round_num=tool_round)
-        if trace_id:
-            recorder.record_tool_calls_detected(trace_id, model_id, tool_round, assistant_msg["tool_calls"])
 
         # Execute tool calls (parallel when possible)
         tool_tasks = []
@@ -1443,9 +1412,7 @@ async def _gemini_stream_with_tools(
     - Per-round try/except for granular error recovery
     """
     from backend.app.services.chat_debug import chat_trace
-    from backend.app.services.research_interaction_log import get_recorder
     trace = chat_trace(model_id=model_id, trace_id=trace_id or "")
-    recorder = get_recorder()
 
     from backend.app.services.alphapai_service import execute_tool as alphapai_execute
     from backend.app.services.jinmen_service import execute_tool as jinmen_execute
@@ -1507,38 +1474,16 @@ async def _gemini_stream_with_tools(
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
             if name in ("web_search", "read_webpage"):
                 trace.log_tool_exec_done(name, result[0], elapsed_ms)
-                result_text = result[0]
-                if trace_id:
-                    recorder.record_tool_result(
-                        trace_id, model_id, round_num, name, arguments,
-                        result_text, elapsed_ms,
-                    )
-                return result_text
+                return result[0]
             trace.log_tool_exec_done(name, result, elapsed_ms)
-            if trace_id:
-                recorder.record_tool_result(
-                    trace_id, model_id, round_num, name, arguments,
-                    result, elapsed_ms,
-                )
             return result
         except asyncio.TimeoutError:
             trace.log_tool_timeout(name, _TOOL_EXEC_TIMEOUT)
             logger.warning("Tool %s timed out after %.0fs", name, _TOOL_EXEC_TIMEOUT)
-            if trace_id:
-                recorder.record_tool_result(
-                    trace_id, model_id, round_num, name, arguments,
-                    f"Tool timed out after {int(_TOOL_EXEC_TIMEOUT)}s",
-                    int(_TOOL_EXEC_TIMEOUT * 1000), error="timeout",
-                )
             return f"Tool {name} timed out after {int(_TOOL_EXEC_TIMEOUT)} seconds."
         except Exception as e:
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
             trace.log_tool_exec_done(name, f"ERROR: {e}", elapsed_ms, error=True)
-            if trace_id:
-                recorder.record_tool_result(
-                    trace_id, model_id, round_num, name, arguments,
-                    f"ERROR: {e}", elapsed_ms, error=str(e)[:300],
-                )
             raise
 
     _TRANSIENT_KEYWORDS = ("500", "503", "overloaded", "unavailable", "deadline", "timeout", "reset", "rate")
@@ -1563,8 +1508,6 @@ async def _gemini_stream_with_tools(
     for tool_round in range(1, max_tool_rounds + 1):
         activity["rounds_used"] = tool_round
         trace.log_sse_event("GEMINI_ROUND_START", f"round={tool_round}/{max_tool_rounds}")
-        if trace_id:
-            recorder.record_round_start(trace_id, model_id, tool_round, messages, tools, mode)
         # Check overall timeout before each round
         elapsed = time.monotonic() - start
         if elapsed > _OVERALL_TOOL_TIMEOUT:
@@ -1675,8 +1618,6 @@ async def _gemini_stream_with_tools(
             if round_text_emitted and function_calls:
                 # Text preceded the function calls — log it as model reasoning
                 trace.log_model_reasoning(round_num=tool_round, text=round_text_emitted)
-                if trace_id:
-                    recorder.record_reasoning(trace_id, model_id, tool_round, round_text_emitted)
 
             if not function_calls:
                 trace.log_sse_event("GEMINI_NO_FUNC_CALLS", f"round={tool_round} — LLM returned text only")
@@ -1697,13 +1638,6 @@ async def _gemini_stream_with_tools(
 
             # Log the function calls Gemini decided to make
             trace.log_gemini_function_calls(function_calls, round_num=tool_round)
-            if trace_id:
-                # Reshape to match record_tool_calls_detected format.
-                tc_shaped = [
-                    {"id": f"{tool_round}_{i}", "function": {"name": fc["name"], "arguments": fc["args"]}}
-                    for i, fc in enumerate(function_calls)
-                ]
-                recorder.record_tool_calls_detected(trace_id, model_id, tool_round, tc_shaped)
 
             # Append the ORIGINAL content object to preserve thought_signature
             # (reconstructing Content loses thought_signature on function_call parts)

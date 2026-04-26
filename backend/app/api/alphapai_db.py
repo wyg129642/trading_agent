@@ -242,8 +242,9 @@ def _classify_pdf_error(err: str | None) -> tuple[str, str]:
     if "code=810002" in s or "上限" in s:
         return "quota_exhausted", "今日外资研报 PDF 查看额度已用尽 (账号 tier 限制)"
     # Permission denied — the masked version of quota_exhausted, plus
-    # genuine no-access cases.
-    if "code=10222" in s or "无权限查看" in s:
+    # genuine no-access cases. 2026-04-24: hasPermission=false 短路 (list 已经
+    # 告诉我们没权限, 不必打 detail/pdf; scraper.enrich_report_doc 写此 marker).
+    if "code=10222" in s or "无权限查看" in s or "hasPermission=false" in s:
         return "permission_denied", "当前账号无该研报 PDF 访问权限 (多为外资研报 tier 限制)"
     # OS filename too long (Errno 36)
     if "file name too long" in low or "errno 36" in low:
@@ -256,8 +257,13 @@ def _classify_pdf_error(err: str | None) -> tuple[str, str]:
     )
     if any(m in low for m in transient_markers):
         return "transient_network", "网络中断 / 临时下载失败"
-    # Server-side 404 or empty payload from the relpath endpoint
-    if "code=404" in s or "empty_data" in s or "code=400404" in s:
+    # 2026-04-24: empty_data_type=str 实测来自 hasPermission=false 的付费墙条目 —
+    # 服务端降级返回 data="" 而不是 code=10222. 按 permission_denied 分类, 前端
+    # 不展示 retry 按钮, 避免操作员白点 (retry 不会成功).
+    if "empty_data" in s:
+        return "permission_denied", "平台返回空 PDF 数据 (付费墙降级响应, 同 tier 限制)"
+    # Server-side 404 from the relpath endpoint
+    if "code=404" in s or "code=400404" in s:
         return "not_found", "平台未提供该研报的 PDF"
     # Step-typed fallbacks
     if s.startswith("relpath_err"):
@@ -507,21 +513,15 @@ async def get_report_pdf(
         err = doc.get("pdf_error") or "pdf_local_path 未记录 (PDF 未下载)"
         raise HTTPException(404, f"PDF not available: {err}")
 
-    # 2026-04-23: 走 Mongo GridFS 优先 / 本地 fallback 的统一读取器.
+    # 2026-04-26: 本地 SSD → GridFS 的统一读取器（/mnt/share fallback 已退役）.
     # 文件名用 title (去文件名不安全字符) + .pdf, 方便"另存为".
     title = (doc.get("title") or f"report-{item_id[:12]}")[:120]
     from ..services.pdf_storage import stream_pdf_or_file
     settings = get_settings()
-    # 2026-04-24: 两个 root 都放行 — 新 PDF 在 /mnt/share/ygwang/...,
-    # 历史 PDF (约 41GB, 迁移前) 在 /home/ygwang/crawl_data/...
-    pdf_roots = [settings.alphapai_pdf_dir]
-    legacy = getattr(settings, "alphapai_pdf_dir_legacy", None)
-    if legacy and legacy not in pdf_roots:
-        pdf_roots.append(legacy)
     return await stream_pdf_or_file(
         db=db,
         pdf_rel_path=rel,
-        pdf_root=pdf_roots,
+        pdf_root=settings.alphapai_pdf_dir,
         download_filename=title,
         download=bool(download),
     )

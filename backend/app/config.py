@@ -12,9 +12,9 @@ For multi-environment deploys (prod vs staging) we ALSO respect
 ``APP_ENV``. When ``APP_ENV=staging`` the helper methods on ``Settings``
 automatically scope state to a ``_staging`` suffix (Postgres DB, Redis
 DB index, Milvus collections, ClickHouse DB) or a ``stg_`` prefix
-(Mongo collections in shared databases — the remote ``u_spider`` user
-cannot create new DBs on 192.168.31.176:35002, so we isolate at the
-collection level instead).
+(Mongo collections in shared databases — both prod and staging share
+the same physical DBs in ``ta-mongo-crawl`` :27018, isolated at the
+collection level via the prefix).
 
 The suffix logic is *idempotent*: if an explicit env var already carries
 the ``_staging`` tail the helpers won't double-apply it. This is why
@@ -22,6 +22,7 @@ the ``_staging`` tail the helpers won't double-apply it. This is why
 ``POSTGRES_DB=trading_agent_staging`` explicitly or leaving it blank
 and relying on ``APP_ENV`` to derive it.
 """
+import os
 from pathlib import Path
 from pydantic_settings import BaseSettings
 from functools import lru_cache
@@ -52,6 +53,17 @@ class Settings(BaseSettings):
     @property
     def database_url_sync(self) -> str:
         return f"postgresql+psycopg2://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.effective_postgres_db}"
+
+    @property
+    def database_url_prod(self) -> str:
+        """Async URL pinned to the *raw* postgres_db (no _staging suffix).
+
+        Lets specific staging endpoints opt into reading prod's tables
+        (e.g. portfolio scan results, populated only by the prod-only
+        proactive scanner). On a prod process this resolves to the same
+        URL as `database_url`, so no code path branches on env.
+        """
+        return f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
 
     # Redis
     redis_host: str = "localhost"
@@ -98,22 +110,17 @@ class Settings(BaseSettings):
     alphapai_sync_interval_seconds: int = 3600
     alphapai_batch_size: int = 500
 
-    # ===== 2026-04-23 迁移至远端 MongoDB =====
-    # 所有平台 8 个爬虫 DB 迁到 192.168.31.176:35002 (u_spider:prod_X5BKVbAc).
-    # 源 DB 名 → 远端 DB 名映射(含连字符 / -full 后缀由远端授权决定):
-    #   alphapai       -> alphapai-full
-    #   jinmen         -> jinmen-full
-    #   meritco        -> jiuqian-full
-    #   thirdbridge    -> third-bridge    (注意连字符)
-    #   funda          -> funda
-    #   gangtise       -> gangtise-full
-    #   acecamp        -> acecamp
-    #   alphaengine    -> alphaengine
-    #   sentimentrader -> funda (合并, indicators 迁到 funda.sentimentrader_indicators)
-    # PDF 统一走 GridFS (fs.files + fs.chunks), filename = 原 pdf_*_dir 相对路径.
-    # 本地 pdf_*_dir 作为 backend `stream_pdf_or_file` 的 fallback 保留.
-    REMOTE_CRAWL_MONGO_URI: str = (
-        "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin"
+    # ===== 2026-04-26 从远端 192.168.31.176:35002 复制回本机 MongoDB =====
+    # 所有 10 个 crawler/user-kb DB 迁回本机 ta-mongo-crawl 容器 :27018,
+    # 数据目录 /home/ygwang/crawl_data/mongo。远端保留作为只读备份。
+    # MONGO_URI 环境变量统一驱动 REMOTE_CRAWL_MONGO_URI，crawler scrapers 也用同
+    # 一个 env 变量。env 不写则默认本机 27018。
+    # PDF 全部从本地 SSD `/home/ygwang/crawl_data/<plat>_pdfs/` 加载，仅在
+    # 本地 disk miss 时回退到 GridFS (fs.files + fs.chunks)。/mnt/share fallback
+    # 已于 2026-04-26 移除 — alphapai_pdfs 已 rsync 回本机。
+    REMOTE_CRAWL_MONGO_URI: str = os.environ.get(
+        "MONGO_URI",
+        "mongodb://127.0.0.1:27018/",
     )
 
     # AlphaPai MongoDB
@@ -125,12 +132,20 @@ class Settings(BaseSettings):
     sentimentrader_mongo_db: str = "funda"
     sentimentrader_collection: str = "sentimentrader_indicators"
 
-    # SemiAnalysis (Substack) — co-hosted in funda DB (u_spider can't create new DBs)
+    # SemiAnalysis (Substack) — 2026-04-24 迁到独立 foreign-website DB (之前 co-host 在 funda)
     semianalysis_mongo_uri: str = REMOTE_CRAWL_MONGO_URI
-    semianalysis_mongo_db: str = "funda"
+    semianalysis_mongo_db: str = "foreign-website"
     semianalysis_collection: str = "semianalysis_posts"
     semianalysis_state_collection: str = "_state_semianalysis"
-    # 研报 PDF 本地落盘目录 — 迁移后作为 GridFS fallback 路径保留
+
+    # The Information (theinformation.com) — 2026-04-25 落同 foreign-website DB
+    the_information_mongo_uri: str = REMOTE_CRAWL_MONGO_URI
+    the_information_mongo_db: str = "foreign-website"
+    the_information_collection: str = "theinformation_posts"
+    the_information_state_collection: str = "_state_theinformation"
+    # 研报 PDF 本地落盘目录 — 2026-04-26 起统一回到 /home/ygwang/crawl_data/.
+    # 之前一段时间 scraper 写入 /mnt/share/ygwang/alphapai_pdfs (SMB 共享盘),
+    # 已 rsync 回本机后该路径退役.
     alphapai_pdf_dir: str = "/home/ygwang/crawl_data/alphapai_pdfs"
 
     # Jinmen MongoDB
@@ -165,19 +180,6 @@ class Settings(BaseSettings):
     alphaengine_mongo_db: str = "alphaengine"
     alphaengine_pdf_dir: str = "/home/ygwang/crawl_data/alphaengine_pdfs"
 
-    # Research interaction log — captures full AI research assistant lifecycle
-    # (LLM calls, tool calls with full args, searches, webpage reads, final
-    # responses) for the admin-only visualization page. Writes are best-effort
-    # fire-and-forget; auth/connection failures degrade to a no-op.
-    # 2026-04-24: migrated to remote Mongo on 192.168.31.176:35002.
-    # u_spider cannot create new databases, so the recorder is co-hosted inside
-    # the existing `ti-user-knowledge-base` DB as a dedicated `research_sessions`
-    # collection (distinct from the KB's `documents`/`chunks`/`fs.*`). Override
-    # via RESEARCH_LOG_MONGO_URI / RESEARCH_LOG_MONGO_DB.
-    research_log_mongo_uri: str = (
-        "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin"
-    )
-    research_log_mongo_db: str = "ti-user-knowledge-base"
     # AceCamp 内容字段直接从 API 拿到 markdown 全文, 绝大多数无独立 PDF —
     # 仅 can_download 的少数文章会写入此目录 (/articles/download_url 返回 S3 URL)
     acecamp_pdf_dir: str = "/home/ygwang/crawl_data/acecamp_pdfs"
@@ -187,14 +189,15 @@ class Settings(BaseSettings):
     # service parses them into searchable chunks and exposes `user_kb_search`
     # / `user_kb_fetch_document` tools to the AI chat assistant. Each user's
     # uploads are isolated by user_id filtering on every query.
-    # 2026-04-23: migrated to remote Mongo `ti-user-knowledge-base` on
-    # 192.168.31.176:35002 (shared ops cluster, u_spider has readWrite).
+    # 2026-04-26: replicated back to local Mongo (ta-mongo-crawl :27018).
     # Schema is unchanged — shared `documents` + `chunks` + GridFS, scoped
     # by user_id. Per-user collections would blow past Mongo's soft-limit on
     # collection count and fracture GridFS buckets; user_id scoping is the
-    # right pattern at scale. Override via USER_KB_MONGO_URI / USER_KB_MONGO_DB.
-    user_kb_mongo_uri: str = (
-        "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin"
+    # right pattern at scale. Override via USER_KB_MONGO_URI / USER_KB_MONGO_DB
+    # (defaults to MONGO_URI env so a single setting drives all workloads).
+    user_kb_mongo_uri: str = os.environ.get(
+        "USER_KB_MONGO_URI",
+        os.environ.get("MONGO_URI", "mongodb://127.0.0.1:27018/"),
     )
     user_kb_mongo_db: str = "ti-user-knowledge-base"
     # Per-file upload ceiling (bytes) for text/document uploads. 50 MB is
@@ -274,12 +277,18 @@ class Settings(BaseSettings):
     # pad heavily for queueing and model-load.
     asr_service_job_timeout_seconds: int = 3600
 
-    # LLM used by the enrichment background services (AlphaPai/Jiuqian
-    # processors, hot-news filter). OpenAI-compatible endpoint — can point at
-    # Aliyun Bailian/DashScope, MiniMax, OpenRouter, or anything similar.
+    # LLM used by on-demand admin scripts (e.g. scripts/llm_tag_tickers.py).
+    # OpenAI-compatible endpoint — can point at Aliyun Bailian/DashScope,
+    # MiniMax, OpenRouter, or anything similar.
+    #
+    # Realtime ingest-time LLM enrichment is OFF by default — crawlers and
+    # sync services land raw scraped data only; no AlphaPai/Jiuqian processor
+    # or hot-news filter will run unless `realtime_llm_enrichment_enabled` is
+    # set True. Existing `enrichment` rows in Postgres are left untouched.
     llm_enrichment_api_key: str = ""
     llm_enrichment_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_enrichment_model: str = "qwen-plus"
+    realtime_llm_enrichment_enabled: bool = False
 
     # OpenRouter (for AI Chat multi-model)
     openrouter_api_key: str = ""
@@ -357,6 +366,23 @@ class Settings(BaseSettings):
     vector_sync_enabled: bool = True
     kb_search_legacy: bool = False
 
+    # Auto-sync cadence for the crawler-corpus MongoDB → Milvus poller
+    # (backend/app/services/kb_vector_sync.py). The poller iterates every
+    # spec in SPECS_LIST once per cycle, advancing each spec's watermark.
+    # 1h cycle keeps event-loop pressure low (sync pymongo cursor inside
+    # async ingest can pin the loop) while still landing fresh crawler
+    # volume well inside the 2000-doc per-spec limit.
+    kb_vector_sync_interval_seconds: int = 3600       # sleep between cycles (1h)
+    kb_vector_sync_per_spec_limit: int = 2000         # max docs/cycle/spec
+    kb_vector_sync_embed_batch_size: int = 32         # chunks per TEI call
+    # Daily delete sweep fires once in this local-time window (24h clock).
+    # The sweep diffs Mongo IDs ↔ Milvus doc_ids so crawler-deletes stop
+    # returning stale hits. 03:xx is chosen so it runs outside US/CN market
+    # hours and after the 03:10 Postgres backup has finished.
+    kb_vector_sync_sweep_hour: int = 3
+    kb_vector_sync_sweep_minute_start: int = 5
+    kb_vector_sync_sweep_minute_end: int = 10
+
     # Stamp every chunk with this — used for partial re-embed when the
     # embedding model is swapped out. Bump when you change the model.
     embedding_model_version: str = "qwen3-emb-8b-v1"
@@ -375,10 +401,10 @@ class Settings(BaseSettings):
     # ── Selective share-with-prod overrides (staging only) ──────────
     # By default APP_ENV=staging scopes every collection away from prod so
     # experiments can't corrupt prod data. That's right for Postgres
-    # (per-env schema) and research_sessions, but means staging's
-    # knowledge-base kernels (`kb_search` + `user_kb_search`) start with
-    # empty Milvus/Mongo collections — the AI assistant has nothing to
-    # search. These opt-in flags point the KB tools back at prod's data:
+    # (per-env schema), but means staging's knowledge-base kernels
+    # (`kb_search` + `user_kb_search`) start with empty Milvus/Mongo
+    # collections — the AI assistant has nothing to search. These opt-in
+    # flags point the KB tools back at prod's data:
     #
     #   kb_share_with_prod=true      → Milvus `kb_chunks` (crawled corpus).
     #                                  Effectively read-only since only
@@ -393,6 +419,14 @@ class Settings(BaseSettings):
     #                                  anything externally accessible.
     kb_share_with_prod: bool = False
     user_kb_share_with_prod: bool = False
+    # Portfolio scan tables (portfolio_scan_results + portfolio_scan_baselines)
+    # are populated only by run_proactive.py, which is prod-only via
+    # _prod_only_guard. A staging-isolated Postgres DB therefore has zero
+    # breaking-news rows and the dashboard renders empty cards. Defaulting
+    # this flag to True so staging reads prod's scan tables — staging never
+    # writes to them, so cross-DB reads are inherently safe. Flip to False
+    # only to confirm the empty-state UI.
+    portfolio_scan_share_with_prod: bool = True
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -418,8 +452,8 @@ class Settings(BaseSettings):
     @property
     def collection_prefix(self) -> str:
         """`stg_` for staging, empty for prod. Prepend to Mongo collections
-        that live in a shared database where we cannot create a new DB
-        (the remote 192.168.31.176:35002 cluster's `u_spider` user)."""
+        that live in a shared database — both envs share the same physical
+        Mongo (ta-mongo-crawl :27018) and isolate at the collection level."""
         return "stg_" if self.is_staging else ""
 
     @property
@@ -478,11 +512,13 @@ class Settings(BaseSettings):
             return self.user_kb_milvus_collection
         return self._suffixed(self.user_kb_milvus_collection)
 
-    # Mongo collections in shared databases. Fixed names — u_spider has no
-    # permission to create new DBs on the remote cluster so prod+staging
-    # must coexist inside the same DB with a name prefix.
-    # `user_kb_share_with_prod=true` also short-circuits these three so
-    # staging reads prod's uploads + GridFS directly.
+    # Mongo collections in shared databases. Prod+staging coexist in the
+    # same physical DB (`ti-user-knowledge-base` on ta-mongo-crawl :27018)
+    # and isolate at the collection level via a `stg_` prefix — carried
+    # over from the remote-Mongo era when `u_spider` could not create new
+    # DBs and kept after the 2026-04-26 back-migration for simplicity.
+    # `user_kb_share_with_prod=true` short-circuits these three so staging
+    # reads prod's uploads + GridFS directly.
 
     @property
     def user_kb_docs_collection(self) -> str:
@@ -502,13 +538,6 @@ class Settings(BaseSettings):
         if self.user_kb_share_with_prod:
             return "fs"
         return self._prefixed("fs")
-
-    @property
-    def research_sessions_collection(self) -> str:
-        # Always env-scoped — keeping prod's audit log uncorrupted by
-        # staging traffic outweighs the convenience of seeing staging
-        # traces on the admin page with prod's.
-        return self._prefixed("research_sessions")
 
     model_config = {
         # Pydantic-settings loads these in order; later files override earlier.

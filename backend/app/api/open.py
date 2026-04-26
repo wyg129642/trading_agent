@@ -6,6 +6,7 @@ Authenticated via X-API-Key header instead of JWT.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -39,9 +40,15 @@ from backend.app.schemas.open import (
     SearchResponse,
     StockSuggestion,
     SuggestResponse,
+    UserKbFetchRequest,
+    UserKbFetchResponse,
+    UserKbHit,
+    UserKbSearchRequest,
+    UserKbSearchResponse,
 )
-from backend.app.services import kb_service
+from backend.app.services import kb_service, user_kb_service
 from backend.app.services.stock_verifier import get_stock_verifier
+from backend.app.services.ticker_normalizer import normalize_one
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -133,6 +140,34 @@ def _detect_market(code: str) -> str:
     return "美股"
 
 
+# Mirrors frontend Portfolio.tsx::toCanonical so the suggestion's canonical_id
+# always matches what scripts/enrich_tickers.py writes into Mongo
+# `_canonical_tickers`. Custom KR/JP/AU/DE markets bypass normalize_one()
+# because a bare 6-digit Korean code (e.g. "005930") would otherwise be
+# misclassified as A-share by the bare-code parser.
+_MARKET_SUFFIX = {"韩股": "KS", "日股": "JP", "澳股": "AU", "德股": "DE"}
+
+
+def _suggestion_canonical(code: str, market: str) -> str | None:
+    code = (code or "").strip()
+    if not code:
+        return None
+    if market == "A股" and "." in code:
+        return code.upper()
+    if market == "美股":
+        return f"{code.upper()}.US"
+    if market == "港股":
+        digits = re.sub(r"\D", "", code).lstrip("0") or "0"
+        return f"{digits.zfill(5)}.HK"
+    suffix = _MARKET_SUFFIX.get(market)
+    if suffix:
+        return f"{code.upper()}.{suffix}"
+    try:
+        return normalize_one(code)
+    except Exception:
+        return None
+
+
 # ── Endpoint 1: Stock suggest ──────────────────────────────────────────
 
 
@@ -164,6 +199,7 @@ async def suggest_stocks(
         results.append(StockSuggestion(
             name=name, code=code, market=market,
             label=f"{name}({code})",
+            canonical_id=_suggestion_canonical(code, market),
         ))
 
     # Exact code match
@@ -985,3 +1021,81 @@ async def kb_facets(
     except ValueError as e:
         raise HTTPException(400, str(e))
     return KbFacetsResponse(dimension=req.dimension, rows=rows)
+
+
+# ── Personal Knowledge Base (team-shared) ─────────────────────────────
+# The personal-KB on remote Mongo (ti-user-knowledge-base) is shared
+# team-wide for retrieval. These endpoints search/read across every
+# team member's uploads in one call — no per-user scoping.
+
+@router.post("/user_kb/search", response_model=UserKbSearchResponse)
+async def user_kb_search(
+    req: UserKbSearchRequest,
+    _api_key=Depends(verify_api_key),
+):
+    """Hybrid (BM25 + dense) chunk search over the team-shared personal KB.
+
+    Returns chunk-level hits across every team member's uploaded docs
+    (PDF / Markdown / DOCX / XLSX / TXT / audio transcripts). Pass the
+    returned ``document_id`` to /user_kb/fetch to read the full body.
+    Both retrievers fail open: if Milvus or BM25 is down, the surviving
+    side still returns hits.
+    """
+    hits = await user_kb_service.search_chunks(
+        req.query or "",
+        top_k=req.top_k,
+        document_ids=req.document_ids,
+        mode=req.mode,
+    )
+    return UserKbSearchResponse(
+        query=req.query or "",
+        total=len(hits),
+        hits=[
+            UserKbHit(
+                document_id=h.document_id,
+                title=h.title,
+                original_filename=h.original_filename,
+                chunk_index=h.chunk_index,
+                text=h.text,
+                score=h.score,
+                created_at=h.created_at,
+                uploader_user_id=h.uploader_user_id,
+            )
+            for h in hits
+        ],
+    )
+
+
+@router.post("/user_kb/fetch", response_model=UserKbFetchResponse)
+async def user_kb_fetch(
+    req: UserKbFetchRequest,
+    _api_key=Depends(verify_api_key),
+):
+    """Fetch the full extracted text of a personal-KB document by id.
+
+    Cross-user read: any team member's upload is reachable. The
+    ``document_id`` is the Mongo ObjectId hex (24 chars) returned by
+    /user_kb/search.
+    """
+    meta = await user_kb_service.get_any_document(req.document_id)
+    if meta is None:
+        return UserKbFetchResponse(
+            found=False, document_id=req.document_id, error="not_found",
+        )
+    text = await user_kb_service.get_any_document_content(
+        req.document_id, max_chars=req.max_chars,
+    ) or ""
+    full_len = int(meta.get("extracted_char_count") or len(text))
+    return UserKbFetchResponse(
+        found=True,
+        document_id=req.document_id,
+        title=meta.get("title"),
+        original_filename=meta.get("original_filename"),
+        doc_type=meta.get("doc_type"),
+        mime_type=meta.get("mime_type"),
+        text=text,
+        full_text_len=full_len,
+        truncated=full_len > len(text),
+        created_at=str(meta.get("created_at") or ""),
+        uploader_user_id=str(meta.get("user_id") or ""),
+    )

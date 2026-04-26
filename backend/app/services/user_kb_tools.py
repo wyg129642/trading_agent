@@ -185,7 +185,9 @@ async def execute_tool(
     """Dispatch entry point called from ``chat_llm.dispatch_tool``."""
     try:
         from backend.app.services.chat_debug import chat_trace, get_current_trace_id
-        trace = chat_trace(get_current_trace_id())
+        # Keyword args matter: chat_trace's first positional is user_id.
+        # model_id is picked up from the per-model contextvar set by chat_llm.
+        trace = chat_trace(trace_id=get_current_trace_id())
     except Exception:  # pragma: no cover - chat_debug not wired
         trace = None
 

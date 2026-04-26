@@ -1,8 +1,8 @@
 """Personal knowledge base service — per-user document storage + retrieval.
 
-Layered over one MongoDB database (``ti-user-knowledge-base`` on the shared
-ops cluster ``192.168.31.176:35002`` by default; override via
-``USER_KB_MONGO_URI`` / ``USER_KB_MONGO_DB``):
+Layered over one MongoDB database (``ti-user-knowledge-base`` on
+``mongodb://127.0.0.1:27018/`` = local ``ta-mongo-crawl`` container by
+default; override via ``USER_KB_MONGO_URI`` / ``USER_KB_MONGO_DB``):
 
 * ``documents``  — one row per uploaded file. Holds metadata, upload status,
                    parse status, extracted text (for small-file convenience)
@@ -156,9 +156,11 @@ def _db() -> AsyncIOMotorDatabase:
 
 
 def _docs() -> AsyncIOMotorCollection:
-    # Staging shares the remote `ti-user-knowledge-base` DB with prod
-    # (u_spider cannot create new DBs). Per-env isolation is done via a
-    # `stg_` collection prefix — see Settings.user_kb_docs_collection.
+    # Staging shares the local `ti-user-knowledge-base` DB with prod (the
+    # `-full` DB names + this single shared DB carried over from the
+    # remote-Mongo era when u_spider couldn't create new DBs). Per-env
+    # isolation uses a `stg_` collection prefix — see
+    # Settings.user_kb_docs_collection.
     return _db()[get_settings().user_kb_docs_collection]
 
 

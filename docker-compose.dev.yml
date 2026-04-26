@@ -35,6 +35,24 @@ services:
       timeout: 3s
       retries: 5
 
+  # Crawler-data MongoDB (migrated from remote 192.168.31.176:35002 on 2026-04-26).
+  # Holds the 10 crawler/user-kb DBs. Bound to 127.0.0.1 only (LAN-internal),
+  # no auth (parity with the open remote setup we are replacing).
+  mongo-crawl:
+    image: docker.1ms.run/library/mongo:7
+    container_name: ta-mongo-crawl
+    command: ["mongod", "--bind_ip_all", "--wiredTigerCacheSizeGB", "8"]
+    ports:
+      - "127.0.0.1:27018:27017"
+    volumes:
+      - /home/ygwang/crawl_data/mongo:/data/db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   postgres_dev_data:
   redis_dev_data:

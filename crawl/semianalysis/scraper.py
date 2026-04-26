@@ -5,9 +5,8 @@
   - archive list:  GET /api/v1/archive?sort=new&search=&offset=N&limit=12
   - post detail:   GET /api/v1/posts/by-id/<post_id>
 
-写入 MongoDB funda DB 的 `semianalysis_posts` collection (u_spider 无权建新
-DB, 所以 co-host 到 funda — 同 sentimentrader_indicators 的做法). Checkpoint
-走独立 `_state_semianalysis` collection, 跟 funda 自身的 _state 隔离.
+写入 MongoDB `foreign-website` DB 的 `semianalysis_posts` collection (2026-04-24
+从 funda DB 迁出). Checkpoint 走独立 `_state_semianalysis` collection.
 
 鉴权:
   - 匿名可抓到 free 全文 + paid preview (大约 170 KB HTML).
@@ -28,8 +27,8 @@ DB, 所以 co-host 到 funda — 同 sentimentrader_indicators 的做法). Check
   python3 scraper.py --today                  # 今日对齐统计
 
 环境变量:
-  MONGO_URI      (默认 远端 u_spider)
-  MONGO_DB       (默认 funda — co-host)
+  MONGO_URI      (默认 mongodb://127.0.0.1:27018/, 本机 ta-mongo-crawl)
+  MONGO_DB       (默认 foreign-website)
   HTTP_PROXY / HTTPS_PROXY  (默认 http://127.0.0.1:7890)
 
 依赖 crawl/antibot.py (共享节流栈) + crawl/ticker_tag.py (ticker 富化).
@@ -61,6 +60,7 @@ from antibot import (  # noqa: E402
     add_antibot_args, throttle_from_args, cap_from_args,
     AccountBudget, SoftCooldown, detect_soft_warning,
     headers_for_platform, log_config_stamp, budget_from_args,
+    warmup_session,
 )
 from ticker_tag import stamp as _stamp_ticker  # noqa: E402
 
@@ -75,12 +75,12 @@ POST_BY_SLUG_PATH = "/api/v1/posts"       # + /<slug>  (fallback)
 
 CREDS_FILE = Path(__file__).resolve().parent / "credentials.json"
 
-# Co-host 到 funda DB (u_spider 无权建新 DB; 同 sentimentrader_indicators 模式)
+# 2026-04-24 迁到独立 `foreign-website` DB (之前 co-host 在 funda)
 MONGO_URI_DEFAULT = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
-MONGO_DB_DEFAULT = os.environ.get("MONGO_DB", "funda")
+MONGO_DB_DEFAULT = os.environ.get("MONGO_DB", "foreign-website")
 COL_POSTS = "semianalysis_posts"
 COL_STATE = "_state_semianalysis"
 COL_ACCOUNT = "_state_semianalysis"   # account meta goes into the same state collection (namespaced by _id)
@@ -149,6 +149,8 @@ def create_session(cookie: str, proxy: Optional[str] = None) -> requests.Session
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
     s.trust_env = False   # proxies 已显式设, 不吃 env (避免二次代理)
+    # Warmup: 先 GET newsletter.semianalysis.com/archive landing 再调 API
+    warmup_session(s, PLATFORM if PLATFORM in _SUPPORTED_PLATFORMS() else "funda")
     return s
 
 
@@ -836,8 +838,9 @@ def parse_args():
                    help="启动随机偏移 (秒, 由 crawler_monitor 注入, 这里延迟启动)")
 
     # 反爬 (crawl/antibot.py) — 默认跟 US 平台 funda 一致
+    # 2026-04-25 default_cap 400→0: 实时档不再数量闸 (antibot.py 顶部 §5).
     add_antibot_args(p, default_base=3.0, default_jitter=2.0,
-                     default_burst=40, default_cap=400, platform=PLATFORM)
+                     default_burst=40, default_cap=0, platform=PLATFORM)
     return p.parse_args()
 
 

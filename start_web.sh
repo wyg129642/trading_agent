@@ -102,7 +102,7 @@ MEMORY_SCRIPT="run_chat_memory_processor.py"
 
 MONITOR_PID_FILE="$PROJECT_DIR/logs/crawler_monitor.pid"
 MONITOR_LOG="$PROJECT_DIR/logs/crawler_monitor.log"
-MONITOR_PORT=8080
+MONITOR_PORT="$(_load_env_var MONITOR_PORT 8080)"
 MONITOR_DIR="$PROJECT_DIR/crawl"
 
 # Crawler MongoDB container (not in docker-compose.dev.yml; started independently)
@@ -134,6 +134,34 @@ _prod_only_guard() {
     local what="$1"
     if [ "$APP_ENV" = "staging" ]; then
         warn "[STAGING] Skipping ${what} — staging shares prod's ${what} output. Run it in the prod worktree instead."
+        return 1
+    fi
+    return 0
+}
+
+# Cross-worktree crawler lock: refuse to start scrapers / crawler_monitor if
+# the *other* worktree still has any live crawler process. This is the real
+# invariant — "one writer per credential" — and replaces the old APP_ENV=prod
+# gate for the crawl group. Whichever worktree cleans up first wins the lock.
+_check_other_worktree_clear() {
+    local other=""
+    case "$PROJECT_DIR" in
+        /home/ygwang/trading_agent_staging) other="/home/ygwang/trading_agent" ;;
+        /home/ygwang/trading_agent)         other="/home/ygwang/trading_agent_staging" ;;
+        *) return 0 ;;  # unknown layout — don't block
+    esac
+    local conflict=""
+    for pid in $(pgrep -f 'scraper\.py|crawler_monitor\.py' 2>/dev/null); do
+        local cwd
+        cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+        case "$cwd" in
+            "$other"/crawl|"$other"/crawl/*) conflict="$conflict $pid" ;;
+        esac
+    done
+    if [ -n "$conflict" ]; then
+        err "Refusing to start crawlers: other worktree ($other) still has crawler processes:"
+        err "  PIDs:$conflict"
+        err "  Stop them first (manually, or: cd $other && ./start_web.sh crawl stop)"
         return 1
     fi
     return 0
@@ -418,16 +446,17 @@ stop_backend() {
         # vice versa (both worktrees use the same uvicorn import path).
         pkill -f "uvicorn.*backend\.app\.main:app.*--port[= ]${APP_PORT}" 2>/dev/null
     fi
-    # Orphaned engine subprocess safety net. Prod only — staging never spawns
-    # the engine, so this pkill is a no-op there. Pattern matches only this
-    # worktree's engine start: run.py living under $PROJECT_DIR (engine
-    # subprocess inherits cwd from backend, and backend cwd = $PROJECT_DIR).
-    if [ "$APP_ENV" = "production" ]; then
-        for pid in $(pgrep -f "python.*run\.py" 2>/dev/null); do
-            cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
-            [ "$cwd" = "$PROJECT_DIR" ] && kill "$pid" 2>/dev/null
-        done
-    fi
+    # Orphaned engine subprocess safety net. In prod the backend intentionally
+    # spawns run.py; in staging it SHOULDN'T (gated in main.py lifespan) but we
+    # still sweep here in case the guard regresses — orphans accumulate fast
+    # and exhaust Postgres max_connections (2026-04-24 incident: 13 staging
+    # orphans holding ~100 conns). Pattern is scoped to this worktree's
+    # run.py via /proc/$pid/cwd so stopping staging never touches prod and
+    # vice versa.
+    for pid in $(pgrep -f "python.*run\.py" 2>/dev/null); do
+        cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+        [ "$cwd" = "$PROJECT_DIR" ] && kill "$pid" 2>/dev/null
+    done
 }
 
 start_scanner() {
@@ -636,7 +665,7 @@ restart_web_group() {
 # ==============================================================
 
 start_crawler_monitor() {
-    _prod_only_guard "crawler_monitor.py + scrapers (shared remote Mongo corpus — only prod writes)" || return 0
+    _check_other_worktree_clear || return 1
     if [ -f "$MONITOR_PID_FILE" ]; then
         old_pid=$(cat "$MONITOR_PID_FILE")
         if kill -0 "$old_pid" 2>/dev/null; then
@@ -697,14 +726,10 @@ _is_our_scraper() {
 }
 
 stop_scrapers() {
-    # Staging is crawler-free; this is a no-op there. Double belt-and-braces:
-    # `_is_our_scraper` already scopes to $PROJECT_DIR/crawl, so even if the
-    # guard below were removed staging would only target its own (empty) set.
-    if [ "$APP_ENV" = "staging" ]; then
-        return 0
-    fi
     # Scrapers are spawned with start_new_session=True so they survive
-    # crawler_monitor death — must be killed explicitly.
+    # crawler_monitor death — must be killed explicitly. `_is_our_scraper`
+    # scopes the kill to $PROJECT_DIR/crawl, so each worktree only stops its
+    # own scrapers.
     local killed=0
     for pid in $(pgrep -f "scraper\.py" 2>/dev/null); do
         if _is_our_scraper "$pid"; then
@@ -721,11 +746,6 @@ stop_scrapers() {
 }
 
 stop_crawler_monitor() {
-    # Staging never runs the crawler group. Returning here prevents the
-    # pgrep fallback below from killing prod's crawler_monitor.
-    if [ "$APP_ENV" = "staging" ]; then
-        return 0
-    fi
     if [ -f "$MONITOR_PID_FILE" ]; then
         pid=$(cat "$MONITOR_PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
@@ -756,7 +776,7 @@ stop_crawler_monitor() {
 }
 
 trigger_scrapers_start() {
-    _prod_only_guard "scraper start-all" || return 0
+    _check_other_worktree_clear || return 1
     # POST to crawler_monitor's /api/start-all — idempotent (internally kills
     # existing scrapers by cwd + re-spawns all configured ones).
     info "Triggering /api/start-all on crawler monitor..."

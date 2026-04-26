@@ -67,17 +67,18 @@ GB LSE   FR Paris   CH SIX   NL Euronext
 | 久谦中台(meritco) | **`jiuqian-full`** | `forum` / `research` |
 | 高临咨询(third_bridge) | **`third-bridge`** | `interviews` |
 | Funda | **`funda`** | `posts` / `earnings_reports` / `earnings_transcripts` / `sentiments` |
-| 港推(gangtise) | `gangtise-full` | `summaries` / `researches` / `chief_opinions` |
+| 岗底斯(gangtise) | `gangtise-full` | `summaries` / `researches` / `chief_opinions` |
 | AceCamp | **`acecamp`** | `articles` |
 | 阿尔法引擎(alphaengine) | **`alphaengine`** | `summaries` / `china_reports` / `foreign_reports` / `news_items` |
 
-**连接串**(线上 ops cluster):
+**连接串**(本机 ta-mongo-crawl 容器, 2026-04-26 起从远端 ops cluster 迁回本机):
 
 ```
-mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin
+mongodb://127.0.0.1:27018/
 ```
 
-⚠️ Clash 代理会拦截 LAN,要先 `NO_PROXY=192.168.31.176,localhost,127.0.0.1`。
+历史远端连接串(应急回滚用,见 `.env` 注释): `mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin`。
+本机连接无需代理设置,直连 loopback;远端连接才需要 `NO_PROXY=192.168.31.176,localhost,127.0.0.1`。
 
 ---
 
@@ -86,11 +87,9 @@ mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin
 ### 4.1 单票跨源 —— MongoDB 直查(训练/批量推荐)
 
 ```python
-import os
-os.environ["NO_PROXY"] = "192.168.31.176,localhost,127.0.0.1"
 from pymongo import MongoClient
 
-c = MongoClient("mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin")
+c = MongoClient("mongodb://127.0.0.1:27018/")
 
 ROUTE = [
     ("alphapai-full",  ["comments", "roadshows", "wechat_articles", "reports"]),
@@ -132,7 +131,7 @@ pipeline = [
 # 并发扫所有 collection
 import asyncio
 from motor.motor_asyncio import AsyncIOMotorClient
-mc = AsyncIOMotorClient("mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin")
+mc = AsyncIOMotorClient("mongodb://127.0.0.1:27018/")
 
 async def run():
     tasks = [mc[dbn][coll].aggregate(pipeline).to_list(None)
@@ -212,12 +211,10 @@ projection = {"title": 1, "release_time": 1, "_canonical_tickers": 1,
 
 ```python
 import asyncio
-import os
-os.environ["NO_PROXY"] = "192.168.31.176,localhost,127.0.0.1"
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime, timedelta
 
-MONGO_URI = "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin"
+MONGO_URI = "mongodb://127.0.0.1:27018/"
 ROUTE = [
     ("alphapai-full",  ["comments", "roadshows", "wechat_articles", "reports"]),
     ("jinmen-full",    ["meetings", "reports", "oversea_reports"]),

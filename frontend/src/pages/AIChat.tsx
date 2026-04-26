@@ -3181,7 +3181,7 @@ export default function AIChat() {
             </div>
 
             {/* 内部知识库 toggle — 7 crawled platforms via kb_search/kb_fetch_document/kb_list_facets */}
-            <Tooltip title="内部知识库：统一检索全部7个投研来源（Alpha派+进门+久谦+第三方桥+Funda+港推+峰会），支持按股票代码+日期+类型过滤">
+            <Tooltip title="内部知识库：统一检索全部7个投研来源（Alpha派+进门+久谦+第三方桥+Funda+岗底斯+峰会），支持按股票代码+日期+类型过滤">
               <Button
                 type={kbEnabled ? 'primary' : 'text'}
                 size="small"

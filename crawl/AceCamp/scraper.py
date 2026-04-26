@@ -54,6 +54,7 @@ from antibot import (  # noqa: E402
     add_antibot_args, throttle_from_args, cap_from_args,
     AccountBudget, SoftCooldown, detect_soft_warning,
     headers_for_platform, log_config_stamp, budget_from_args,
+    warmup_session,
 )
 from ticker_tag import stamp as _stamp_ticker  # noqa: E402
 
@@ -117,7 +118,7 @@ WEB_BASE = "https://www.acecamptech.com"
 # MongoDB 配置
 MONGO_URI_DEFAULT = os.environ.get(
     "MONGO_URI",
-    "mongodb://u_spider:prod_X5BKVbAc@192.168.31.176:35002/?authSource=admin",
+    "mongodb://127.0.0.1:27018/",
 )
 MONGO_DB_DEFAULT = os.environ.get("MONGO_DB", "acecamp")
 COL_ACCOUNT = "account"
@@ -138,6 +139,8 @@ def create_session(cookie: str) -> requests.Session:
         "X-Requested-With": "XMLHttpRequest",
     })
     s.headers.update(h)
+    # Warmup: 先 GET acecamptech.com landing 再调 api.acecamptech.com/api/v1/*
+    warmup_session(s, "acecamp")
     return s
 
 
@@ -1119,8 +1122,10 @@ def parse_args():
     # 导致 detail quota 几分钟烧光). 新默认跟 ANTIBOT.md backfill 默认 (3.5/2.0/30/400)
     # 对齐偏保守: 4.0/2.5/20/300. 实际调用方 (crawler_manager.SPECS / daily_catchup /
     # backfill_6months) 会再覆盖成 variant-specific 值, 这里是 CLI 裸跑兜底.
+    # 2026-04-25 default_cap 300→0: realtime --skip-detail 根本不碰 detail quota 池,
+    # 数量闸价值低; 真出事靠 SoftCooldown (10003/10040 自动 30min 静默).
     add_antibot_args(p, default_base=4.0, default_jitter=2.5,
-                     default_burst=20, default_cap=300, platform="acecamp")
+                     default_burst=20, default_cap=0, platform="acecamp")
     return p.parse_args()
 
 

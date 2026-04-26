@@ -54,7 +54,7 @@ status    /status   report    /report
 | **alphapai · Alpha派** | 路演 / 券商点评 / 券商研报 / 社媒微信 | JWT (`eyJ...`) | `alphapai` |
 | **thirdbridge · 高临** | 专家访谈 | AWS Cognito Cookie 串 | `thirdbridge` |
 | **funda · Funda.ai** | 研究 / 8-K / 业绩会 / 情绪 | 整条浏览器 Cookie | `funda` |
-| **gangtise · 港推** | 纪要 (7 分类) / 研报 / 首席观点 | localStorage `G_token` (UUID) | `gangtise` |
+| **gangtise · 岗底斯** | 纪要 (7 分类) / 研报 / 首席观点 | localStorage `G_token` (UUID) | `gangtise` |
 | **acecamp** | 观点 / 纪要 / 调研 | Cookie 三件套 (`user_token`+Rails+`aceid`) | `acecamp` |
 | **sentimentrader** | Smart/Dumb · Fear/Greed · QQQ Optix | email + 密码 (走 `/data-sources` UI 自动登录) | — |
 

@@ -146,17 +146,9 @@ MONGO_PLATFORMS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
         ("news_items", "资讯"),
     ]),
     ("SentimenTrader", "sentimentrader_mongo_uri", "sentimentrader_mongo_db", []),
-    # Research Log co-hosts inside the User KB database (u_spider can't create
-    # new DBs on the remote cluster), so pin the collection name explicitly —
-    # otherwise auto-discovery would double-count the KB collections under
-    # both "Research Log" and "User KB".
-    #
     # Collection names are resolved dynamically at request time via
     # ``_scope_collections`` below so staging (APP_ENV=staging) sees its
     # ``stg_`` siblings instead of prod's data.
-    ("Research Log", "research_log_mongo_uri", "research_log_mongo_db", [
-        ("__research_sessions__", "AI 研究助手会话日志"),
-    ]),
     ("User KB", "user_kb_mongo_uri", "user_kb_mongo_db", [
         ("__user_kb_docs__", "用户上传文档"),
         ("__user_kb_chunks__", "分片索引"),
@@ -167,11 +159,10 @@ MONGO_PLATFORMS: list[tuple[str, str, str, list[tuple[str, str]]]] = [
 
 
 # Sentinel → settings-attr mapping. Kept narrow on purpose: only shared-DB
-# collections (User KB + Research Log) are env-scoped at the collection
-# level; crawler platforms already sit in their own per-platform DB so
-# they don't need staging-vs-prod disambiguation.
+# collections (User KB) are env-scoped at the collection level; crawler
+# platforms already sit in their own per-platform DB so they don't need
+# staging-vs-prod disambiguation.
 _DYNAMIC_COLL_SENTINELS: dict[str, str] = {
-    "__research_sessions__": "research_sessions_collection",
     "__user_kb_docs__": "user_kb_docs_collection",
     "__user_kb_chunks__": "user_kb_chunks_collection",
 }
@@ -795,17 +786,22 @@ async def _gather_backfill_progress(
         {"platform": "alphaengine", "category": "summary",        "db": "alphaengine", "coll": "summaries",        "mode": "streaming"},
         {"platform": "alphaengine", "category": "news",           "db": "alphaengine", "coll": "news_items",       "mode": "streaming"},
         {"platform": "alphaengine", "category": "foreignReport",  "db": "alphaengine", "coll": "foreign_reports",  "mode": "streaming"},
+        # foreign-website DB (foreign news / newsletter sites)
+        {"platform": "semianalysis",    "category": "posts",    "db": "foreign-website", "coll": "semianalysis_posts",    "mode": "streaming"},
+        {"platform": "the_information", "category": "articles", "db": "foreign-website", "coll": "theinformation_posts",  "mode": "streaming"},
     ]
 
     # Map of platform → (uri_attr, db_attr) from config
     platform_conn = {
-        "alphapai":    ("alphapai_mongo_uri", "alphapai_mongo_db"),
-        "jinmen":      ("jinmen_mongo_uri", "jinmen_mongo_db"),
-        "meritco":     ("meritco_mongo_uri", "meritco_mongo_db"),
-        "gangtise":    ("gangtise_mongo_uri", "gangtise_mongo_db"),
-        "funda":       ("funda_mongo_uri", "funda_mongo_db"),
-        "acecamp":     ("acecamp_mongo_uri", "acecamp_mongo_db"),
-        "alphaengine": ("alphaengine_mongo_uri", "alphaengine_mongo_db"),
+        "alphapai":        ("alphapai_mongo_uri", "alphapai_mongo_db"),
+        "jinmen":          ("jinmen_mongo_uri", "jinmen_mongo_db"),
+        "meritco":         ("meritco_mongo_uri", "meritco_mongo_db"),
+        "gangtise":        ("gangtise_mongo_uri", "gangtise_mongo_db"),
+        "funda":           ("funda_mongo_uri", "funda_mongo_db"),
+        "acecamp":         ("acecamp_mongo_uri", "acecamp_mongo_db"),
+        "alphaengine":     ("alphaengine_mongo_uri", "alphaengine_mongo_db"),
+        "semianalysis":    ("semianalysis_mongo_uri", "semianalysis_mongo_db"),
+        "the_information": ("the_information_mongo_uri", "the_information_mongo_db"),
     }
 
     async def _probe_target(tgt: dict[str, Any]) -> dict[str, Any]:

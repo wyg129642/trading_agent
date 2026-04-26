@@ -19,7 +19,7 @@
 │  ├── meritco_crawl/     久谦中台 (论坛: 纪要/研报/久谦自研)    │
 │  ├── third_bridge/      Third Bridge (英文专家访谈)            │
 │  ├── funda/             funda.ai (美股研究/8-K/业绩会/情绪)    │
-│  ├── gangtise/          港推 (港股纪要/研报/首席观点 — 7 类)   │
+│  ├── gangtise/          岗底斯 (港股纪要/研报/首席观点 — 7 类) │
 │  ├── AceCamp/           AceCamp (观点/纪要/调研)               │
 │  ├── sentimentrader/    SentimenTrader (情绪指标 daily)        │
 │  │                                                             │
@@ -60,7 +60,7 @@ frontend/src/pages/{AlphaPai*,Jinmen*,Meritco*,ThirdBridge*,
 | **Meritco** (久谦中台) | `meritco` | forum 2 281 (type 2 专业 + 3 久谦自研) · research 68 (久谦研究) · PDF 附件 121 | 1 (`--type 2,3`) | Network token + **RSA X-My-Header 签名** | ⭐⭐⭐ 难 | [meritco_crawl/README.md](meritco_crawl/README.md) |
 | **Third Bridge** (高临) | `thirdbridge` | interviews 148 | 1 (低频) | 完整 Cookie 串 (AWS Cognito + WAF) | ⭐⭐⭐⭐ 最难 | [third_bridge/README.md](third_bridge/README.md) |
 | **Funda** (funda.ai) | `funda` | posts 354 · earnings_reports 886 · earnings_transcripts 2 480 · sentiments 10 487 | **3** (`--category`) | Cookie `session-token` + tRPC superjson | ⭐⭐ 中 | [funda/README.md](funda/README.md) |
-| **Gangtise** (港推) | `gangtise` | summaries 656 · researches 480 · chief_opinions 711 | **3** (`--type`) — `--type summary` 内部再轮询 **7 个 classify** | localStorage `G_token` (UUID) | ⭐ 普通 (CDN 禁代理 + chief 端点特殊) | [gangtise/README.md](gangtise/README.md) |
+| **Gangtise** (岗底斯) | `gangtise` | summaries 656 · researches 480 · chief_opinions 711 | **3** (`--type`) — `--type summary` 内部再轮询 **7 个 classify** | localStorage `G_token` (UUID) | ⭐ 普通 (CDN 禁代理 + chief 端点特殊) | [gangtise/README.md](gangtise/README.md) |
 | **AceCamp** | `acecamp` | articles 765 (观点 + 纪要) · events 111 | **2** (`--type`) | Cookie 三件套 (`user_token` JWT + Rails session + `aceid`) | ⭐⭐ 中 | [AceCamp/README.md](AceCamp/README.md) |
 | **SentimenTrader** | `sentimentrader` | indicators 4 (Smart/Dumb · Fear/Greed · QQQ Optix) | 1 (cron 06:00 CST) | email + 密码 (Playwright) | ⭐⭐ 中 (Highcharts JS 内嵌) | [sentimentrader/README.md](sentimentrader/README.md) |
 | **合计** | 8 DB | **76 000+ 文档** | **18 进程并行** | | | |
@@ -365,7 +365,7 @@ python3 crawler_monitor.py --push-feishu            # state 变化才推送
 │   └── 研报 (/jinmen/reports)
 ├── 高临专区 (Third Bridge)
 │   └── 专家访谈 (/thirdbridge/interviews)
-├── 港推专区 (Gangtise)
+├── 岗底斯专区 (Gangtise)
 │   ├── 纪要 (/gangtise/summary)        ← 7 类 classify 全量
 │   ├── 研报 (/gangtise/research)
 │   └── 首席观点 (/gangtise/chief)
@@ -382,7 +382,7 @@ python3 crawler_monitor.py --push-feishu            # state 变化才推送
 
 **统一命名原则**:
 - **研报 / 纪要 / 观点 / 微信 / 财报** 五类基础词汇跨平台复用
-- 特殊保留:「首席观点」(港推) /「专家访谈」(高临) /「点评速递」(AlphaPai)
+- 特殊保留:「首席观点」(岗底斯) /「专家访谈」(高临) /「点评速递」(AlphaPai)
 - 避免 Research / Reports / Earnings 等英文混杂
 
 ### 6.2 每个页面的极简布局
@@ -957,7 +957,7 @@ docker run -d --name crawl_data_ui --network host \
 /home/ygwang/crawl_data/
 ├── pdf_full/               706 GB  历史全量 jinmen 研报归档 (用户手工管理)
 ├── alphapai_pdfs/          ~440 MB  AlphaPai 研报 PDF (2026-04 起增量)
-├── gangtise_pdfs/          ~16 MB   港推研报 PDF
+├── gangtise_pdfs/          ~16 MB   岗底斯研报 PDF
 ├── jinmen_pdfs/            ~9 MB    进门增量 PDF
 ├── meritco_pdfs/           ~263 MB  久谦 PDF 附件
 └── sentimentrader_images/  ~5 MB    SentimenTrader 图表 PNG

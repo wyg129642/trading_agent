@@ -40,11 +40,13 @@ if str(_REPO_ROOT) not in sys.path:
 try:
     from backend.app.services.ticker_normalizer import (  # noqa: E402
         EXTRACTORS,
+        extract_tickers_from_text,
         normalize_with_unmatched,
     )
     _AVAILABLE = True
 except Exception:
     EXTRACTORS = {}  # type: ignore
+    extract_tickers_from_text = None  # type: ignore
     _AVAILABLE = False
 
 
@@ -70,10 +72,25 @@ def stamp(doc: dict, source_key: str, col: Any) -> dict:
     try:
         raw = extractor(doc, _coll_name(col))
         matched, unmatched = normalize_with_unmatched(raw)
+        extract_source = source_key
+        # Title fallback (2026-04-24): when structured extractor finds nothing,
+        # scan parenthesized `(CODE.MARKET)` / `(CODE:MARKET)` in common title
+        # fields. Matches the logic in `scripts/enrich_tickers.py` so new-doc
+        # coverage aligns with back-fill coverage.
+        if not matched and extract_tickers_from_text is not None:
+            for field in ("title", "title_cn", "title_en"):
+                title = doc.get(field)
+                if not isinstance(title, str) or not title.strip():
+                    continue
+                title_hits = extract_tickers_from_text(title)
+                if title_hits:
+                    matched = title_hits
+                    extract_source = f"{source_key}_title"
+                    break
         doc["_canonical_tickers"] = matched
         doc["_canonical_tickers_at"] = datetime.now(timezone.utc)
         doc["_unmatched_raw"] = unmatched
-        doc["_canonical_extract_source"] = source_key
+        doc["_canonical_extract_source"] = extract_source
     except Exception:
         pass
     return doc

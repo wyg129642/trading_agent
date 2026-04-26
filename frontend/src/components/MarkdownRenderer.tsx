@@ -12,7 +12,7 @@ export default function MarkdownRenderer({ content }: MarkdownRendererProps) {
 
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={[[remarkGfm, { singleTilde: false }]]}
       components={{
         code({ className, children, ...props }) {
           const match = /language-(\w+)/.exec(className || '')
@@ -84,6 +84,11 @@ export default function MarkdownRenderer({ content }: MarkdownRendererProps) {
               {children}
             </td>
           )
+        },
+        del({ children }) {
+          // Render strikethrough as plain text — number ranges using `~~`
+          // (e.g. 60~~75%) should not visually disappear.
+          return <span>{children}</span>
         },
       }}
     >
