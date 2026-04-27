@@ -6,6 +6,10 @@ content comes back with citation indices registered on the tracker.
 """
 from __future__ import annotations
 
+import shutil
+import tempfile
+from pathlib import Path
+
 import pytest
 import pytest_asyncio
 
@@ -50,6 +54,8 @@ async def _isolated_db():
     settings = get_settings()
     settings.user_kb_mongo_uri = "mongodb://localhost:27017"
     settings.user_kb_mongo_db = TEST_DB_NAME
+    disk_root = Path(tempfile.mkdtemp(prefix="user_kb_tools_test_disk_"))
+    settings.user_kb_disk_root = str(disk_root)
     svc._clear_mongo_client_cache()
     svc._reset_index_init_for_retry()
     client = svc._mongo_client()
@@ -57,6 +63,7 @@ async def _isolated_db():
     yield
     await client.drop_database(TEST_DB_NAME)
     svc._clear_mongo_client_cache()
+    shutil.rmtree(disk_root, ignore_errors=True)
 
 
 class _FakeTracker:

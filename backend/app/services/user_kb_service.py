@@ -275,6 +275,76 @@ def _delete_disk_blob_sync(path: Path) -> bool:
         return False
 
 
+async def _load_blob(local_path: str | None, gridfs_file_id: Any) -> bytes:
+    """Disk-first read with legacy GridFS fallback.
+
+    Returns the raw bytes. Raises ``FileNotFoundError`` if neither source
+    yields data — callers (parse, download, inline reparse) translate that
+    into the appropriate user-facing failure.
+    """
+    disk = _resolve_disk_path(local_path)
+    if disk is not None:
+        try:
+            return await asyncio.to_thread(_read_disk_blob_sync, disk)
+        except FileNotFoundError:
+            # Disk path was recorded but the file is gone (manual delete,
+            # disk corruption, partial migration). Fall through to GridFS
+            # rather than blowing up; the GridFS leg is the safety net.
+            logger.warning(
+                "user_kb: local_path=%r missing on disk; falling back to GridFS",
+                local_path,
+            )
+    if gridfs_file_id is not None:
+        fs = _gridfs()
+        stream = await fs.open_download_stream(gridfs_file_id)
+        try:
+            return await stream.read()
+        finally:
+            close_fn = getattr(stream, "close", None)
+            if callable(close_fn):
+                res = close_fn()
+                if hasattr(res, "__await__"):
+                    try:
+                        await res
+                    except Exception:
+                        pass
+    raise FileNotFoundError(
+        f"user_kb blob unavailable (local_path={local_path!r}, gridfs_file_id={gridfs_file_id!r})"
+    )
+
+
+async def _delete_blob(
+    local_path: str | None,
+    gridfs_file_id: Any,
+    doc_id_str: str,
+    where: str,
+) -> None:
+    """Best-effort delete from BOTH disk and legacy GridFS.
+
+    A doc in the migration window may have its bytes in either or both
+    locations, and "I can't find this blob" is *never* a reason to abort
+    the surrounding row delete (that would leak Mongo rows pointing at
+    nothing). Logs and moves on.
+    """
+    disk = _resolve_disk_path(local_path)
+    if disk is not None:
+        try:
+            await asyncio.to_thread(_delete_disk_blob_sync, disk)
+        except Exception as e:
+            logger.warning(
+                "user_kb disk delete failed for doc=%s (path=%s, %s): %s",
+                doc_id_str, disk, where, e,
+            )
+    if gridfs_file_id is not None:
+        try:
+            await _gridfs().delete(gridfs_file_id)
+        except Exception as e:
+            logger.warning(
+                "user_kb gridfs delete failed for doc=%s (gridfs=%s, %s): %s",
+                doc_id_str, gridfs_file_id, where, e,
+            )
+
+
 # ── Index setup ────────────────────────────────────────────────
 
 
@@ -944,27 +1014,36 @@ async def create_document(
             was_duplicate=True,
         )
 
-    # 1. Stream the bytes into GridFS.
-    fs = _gridfs()
-    gridfs_file_id = await fs.upload_from_stream(
-        original_filename,
-        data,
-        metadata={"user_id": user_id, "content_hash": content_hash},
-    )
+    # 1. Reserve an ObjectId so the on-disk filename is deterministic
+    #    (and matches the documents row we're about to insert).
+    new_oid = ObjectId()
+    disk_path = _disk_path_for(user_id, new_oid, original_filename)
+    local_path = _disk_relpath(disk_path)
 
-    # 2. Create the document row. If Mongo rejects the insert (schema drift,
-    #    disk full, network hiccup), roll back the GridFS blob so we don't
-    #    leak an orphaned binary.
+    # 2. Write the bytes to local SSD atomically (tmp + fsync + rename).
+    #    The file is written before the Mongo insert so the row is never
+    #    "valid but pointing at nothing"; the inverse leak (file written,
+    #    insert fails) is healed in step 4.
+    await asyncio.to_thread(_write_disk_blob_sync, disk_path, data)
+
+    # 3. Create the document row. If Mongo rejects the insert (schema drift,
+    #    disk full, network hiccup), unlink the just-written file so we
+    #    don't leak an orphaned binary.
     now = _now()
     doc_title = (title or "").strip() or _title_from_filename(original_filename)
     row = {
+        "_id": new_oid,
         "user_id": user_id,
         "original_filename": original_filename,
         "file_extension": ext,
         "content_type": user_kb_parser.content_type_for(original_filename),
         "file_size_bytes": size,
         "content_hash": content_hash,
-        "gridfs_file_id": gridfs_file_id,
+        # Disk-relative path under settings.user_kb_disk_root. ``gridfs_file_id``
+        # remains None — left in the schema so legacy code paths and
+        # serializers don't crash, but the disk path is the source of truth.
+        "local_path": local_path,
+        "gridfs_file_id": None,
         "upload_status": UploadStatus.COMPLETED,
         "upload_error": None,
         "parse_status": ParseStatus.PENDING,
@@ -994,14 +1073,14 @@ async def create_document(
     try:
         result = await _docs().insert_one(row)
     except Exception:
-        # Roll back the just-uploaded GridFS blob; otherwise it sits there
-        # with no documents row pointing at it, wasting space forever.
+        # 4. Roll back the on-disk blob; otherwise it sits there with no
+        #    documents row pointing at it, wasting space forever.
         try:
-            await fs.delete(gridfs_file_id)
+            await asyncio.to_thread(_delete_disk_blob_sync, disk_path)
         except Exception:
             logger.warning(
-                "gridfs rollback failed for blob %s after insert failure",
-                gridfs_file_id,
+                "disk rollback failed for %s after insert failure",
+                disk_path,
             )
         raise
     return UploadOutcome(document_id=str(result.inserted_id), was_duplicate=False)
@@ -1103,7 +1182,8 @@ async def parse_document(document_id: str) -> None:
 
     user_id = claimed["user_id"]
     filename = claimed["original_filename"]
-    gridfs_file_id = claimed["gridfs_file_id"]
+    gridfs_file_id = claimed.get("gridfs_file_id")
+    local_path = claimed.get("local_path") or ""
 
     # Bound concurrent parses AND cap each one at a wall-clock timeout. The
     # semaphore must be entered *outside* the timeout so waiting in the
@@ -1123,7 +1203,7 @@ async def parse_document(document_id: str) -> None:
     async with sem:
         try:
             await asyncio.wait_for(
-                _do_parse(oid, user_id, filename, gridfs_file_id),
+                _do_parse(oid, user_id, filename, local_path, gridfs_file_id),
                 timeout=parse_timeout,
             )
         except asyncio.TimeoutError:
@@ -1147,7 +1227,7 @@ async def parse_document(document_id: str) -> None:
         except user_kb_asr_client.AsrUnavailable as e:
             # Transport-level ASR outage (tunnel down, jumpbox rebooting,
             # ReadTimeout, etc.) — deliberately NOT a per-doc failure. The
-            # file is already in GridFS; reset parse_status back to PENDING
+            # file is already on local SSD; reset parse_status back to PENDING
             # so ``asr_recovery_sweep_loop`` re-enqueues it the moment the
             # service is reachable again. This is the contract the UI banner
             # "音频会排队，服务恢复后会自动续转" promises to users.
@@ -1195,6 +1275,7 @@ async def _do_parse(
     oid: ObjectId,
     user_id: str,
     filename: str,
+    local_path: str,
     gridfs_file_id: Any,
 ) -> None:
     """Core parse pipeline; wrapped by ``parse_document`` for timeout/error handling.
@@ -1210,10 +1291,10 @@ async def _do_parse(
     pipeline so retrieval behaves identically regardless of the original
     file format.
     """
-    # Pull bytes back out of GridFS.
-    fs = _gridfs()
-    stream = await fs.open_download_stream(gridfs_file_id)
-    data = await stream.read()
+    # Pull bytes off local SSD (post-2026-04-27 storage). Fall back to
+    # legacy GridFS only if `local_path` is empty/missing — for rows that
+    # haven't been migrated yet via scripts/migrate_user_kb_gridfs_to_disk.py.
+    data = await _load_blob(local_path, gridfs_file_id)
 
     settings = get_settings()
 
@@ -1763,9 +1844,9 @@ async def asr_recovery_sweep_loop(interval_seconds: int = 60) -> None:
 
     Lifecycle contract for an audio upload:
 
-    1. ``create_document`` writes bytes to GridFS + the documents row with
-       ``parse_status=pending`` — the user's file is safe regardless of
-       what happens next.
+    1. ``create_document`` writes bytes to local SSD + the documents row
+       with ``parse_status=pending`` — the user's file is safe regardless
+       of what happens next.
     2. ``schedule_parse`` fires ``_parse_audio`` → the ASR client. If the
        jumpbox tunnel is up, great: transcription proceeds.
     3. If the tunnel is DOWN, ``_parse_audio`` catches ``AsrUnavailable``
@@ -2051,14 +2132,14 @@ async def delete_documents_by_folder_ids(
     """Cascade-delete all documents whose folder_id is in the given list.
 
     Used by the folder-delete API after Postgres removes the folder rows.
-    Walks each doc so we can clean up GridFS + chunks + vectors too, not
-    just orphan the Mongo row.
+    Walks each doc so we can clean up disk + chunks + vectors + legacy
+    GridFS too, not just orphan the Mongo row.
     """
     if not folder_ids:
         return 0
     cursor = _docs().find(
         {"folder_id": {"$in": list(folder_ids)}},
-        {"_id": 1, "user_id": 1, "gridfs_file_id": 1},
+        {"_id": 1, "user_id": 1, "gridfs_file_id": 1, "local_path": 1},
     )
     deleted = 0
     async for row in cursor:
@@ -2074,15 +2155,12 @@ async def delete_documents_by_folder_ids(
                     "user_kb Milvus cleanup failed for %s during folder delete: %s",
                     doc_id_str, e,
                 )
-            gridfs_id = row.get("gridfs_file_id")
-            if gridfs_id is not None:
-                try:
-                    await _gridfs().delete(gridfs_id)
-                except Exception as e:
-                    logger.warning(
-                        "gridfs delete failed for %s during folder delete: %s",
-                        doc_id_str, e,
-                    )
+            await _delete_blob(
+                row.get("local_path") or "",
+                row.get("gridfs_file_id"),
+                doc_id_str,
+                "folder delete",
+            )
             await _docs().delete_one({"_id": row["_id"]})
             deleted += 1
         except Exception as e:
@@ -2139,9 +2217,10 @@ async def _get_document_content_scoped(
     """Internal: assemble full extracted text. ``user_id=None`` means no scope.
 
     Fallback: if the doc has no extracted text (parse failed / never ran) but
-    the original binary is still in GridFS, re-parse it inline so the chat
-    fetch tool returns *something* readable instead of empty. The result is
-    persisted back to ``extracted_text`` + chunked so the next read is fast.
+    the original binary is still on disk (or in legacy GridFS), re-parse it
+    inline so the chat fetch tool returns *something* readable instead of
+    empty. The result is persisted back to ``extracted_text`` + chunked so
+    the next read is fast.
     """
     try:
         oid = _oid(document_id)
@@ -2154,7 +2233,7 @@ async def _get_document_content_scoped(
         doc_filter,
         {"_id": 1, "num_chunks": 1, "extracted_text": 1,
          "extracted_char_count": 1, "user_id": 1, "gridfs_file_id": 1,
-         "original_filename": 1, "parse_status": 1},
+         "local_path": 1, "original_filename": 1, "parse_status": 1},
     )
     if row is None:
         return None
@@ -2163,7 +2242,7 @@ async def _get_document_content_scoped(
     if char_count <= len(inline):
         if inline.strip():
             return inline[:max_chars] if max_chars else inline
-        # extracted_text is empty — try chunks before falling back to GridFS.
+        # extracted_text is empty — try chunks before falling back to disk.
     # Reassemble from chunks. Always filter chunks by the owning user_id
     # (from the doc row, not the caller) so we don't leak a partial chunk
     # set if the chunks collection ever holds stray rows.
@@ -2181,32 +2260,21 @@ async def _get_document_content_scoped(
     if text.strip():
         return text[:max_chars] if max_chars else text
 
-    # Final fallback: re-parse the original from GridFS. Only triggers when
-    # extraction never produced searchable text (typical for PDFs whose JVM
-    # parse failed and pypdf wasn't tried at upload time, or for legacy
-    # pre-parser-rev rows). This path is bounded by the same caps as the
-    # upload-time parser via user_kb_parser.parse_file.
+    # Final fallback: re-parse the original from disk (or legacy GridFS for
+    # un-migrated rows). Only triggers when extraction never produced
+    # searchable text (typical for PDFs whose JVM parse failed and pypdf
+    # wasn't tried at upload time, or for legacy pre-parser-rev rows). Bounded
+    # by the same caps as the upload-time parser via user_kb_parser.parse_file.
+    local_path = row.get("local_path") or ""
     gridfs_file_id = row.get("gridfs_file_id")
     filename = row.get("original_filename") or ""
-    if not gridfs_file_id or not filename:
+    if not filename or (not local_path and not gridfs_file_id):
         return text or None
     try:
-        fs = _gridfs()
-        stream = await fs.open_download_stream(gridfs_file_id)
-        try:
-            data = await stream.read()
-        finally:
-            close_fn = getattr(stream, "close", None)
-            if callable(close_fn):
-                res = close_fn()
-                if hasattr(res, "__await__"):
-                    try:
-                        await res
-                    except Exception:
-                        pass
+        data = await _load_blob(local_path, gridfs_file_id)
     except Exception as e:
         logger.warning(
-            "user_kb inline reparse: GridFS read failed for %s: %s",
+            "user_kb inline reparse: blob read failed for %s: %s",
             document_id, e,
         )
         return text or None
@@ -2755,25 +2823,24 @@ async def delete_public_document(document_id: str) -> bool:
         await user_kb_vector.delete_by_document(str(oid))
     except Exception as e:
         logger.warning("user_kb Milvus delete failed (public) for %s: %s", oid, e)
-    gridfs_id = row.get("gridfs_file_id")
-    if gridfs_id is not None:
-        try:
-            await _gridfs().delete(gridfs_id)
-        except Exception as e:
-            logger.warning(
-                "gridfs delete failed (public) for %s: %s", oid, e,
-            )
+    await _delete_blob(
+        row.get("local_path") or "",
+        row.get("gridfs_file_id"),
+        str(oid),
+        "public delete",
+    )
     result = await _docs().delete_one({"_id": oid, "scope": SCOPE_PUBLIC})
     return result.deleted_count > 0
 
 
 async def delete_document(user_id: str, document_id: str) -> bool:
-    """Delete the document row, its chunks, and its GridFS binary.
+    """Delete the document row, its chunks, and its on-disk binary.
 
     Returns True if a row was deleted. Safe to call on a missing id — returns
-    False. The three writes are sequenced (chunks → gridfs → row) so a crash
-    mid-delete leaves the row as the authoritative "still exists" signal; the
-    recovery sweeper can retry.
+    False. The four writes are sequenced (chunks → vectors → blob → row) so
+    a crash mid-delete leaves the row as the authoritative "still exists"
+    signal; the recovery sweeper can retry. Legacy GridFS blobs (for
+    pre-2026-04-27 uploads) are also removed by ``_delete_blob``.
     """
     try:
         oid = _oid(document_id)
@@ -2790,16 +2857,12 @@ async def delete_document(user_id: str, document_id: str) -> bool:
         await user_kb_vector.delete_by_document(str(oid))
     except Exception as e:
         logger.warning("user_kb Milvus delete failed for doc=%s: %s", oid, e)
-    gridfs_id = row.get("gridfs_file_id")
-    if gridfs_id is not None:
-        try:
-            await _gridfs().delete(gridfs_id)
-        except Exception as e:
-            # Missing GridFS file is non-fatal — carry on deleting the row.
-            logger.warning(
-                "gridfs delete failed for doc=%s (gridfs=%s): %s",
-                document_id, gridfs_id, e,
-            )
+    await _delete_blob(
+        row.get("local_path") or "",
+        row.get("gridfs_file_id"),
+        document_id,
+        "user delete",
+    )
     result = await _docs().delete_one({"_id": oid, "user_id": user_id})
     return result.deleted_count > 0
 
@@ -2833,15 +2896,23 @@ async def reparse_document(user_id: str, document_id: str) -> bool:
 
 
 async def download_file(user_id: str, document_id: str) -> tuple[dict, bytes] | None:
-    """Return (meta, bytes) of the original upload so the API can stream it."""
+    """Return (meta, bytes) of the original upload so the API can stream it.
+
+    Disk-first; falls back to legacy GridFS for rows that haven't been
+    migrated. Returns ``None`` when neither source has the bytes (e.g.
+    markdown / sheet docs that never had an original binary).
+    """
     meta = await _docs().find_one({"_id": _oid(document_id), "user_id": user_id})
     if meta is None:
         return None
+    local_path = meta.get("local_path") or ""
     gridfs_id = meta.get("gridfs_file_id")
-    if not gridfs_id:
+    if not local_path and not gridfs_id:
         return None
-    stream = await _gridfs().open_download_stream(gridfs_id)
-    data = await stream.read()
+    try:
+        data = await _load_blob(local_path, gridfs_id)
+    except FileNotFoundError:
+        return None
     return meta, data
 
 

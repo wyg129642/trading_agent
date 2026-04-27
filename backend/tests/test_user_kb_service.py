@@ -9,6 +9,10 @@ Skipped automatically if local Mongo is unreachable.
 from __future__ import annotations
 
 import asyncio
+import shutil
+import tempfile
+from pathlib import Path
+
 import pytest
 import pytest_asyncio
 
@@ -41,7 +45,7 @@ USER_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def _isolated_db():
+async def _isolated_db(tmp_path_factory):
     """Drop + recreate the test DB around every test.
 
     Mongo's lru_cache'd Motor client is bound to the event loop of its first
@@ -53,6 +57,10 @@ async def _isolated_db():
     # production URI (which points at the shared ops cluster).
     settings.user_kb_mongo_uri = "mongodb://localhost:27017"
     settings.user_kb_mongo_db = TEST_DB_NAME
+    # Per-test temp dir for the on-disk binary store, so create_document
+    # never writes into the real /home/ygwang/crawl_data/user_kb_files tree.
+    disk_root = Path(tempfile.mkdtemp(prefix="user_kb_test_disk_"))
+    settings.user_kb_disk_root = str(disk_root)
 
     # Clear Motor client cache so it rebinds to this test's event loop.
     svc._clear_mongo_client_cache()
@@ -63,6 +71,7 @@ async def _isolated_db():
     yield
     await client.drop_database(TEST_DB_NAME)
     svc._clear_mongo_client_cache()
+    shutil.rmtree(disk_root, ignore_errors=True)
 
 
 # ── Small helpers ──────────────────────────────────────────────
