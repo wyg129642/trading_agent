@@ -245,32 +245,42 @@ async def execute_tool(
 
         if name == "user_kb_fetch_document":
             doc_id = (arguments.get("document_id") or "").strip()
-            if not doc_id:
-                if trace and hasattr(trace, "log_user_kb_request"):
-                    trace.log_user_kb_request(
-                        user_id=caller_user_id, query="(missing document_id)",
-                        top_k=0, tool_name="user_kb_fetch_document",
-                    )
-                return "user_kb_fetch_document 需要参数 document_id。"
             max_chars = int(arguments.get("max_chars") or 8000)
             max_chars = max(500, min(max_chars, 30_000))
+            if not doc_id:
+                if trace and hasattr(trace, "log_user_kb_fetch"):
+                    trace.log_user_kb_fetch(
+                        document_id="", max_chars=max_chars,
+                        result_len=0, error="missing document_id",
+                    )
+                return "user_kb_fetch_document 需要参数 document_id。"
             # Log the fetch request BEFORE doing IO so the audit timeline
             # captures every doc_id the LLM asked for, even if the fetch
-            # itself fails.
-            if trace and hasattr(trace, "log_user_kb_request"):
-                trace.log_user_kb_request(
-                    user_id=caller_user_id, query=f"fetch:{doc_id}", top_k=1,
-                    document_ids=[doc_id], tool_name="user_kb_fetch_document",
-                )
+            # itself fails. Pairs with a post-IO USER_KB_FETCH carrying
+            # result_len / error, mirroring the kb_fetch_document pattern.
+            if trace and hasattr(trace, "log_user_kb_fetch"):
+                trace.log_user_kb_fetch(document_id=doc_id, max_chars=max_chars)
             # Cross-user fetch — the chat tool is explicitly allowed to read
             # any team member's upload. HTTP management endpoints keep their
             # own user scoping.
             meta = await svc.get_any_document(doc_id)
             if meta is None:
+                if trace and hasattr(trace, "log_user_kb_fetch"):
+                    trace.log_user_kb_fetch(
+                        document_id=doc_id, max_chars=max_chars,
+                        result_len=0, error="document not found",
+                    )
                 return f"未找到 document_id={doc_id}。"
             text = await svc.get_any_document_content(doc_id, max_chars=max_chars)
             text = text or ""
-            return _format_fetch_result(meta, text, max_chars)
+            formatted = _format_fetch_result(meta, text, max_chars)
+            if trace and hasattr(trace, "log_user_kb_fetch"):
+                trace.log_user_kb_fetch(
+                    document_id=doc_id, max_chars=max_chars,
+                    result_len=len(formatted or ""),
+                    result_preview=(formatted or "")[:400],
+                )
+            return formatted
 
         return f"未知的 user_kb 工具: {name}"
 

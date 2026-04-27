@@ -343,20 +343,29 @@ function FetchDocumentResult({
   subEvents: AuditEvent[]
   result: string
 }) {
-  // KB_FETCH (new, kb_fetch_document) carries doc_id, source, sizes, error.
-  // Two events are emitted per fetch: one before the IO with just the
-  // request, one after with result_len/error. Prefer the after-event.
-  const fetches = subEvents.filter((e) => e.event_type === 'KB_FETCH')
+  // KB_FETCH / USER_KB_FETCH carry doc_id, source, sizes, error. Two events
+  // are emitted per fetch: one before the IO with just the request, one after
+  // with result_len/error. Prefer the after-event.
+  const fetches = subEvents.filter(
+    (e) => e.event_type === 'KB_FETCH' || e.event_type === 'USER_KB_FETCH',
+  )
   const fetchAfter = fetches.find((e) => (e.payload?.result_len ?? 0) > 0) || fetches[fetches.length - 1]
   const fetchBefore = fetches[0]
   const meta = fetchAfter?.payload || fetchBefore?.payload || {}
-  // Older runs may not have KB_FETCH — fall back to KB_REQUEST.
-  const legacyReq = subEvents.find((e) => e.event_type === 'KB_REQUEST')
+  // Older runs (or the pre-2026-04-27 user_kb path) may not have *_FETCH —
+  // fall back to KB_REQUEST / USER_KB_REQUEST which encoded the doc_id either
+  // as ``query="fetch:<id>"`` or in ``document_ids[0]``.
+  const legacyReq = subEvents.find(
+    (e) => e.event_type === 'KB_REQUEST' || e.event_type === 'USER_KB_REQUEST',
+  )
   const docId =
     meta.doc_id ||
     (legacyReq?.payload?.query?.startsWith('fetch:')
       ? String(legacyReq.payload.query).slice(6)
-      : '')
+      : '') ||
+    (Array.isArray(legacyReq?.payload?.document_ids) &&
+      legacyReq?.payload?.document_ids[0]) ||
+    ''
   const source = meta.source || (legacyReq?.payload?.sources || [])[0] || ''
 
   return (

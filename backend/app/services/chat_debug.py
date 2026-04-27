@@ -927,6 +927,38 @@ class ChatTrace:
             "round_num": rn,
         }, tool_name=tool_name, round_num=rn or None)
 
+    def log_user_kb_fetch(
+        self,
+        document_id: str,
+        max_chars: int = 0,
+        result_len: int = 0,
+        result_preview: str = "",
+        error: str = "",
+        round_num: int | None = None,
+    ):
+        """Log a user_kb_fetch_document call: doc_id, requested length, returned size.
+
+        Mirrors :meth:`log_kb_fetch` for the personal-KB tool so the audit UI can
+        show *which document* the LLM pulled, separate from the full body that's
+        already on the surrounding TOOL_EXEC_DONE event. Emitted twice per call
+        (before + after IO) so a fetch that errors out still leaves a doc_id on
+        the timeline.
+        """
+        rn = round_num if round_num is not None else _current_round_num_var.get()
+        _logger.info(
+            "%s | USER_KB_FETCH | doc_id=%s max_chars=%d result_len=%d round=%s%s",
+            self._prefix(), document_id, max_chars, result_len, rn,
+            f" error={_truncate(error, 200)}" if error else "",
+        )
+        self._emit("USER_KB_FETCH", {
+            "doc_id": document_id,
+            "max_chars": max_chars,
+            "result_len": result_len,
+            "result_preview": _truncate(result_preview, 800) if result_preview else "",
+            "error": error or "",
+            "round_num": rn,
+        }, tool_name="user_kb_fetch_document", round_num=rn or None)
+
     def log_kb_results(
         self,
         query: str,

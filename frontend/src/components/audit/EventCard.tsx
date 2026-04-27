@@ -37,8 +37,10 @@ const TYPE_META: Record<string, { color: string; icon: any; label: string }> = {
   WEBPAGE_READ: { color: '#7c3aed', icon: <GlobalOutlined />, label: '网页抓取' },
   KB_REQUEST: { color: '#0891b2', icon: <DatabaseOutlined />, label: '知识库查询' },
   KB_RESULTS: { color: '#0e7490', icon: <DatabaseOutlined />, label: '知识库结果' },
+  KB_FETCH: { color: '#0e7490', icon: <FileTextOutlined />, label: '知识库读取' },
   USER_KB_REQUEST: { color: '#0891b2', icon: <DatabaseOutlined />, label: '个人库查询' },
   USER_KB_RESULTS: { color: '#0e7490', icon: <DatabaseOutlined />, label: '个人库结果' },
+  USER_KB_FETCH: { color: '#0e7490', icon: <FileTextOutlined />, label: '个人库读取' },
   GEMINI_FUNC_CALLS: { color: '#10b981', icon: <ToolOutlined />, label: 'Gemini 函数调用' },
   GEMINI_GROUNDING: { color: '#0ea5e9', icon: <SearchOutlined />, label: 'Gemini Grounding' },
   ALPHAPAI_RESULTS: { color: '#0e7490', icon: <DatabaseOutlined />, label: 'AlphaPai 结果' },
@@ -93,6 +95,9 @@ function eventSummary(e: AuditEvent): string {
       return `"${truncate(p.query || '', 100)}" · tickers=${(p.tickers || []).join(',')} · top_k=${p.top_k}`
     case 'KB_RESULTS':
       return `${p.result_count} hits`
+    case 'KB_FETCH':
+    case 'USER_KB_FETCH':
+      return `doc_id=${truncate(p.doc_id || '', 80)} · max=${p.max_chars ?? 0} · returned=${p.result_len ?? 0}${p.error ? ' · ERROR' : ''}`
     case 'USER_KB_REQUEST':
       return `"${truncate(p.query || '', 100)}" · top_k=${p.top_k}`
     case 'USER_KB_RESULTS':

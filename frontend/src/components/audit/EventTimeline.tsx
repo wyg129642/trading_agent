@@ -34,8 +34,10 @@ const TOOL_TYPES = new Set([
   'WEBPAGE_READ',
   'KB_REQUEST',
   'KB_RESULTS',
+  'KB_FETCH',
   'USER_KB_REQUEST',
   'USER_KB_RESULTS',
+  'USER_KB_FETCH',
 ])
 const LLM_TYPES = new Set([
   'LLM_REQUEST',

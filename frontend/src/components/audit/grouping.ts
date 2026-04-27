@@ -70,6 +70,7 @@ const SUB_EVENT_TO_TOOL: Record<string, string[]> = {
   KB_FETCH: ['kb_fetch_document'],
   USER_KB_REQUEST: ['user_kb_search', 'user_kb_fetch_document'],
   USER_KB_RESULTS: ['user_kb_search', 'user_kb_fetch_document'],
+  USER_KB_FETCH: ['user_kb_fetch_document'],
   GEMINI_GROUNDING: ['web_search'],
 }
 
