@@ -513,7 +513,7 @@ async def get_report_pdf(
         err = doc.get("pdf_error") or "pdf_local_path 未记录 (PDF 未下载)"
         raise HTTPException(404, f"PDF not available: {err}")
 
-    # 2026-04-26: 本地 SSD → GridFS 的统一读取器（/mnt/share fallback 已退役）.
+    # 2026-04-27: 仅本地 SSD 读取 (GridFS fallback 已弃用, fs.files 已 drop).
     # 文件名用 title (去文件名不安全字符) + .pdf, 方便"另存为".
     title = (doc.get("title") or f"report-{item_id[:12]}")[:120]
     from ..services.pdf_storage import stream_pdf_or_file
@@ -617,7 +617,9 @@ async def _retry_pdf_download(
     *, db: AsyncIOMotorDatabase, item_id: str, raw_id: str,
     publish_time: str, title: str, pdf_root: str,
 ) -> dict:
-    """Single-shot re-fetch: detail/pdf → storage download → GridFS upload.
+    """Single-shot re-fetch: detail/pdf → storage download → local SSD.
+
+    GridFS mirror retired 2026-04-27 — disk is the only source of truth.
 
     Runs in a thread executor because the underlying crawl helpers are
     sync `requests` calls. Uses the same credentials.json the scraper does.
@@ -659,9 +661,8 @@ async def _retry_pdf_download(
             return {"ok": False, "stage": "download", "error": derr,
                     "relpath": relpath}
 
-        # Mirror to GridFS so subsequent reads via stream_pdf_or_file find it
-        # in the canonical store (not just on local disk).
-        from gridfs import GridFSBucket
+        # 本地 SSD 是 PDF 的唯一 source of truth (GridFS 已于 2026-04-27 弃用).
+        # stream_pdf_or_file 只读磁盘, 所以这里写盘成功即可, 不再镜像到 GridFS.
         from pymongo import MongoClient
         settings = get_settings()
         cli = MongoClient(settings.alphapai_mongo_uri,
@@ -669,31 +670,6 @@ async def _retry_pdf_download(
                           socketTimeoutMS=300000)
         try:
             sync_db = cli[settings.alphapai_mongo_db]
-            bucket = GridFSBucket(sync_db)
-            # filename = <root_basename>/<rel-from-root>, matching the
-            # migration script's convention (see pdf_storage._filename_for_pdf).
-            root = Path(pdf_root).resolve()
-            try:
-                rel_inside_root = dest.resolve().relative_to(root.parent)
-                gridfs_name = rel_inside_root.as_posix()
-            except ValueError:
-                gridfs_name = f"{root.name}/{dest.name}"
-            existing = sync_db["fs.files"].find_one(
-                {"filename": gridfs_name}, projection={"_id": 1})
-            if not existing:
-                with dest.open("rb") as fh:
-                    bucket.upload_from_stream(
-                        filename=gridfs_name, source=fh,
-                        chunk_size_bytes=1024 * 1024,
-                        metadata={
-                            "rel_path": gridfs_name,
-                            "platform_root": root.name,
-                            "size_bytes": size,
-                            "uploaded_via": "backend_pdf_retry",
-                        },
-                    )
-
-            # Update the doc so future requests hit the success path.
             sync_db["reports"].update_one(
                 {"_id": item_id},
                 {"$set": {

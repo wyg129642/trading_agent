@@ -393,13 +393,13 @@ def _coll(spec: CollectionSpec) -> AsyncIOMotorCollection:
 # PDF-bearing doc. New crawler rows land *before* the cron runs, so a fresh
 # doc may have `pdf_local_path` set with `pdf_text_md` still missing — and
 # `kb_fetch_document` would return empty text. This helper does an on-demand
-# pypdf parse from local disk or GridFS and writes back so the next read is
-# instant. Cheap path: pypdf only (no JVM); CPU-bound work runs in a thread.
+# pypdf parse from local disk and writes back so the next read is instant.
+# Cheap path: pypdf only (no JVM); CPU-bound work runs in a thread.
 
 # Map spec.db (LLM-facing label) → configured local PDF root(s). Used only
-# for resolving a stored `pdf_local_path` to its on-disk file or GridFS
-# filename. Some platforms have multiple roots (e.g. jinmen reports vs
-# oversea_reports go to different directories).
+# for resolving a stored `pdf_local_path` to its on-disk file. Some
+# platforms have multiple roots (e.g. jinmen reports vs oversea_reports
+# go to different directories).
 def _pdf_root_for(spec: "CollectionSpec") -> list[str]:
     settings = get_settings()
     # `getattr` for the optional jinmen_oversea_pdf_dir — older Settings
@@ -452,15 +452,16 @@ def _parse_pdf_bytes_with_pypdf(data: bytes) -> str:
 
 
 async def _read_pdf_bytes(spec: "CollectionSpec", pdf_local_path: str) -> bytes | None:
-    """Read PDF bytes from local SSD first, GridFS fallback.
+    """Read PDF bytes from local SSD. Returns None if the file is missing.
 
-    Mirrors the resolution order in `pdf_storage.stream_pdf_or_file`. Returns
-    None when the file is missing in both places — the most common cause for
-    a doc with `pdf_local_path` but no `pdf_text_md` is that the scraper
-    recorded the path but the binary itself never landed on this host.
+    GridFS fallback retired 2026-04-27 — the 5 crawler DBs' fs.files /
+    fs.chunks were dropped after 35 710 PDFs were md5-verified extracted
+    to local SSD. A missing file here means the scraper recorded a
+    `pdf_local_path` but never successfully downloaded the binary; chat
+    falls back to whatever pre-extracted `pdf_text_md` is on the doc.
     """
     from pathlib import Path
-    from .pdf_storage import _filename_for_pdf, _normalize_roots
+    from .pdf_storage import _normalize_roots
 
     pdf_root = _pdf_root_for(spec)
     if not pdf_root:
@@ -469,7 +470,6 @@ async def _read_pdf_bytes(spec: "CollectionSpec", pdf_local_path: str) -> bytes 
     if not roots:
         return None
 
-    # 1) local disk
     p = Path(pdf_local_path)
     candidates: list[Path] = []
     if p.is_absolute():
@@ -493,48 +493,6 @@ async def _read_pdf_bytes(spec: "CollectionSpec", pdf_local_path: str) -> bytes 
                 return await asyncio.to_thread(cand.read_bytes)
         except Exception as e:
             logger.warning("inline pdf disk read failed for %s: %s", cand, e)
-
-    # 2) GridFS — same DB as the doc
-    try:
-        from motor.motor_asyncio import AsyncIOMotorGridFSBucket
-        db = _get_client()[mongo_db_name_for(spec)]
-        bucket = AsyncIOMotorGridFSBucket(db)
-        gridfs_name = _filename_for_pdf(pdf_local_path, roots)
-        cursor = bucket.find({"filename": gridfs_name}, limit=1)
-        async for fdoc in cursor:
-            length = getattr(fdoc, "length", 0) or 0
-            if length and length > _INLINE_PDF_MAX_BYTES:
-                logger.info(
-                    "inline pdf parse skipped — gridfs too large (%d bytes): %s",
-                    length, gridfs_name,
-                )
-                return None
-            stream = await bucket.open_download_stream(fdoc._id)
-            try:
-                buf = bytearray()
-                while True:
-                    chunk = await stream.readchunk()
-                    if not chunk:
-                        break
-                    buf.extend(chunk)
-                    if len(buf) > _INLINE_PDF_MAX_BYTES:
-                        logger.info(
-                            "inline pdf parse aborted — gridfs stream exceeded cap: %s",
-                            gridfs_name,
-                        )
-                        return None
-            finally:
-                close_fn = getattr(stream, "close", None)
-                if callable(close_fn):
-                    res = close_fn()
-                    if hasattr(res, "__await__"):
-                        try:
-                            await res
-                        except Exception:
-                            pass
-            return bytes(buf)
-    except Exception as e:
-        logger.warning("inline pdf gridfs lookup failed: %s", e)
     return None
 
 

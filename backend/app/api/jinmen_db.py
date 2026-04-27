@@ -604,36 +604,23 @@ async def get_report_pdf(
     if not doc:
         raise HTTPException(404, "Report not found")
 
-    # 先查本地 SSD / GridFS, miss 时才走 _ensure_local_pdf 源头回源
-    from ..services.pdf_storage import stream_pdf_or_file, _filename_for_pdf
+    # 本地 SSD 命中 → FileResponse; miss → 上游回源 + 落盘 + 服务.
+    # GridFS 已于 2026-04-27 弃用 (35 710 文件已 md5-verified 全量落盘, fs.files 已 drop).
+    from ..services.pdf_storage import stream_pdf_or_file
     settings = get_settings()
-    pdf_roots = [settings.jinmen_pdf_dir, settings.jinmen_oversea_pdf_dir]
+    pdf_roots = [settings.jinmen_pdf_dir,
+                 getattr(settings, "jinmen_oversea_pdf_dir", "")]
     rel_from_doc = doc.get("pdf_local_path")
-    if rel_from_doc:
-        # 本地 SSD 命中是最快路径; 优先尝试.
-        if Path(rel_from_doc).is_file():
-            title = (doc.get("title") or f"jinmen-{report_id}")[:120]
-            return await stream_pdf_or_file(
-                db=_db(),
-                pdf_rel_path=rel_from_doc,
-                pdf_root=pdf_roots,
-                download_filename=title,
-                download=bool(download),
-            )
-        # 本地 miss → 看 GridFS 有没有 (慢, 但比上游回源快得多).
-        gfs_name = _filename_for_pdf(rel_from_doc, pdf_roots)
-        existing = await _db()["fs.files"].find_one(
-            {"filename": gfs_name}, projection={"_id": 1})
-        if existing:
-            title = (doc.get("title") or f"jinmen-{report_id}")[:120]
-            return await stream_pdf_or_file(
-                db=_db(),
-                pdf_rel_path=rel_from_doc,
-                pdf_root=pdf_roots,
-                download_filename=title,
-                download=bool(download),
-            )
-    # 本地 + GridFS 都 miss → 维持原路径: 上游回源 + 落盘 + 本地流
+    if rel_from_doc and Path(rel_from_doc).is_file():
+        title = (doc.get("title") or f"jinmen-{report_id}")[:120]
+        return await stream_pdf_or_file(
+            db=_db(),
+            pdf_rel_path=rel_from_doc,
+            pdf_root=pdf_roots,
+            download_filename=title,
+            download=bool(download),
+        )
+    # 本地 miss → 上游回源 + 落盘 + 本地流
     target = await _ensure_local_pdf(coll_name, doc)
     title = (doc.get("title") or target.stem)[:120]
     return await stream_pdf_or_file(
@@ -825,34 +812,23 @@ async def get_oversea_report_pdf(
     if not doc:
         raise HTTPException(404, "Oversea report not found")
 
-    from ..services.pdf_storage import stream_pdf_or_file, _filename_for_pdf
+    # 本地 SSD 命中 → FileResponse; miss → 上游回源 + 落盘. GridFS 已弃用 (2026-04-27).
+    # oversea_reports 历史 pdf_local_path 走 overseas_pdf, 必须和 jinmen_pdfs 一起放进
+    # root list, 否则 _is_under 校验拒读本地文件.
+    from ..services.pdf_storage import stream_pdf_or_file
     settings = get_settings()
-    pdf_roots = [settings.jinmen_pdf_dir, settings.jinmen_oversea_pdf_dir]
+    pdf_roots = [settings.jinmen_pdf_dir,
+                 getattr(settings, "jinmen_oversea_pdf_dir", "")]
     rel_from_doc = doc.get("pdf_local_path")
-    if rel_from_doc:
-        # 本地 SSD 命中是最快路径; oversea_reports 历史 pdf_local_path 走 overseas_pdf,
-        # 必须把它和 jinmen_pdfs 一起放进 root list, 否则 _is_under 校验拒读.
-        if Path(rel_from_doc).is_file():
-            title = (doc.get("title") or f"jinmen-oversea-{report_id}")[:120]
-            return await stream_pdf_or_file(
-                db=_db(),
-                pdf_rel_path=rel_from_doc,
-                pdf_root=pdf_roots,
-                download_filename=title,
-                download=bool(download),
-            )
-        gfs_name = _filename_for_pdf(rel_from_doc, pdf_roots)
-        existing = await _db()["fs.files"].find_one(
-            {"filename": gfs_name}, projection={"_id": 1})
-        if existing:
-            title = (doc.get("title") or f"jinmen-oversea-{report_id}")[:120]
-            return await stream_pdf_or_file(
-                db=_db(),
-                pdf_rel_path=rel_from_doc,
-                pdf_root=pdf_roots,
-                download_filename=title,
-                download=bool(download),
-            )
+    if rel_from_doc and Path(rel_from_doc).is_file():
+        title = (doc.get("title") or f"jinmen-oversea-{report_id}")[:120]
+        return await stream_pdf_or_file(
+            db=_db(),
+            pdf_rel_path=rel_from_doc,
+            pdf_root=pdf_roots,
+            download_filename=title,
+            download=bool(download),
+        )
     target = await _ensure_local_pdf(coll_name, doc)
     title = (doc.get("title") or target.stem)[:120]
     return await stream_pdf_or_file(
