@@ -2032,7 +2032,13 @@ async def _get_document_content_scoped(
     max_chars: int | None,
     user_id: str | None = None,
 ) -> str | None:
-    """Internal: assemble full extracted text. ``user_id=None`` means no scope."""
+    """Internal: assemble full extracted text. ``user_id=None`` means no scope.
+
+    Fallback: if the doc has no extracted text (parse failed / never ran) but
+    the original binary is still in GridFS, re-parse it inline so the chat
+    fetch tool returns *something* readable instead of empty. The result is
+    persisted back to ``extracted_text`` + chunked so the next read is fast.
+    """
     try:
         oid = _oid(document_id)
     except ValueError:
@@ -2043,14 +2049,17 @@ async def _get_document_content_scoped(
     row = await _docs().find_one(
         doc_filter,
         {"_id": 1, "num_chunks": 1, "extracted_text": 1,
-         "extracted_char_count": 1, "user_id": 1},
+         "extracted_char_count": 1, "user_id": 1, "gridfs_file_id": 1,
+         "original_filename": 1, "parse_status": 1},
     )
     if row is None:
         return None
     char_count = int(row.get("extracted_char_count") or 0)
     inline = row.get("extracted_text") or ""
     if char_count <= len(inline):
-        return inline[:max_chars] if max_chars else inline
+        if inline.strip():
+            return inline[:max_chars] if max_chars else inline
+        # extracted_text is empty — try chunks before falling back to GridFS.
     # Reassemble from chunks. Always filter chunks by the owning user_id
     # (from the doc row, not the caller) so we don't leak a partial chunk
     # set if the chunks collection ever holds stray rows.
@@ -2065,7 +2074,71 @@ async def _get_document_content_scoped(
         if max_chars and sum(len(p) for p in parts) >= max_chars:
             break
     text = "\n\n".join(parts)
-    return text[:max_chars] if max_chars else text
+    if text.strip():
+        return text[:max_chars] if max_chars else text
+
+    # Final fallback: re-parse the original from GridFS. Only triggers when
+    # extraction never produced searchable text (typical for PDFs whose JVM
+    # parse failed and pypdf wasn't tried at upload time, or for legacy
+    # pre-parser-rev rows). This path is bounded by the same caps as the
+    # upload-time parser via user_kb_parser.parse_file.
+    gridfs_file_id = row.get("gridfs_file_id")
+    filename = row.get("original_filename") or ""
+    if not gridfs_file_id or not filename:
+        return text or None
+    try:
+        fs = _gridfs()
+        stream = await fs.open_download_stream(gridfs_file_id)
+        try:
+            data = await stream.read()
+        finally:
+            close_fn = getattr(stream, "close", None)
+            if callable(close_fn):
+                res = close_fn()
+                if hasattr(res, "__await__"):
+                    try:
+                        await res
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.warning(
+            "user_kb inline reparse: GridFS read failed for %s: %s",
+            document_id, e,
+        )
+        return text or None
+
+    try:
+        result = await asyncio.to_thread(user_kb_parser.parse_file, filename, data)
+    except Exception as e:
+        logger.warning(
+            "user_kb inline reparse: parser failed for %s (%s): %s",
+            document_id, filename, e,
+        )
+        return text or None
+    extracted = (result.text or "").strip()
+    if not extracted:
+        return text or None
+
+    # Persist back so subsequent fetches are instant. Failure to persist is
+    # non-fatal — we still return the text to the caller for this request.
+    try:
+        await _docs().update_one(
+            {"_id": oid},
+            {"$set": {
+                "extracted_text": extracted[:_INLINE_TEXT_MAX_CHARS],
+                "extracted_char_count": len(extracted),
+                "parser_backend": result.parser,
+                "parse_status": ParseStatus.COMPLETED,
+                "parse_error": None,
+                "updated_at": _now(),
+            }},
+        )
+    except Exception as e:
+        logger.warning(
+            "user_kb inline reparse: persist failed for %s: %s",
+            document_id, e,
+        )
+    return extracted[:max_chars] if max_chars else extracted
 
 
 async def generate_audio_summary(

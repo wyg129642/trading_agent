@@ -120,15 +120,27 @@ _RESEARCH_STRATEGY_PROMPT = """## 深度研究策略（务必遵守）
 
 做个股/行业深度研究时，按"**并行多路召回 → 读原文 → 补强 → 写报告**"四步法，避免停留在摘要层面。
 
+### 检索工具优先级（强制——每轮调用都要遵循）
+研究类问题每一轮工具调用都必须按以下顺序覆盖三层信息源；前两层为**强制并行调用**，第三层为补充：
+
+1. **`user_kb_search`（最高优先级·团队共享个人库）**——团队全员上传的私有研究/纪要/调研笔记/数据表/录音转写。跨用户共享，可能含独家内部资料。
+2. **`kb_search`（公司聚合外部库）**——8 个外部投研平台聚合的公开研报/纪要/点评/专家访谈。
+3. **`web_search`（最后补充）**——前两步均未覆盖的公开新闻/宏观/最新事件。
+
+**强制规则**：
+- **每一轮**工具调用都必须**同时**发起 `user_kb_search` + `kb_search`，二者互为补充（团队私藏 vs. 公开聚合），缺一不可。
+- 即便你认为问题更适合公开数据，也不得跳过 user_kb_search——团队可能正好上传过最贴近的内部资料。
+- 二者并行调用，总延迟 ≈ 慢者，对响应时间几乎无影响。
+
 ### 步骤1｜第一轮：并行多路召回（关键：同一轮内并发）
 **必须在同一轮内同时发起多个工具调用**（现代 LLM 支持 parallel tool calling——多个 tool_calls 放在同一条 assistant 消息里），以压缩等待时间并保证多视角覆盖：
 
-- `kb_search`（**主力检索**）：并发发起 2–4 次，组合不同策略：
+- `user_kb_search`（**最高优先**）：并发发起 1–2 次，覆盖团队所有成员上传的内部资料。中文 query + 关键词，必要时英文版本。
+- `kb_search`（**外部聚合库**）：并发发起 2–4 次，组合不同策略：
   - 中文 query + tickers 筛选（覆盖国内券商、纪要、点评）
   - 英文 query + tickers 筛选（覆盖海外研报、外资视角）
   - 子议题 query 拆分（业务/财务/产能/客户各查一次）
   - 必须附带 `date_range` 以约束时效（涉及"最新/近期"时，gte 取最近 6–12 个月）
-- `user_kb_search`（若启用）：并发发起 1 次，检索团队私人上传（可能有未公开的内部资料）
 - `web_search`：并发发起 1–2 次，中英双语关键词，捕获最新新闻与宏观事件
 
 > 并行的好处：总延迟约等于最慢工具的单次延迟，而非各工具之和。
@@ -136,15 +148,16 @@ _RESEARCH_STRATEGY_PROMPT = """## 深度研究策略（务必遵守）
 ### 步骤2｜必须进入"读原文"阶段（极其重要）
 第一轮召回返回后，**不得直接写报告**。扫描命中列表，挑出 2–4 个最硬核的结果读原文：
 
-- 对 `kb_search` / `user_kb_search` 高相关命中 → 调 `kb_fetch_document(doc_id=...)` 读完整原文
+- 对 `user_kb_search` 高相关命中 → 调 `user_kb_fetch_document(document_id=...)` 读完整原文（**自动包含 PDF 解析后的全文**）
+- 对 `kb_search` 高相关命中 → 调 `kb_fetch_document(doc_id=...)` 读完整原文（**自动包含 PDF 解析后的全文**——研报 PDF 文本已离线提取，缺失时后端会实时回退到内联解析）
 - 对 `web_search` 硬核 URL（公告详情页、pdf.dfcfw.com 研报、IR 页）→ 调 `read_webpage(url=...)`
 
-优先级：官方公告 / 定期报告 PDF > 券商深度研报全文 > 业绩交流/路演纪要 > 权威财经新闻；避开百家号、SEO 聚合站、纯索引页。
+优先级：团队内部纪要/调研 PDF > 官方公告 / 定期报告 PDF > 券商深度研报全文 > 业绩交流/路演纪要 > 权威财经新闻；避开百家号、SEO 聚合站、纯索引页。
 
-### 步骤3｜第二轮：针对性补强（仍可并行）
+### 步骤3｜第二轮：针对性补强（仍可并行；仍需 user_kb + kb 双召回）
 基于第一轮 + 深读的结果，用更具体的 query 补漏，同样并行发起：
-- 出现的子业务/客户/竞品名 → 新 `kb_search` 精准检索
-- 发现关键数字但无上下文 → `kb_fetch_document` 回到原文
+- 出现的子业务/客户/竞品名 → 同时发起 `user_kb_search` + `kb_search` 精准检索
+- 发现关键数字但无上下文 → `kb_fetch_document` / `user_kb_fetch_document` 回到原文
 - 跨时间对比缺数据 → `kb_list_facets(dimension='date_histogram')` 看分布再分时段检索
 - 行业对标缺海外视角 → `web_search` 英文或 `kb_search` 限定 `sources=['jinmen']`（海外研报覆盖）
 
@@ -156,10 +169,11 @@ _RESEARCH_STRATEGY_PROMPT = """## 深度研究策略（务必遵守）
 - 字数 4000+ 字；不要为懒而压缩
 
 ### 禁止
+- **跳过 `user_kb_search`**：每轮必须并行调用 user_kb_search + kb_search，二者缺一不可
 - **在一轮里串行发起多个 kb_search**：必须把它们放进同一个 assistant 消息的 `tool_calls` 数组里并行执行
-- 跳过 `kb_fetch_document` / `read_webpage` 直接写报告（研究深度严重不足）
+- 跳过 `kb_fetch_document` / `user_kb_fetch_document` / `read_webpage` 直接写报告（研究深度严重不足）
 - 反复用近义 query 重复调用（浪费 round budget；应改变维度：不同 ticker / 不同日期段 / 不同子议题）
-- 只调 `web_search` 不调 `kb_search`（本地聚合库的专业投研数据质量远高于公网，必须优先）"""
+- 只调 `web_search` 不调 `kb_search` / `user_kb_search`（本地知识库质量远高于公网，必须优先）"""
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "chat_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -696,14 +710,24 @@ async def send_message_stream(
     # intentionally do NOT call them any more to keep the system prompt clean
     # and avoid misleading the LLM about tool availability.
 
-    if kb_effective:
+    # Knowledge bases are now a *paired* surface: per-round dual call is the
+    # mandated research pattern (user_kb_search + kb_search in parallel). When
+    # the user has either KB toggle on, we wire up BOTH tools so the LLM can
+    # actually obey the prompt — toggling only one off would force the prompt
+    # to lie about what's available. The user's explicit toggle still controls
+    # whether the corresponding system-prompt section is injected, so an
+    # all-off path stays clean.
+    user_kb_effective = bool(body.user_kb_enabled or kb_effective)
+
+    if kb_effective or user_kb_effective:
         system_prompt = (system_prompt + "\n\n" + KB_SYSTEM_PROMPT).strip()
         all_tools.extend(KB_TOOLS)
-    if body.user_kb_enabled:
+    if user_kb_effective:
         system_prompt = (system_prompt + "\n\n" + USER_KB_SYSTEM_PROMPT).strip()
         all_tools.extend(USER_KB_TOOLS)
-        # Bind the user id for the tool dispatcher. Tools read this via
-        # user_kb_service.get_current_user_id() so searches are scoped.
+        # Bind the user id for the tool dispatcher. Even though search/fetch
+        # are team-shared (no user_id filter applied), the contextvar is read
+        # by audit logging to attribute the call to the requesting user.
         _user_kb_svc.set_current_user_id(str(user.id))
 
     # Revenue-modeling trigger tool — always available so the chat can
@@ -711,8 +735,10 @@ async def send_message_stream(
     system_prompt = (system_prompt + "\n\n" + TRIGGER_REVENUE_MODEL_SYSTEM_PROMPT).strip()
     all_tools.extend(TRIGGER_REVENUE_MODEL_TOOLS)
 
-    # Add research strategy guidance whenever the aggregated KB is wired in.
-    if kb_effective:
+    # Add research strategy guidance whenever any KB is wired in. The strategy
+    # prompt mandates per-round dual KB calls, so it must be present whenever
+    # *either* knowledge base is available.
+    if kb_effective or user_kb_effective:
         system_prompt = (system_prompt + "\n\n" + _RESEARCH_STRATEGY_PROMPT).strip()
 
     # Time-awareness: any tool that returns dated content needs this guidance.
@@ -721,7 +747,7 @@ async def send_message_stream(
     if (
         body.web_search in ("on", "auto")
         or kb_effective
-        or body.user_kb_enabled
+        or user_kb_effective
     ):
         system_prompt = (system_prompt + "\n\n" + _build_time_awareness_prompt()).strip()
 
@@ -1143,10 +1169,15 @@ async def regenerate_message_stream(
     if body.jinmen_enabled:
         system_prompt = (system_prompt + "\n\n" + JINMEN_SYSTEM_PROMPT).strip()
         all_tools.extend(JINMEN_TOOLS)
-    if body.kb_enabled:
+
+    # Same paired-KB wiring as send_message_stream — see the comment there for
+    # why both KB toolsets get exposed when either toggle is on.
+    kb_effective = bool(body.kb_enabled or body.alphapai_enabled or body.jinmen_enabled)
+    user_kb_effective = bool(body.user_kb_enabled or kb_effective)
+    if kb_effective or user_kb_effective:
         system_prompt = (system_prompt + "\n\n" + KB_SYSTEM_PROMPT).strip()
         all_tools.extend(KB_TOOLS)
-    if body.user_kb_enabled:
+    if user_kb_effective:
         system_prompt = (system_prompt + "\n\n" + USER_KB_SYSTEM_PROMPT).strip()
         all_tools.extend(USER_KB_TOOLS)
         _user_kb_svc.set_current_user_id(str(user.id))

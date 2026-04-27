@@ -387,6 +387,194 @@ def _coll(spec: CollectionSpec) -> AsyncIOMotorCollection:
     return _get_client()[mongo_db_name_for(spec)][spec.collection]
 
 
+# ── Inline PDF extraction fallback ──────────────────────────────
+#
+# The cron job `scripts/extract_pdf_texts.py` writes `pdf_text_md` for every
+# PDF-bearing doc. New crawler rows land *before* the cron runs, so a fresh
+# doc may have `pdf_local_path` set with `pdf_text_md` still missing — and
+# `kb_fetch_document` would return empty text. This helper does an on-demand
+# pypdf parse from local disk or GridFS and writes back so the next read is
+# instant. Cheap path: pypdf only (no JVM); CPU-bound work runs in a thread.
+
+# Map spec.db (LLM-facing label) → configured local PDF root(s). Used only
+# for resolving a stored `pdf_local_path` to its on-disk file or GridFS
+# filename. Some platforms have multiple roots (e.g. jinmen reports vs
+# oversea_reports go to different directories).
+def _pdf_root_for(spec: "CollectionSpec") -> list[str]:
+    settings = get_settings()
+    table: dict[str, list[str]] = {
+        "alphapai":    [settings.alphapai_pdf_dir],
+        "jinmen":      [settings.jinmen_pdf_dir, settings.jinmen_oversea_pdf_dir],
+        "meritco":     [settings.meritco_pdf_dir],
+        "gangtise":    [settings.gangtise_pdf_dir],
+        "alphaengine": [settings.alphaengine_pdf_dir],
+        "acecamp":     [settings.acecamp_pdf_dir],
+    }
+    return [r for r in table.get(spec.db, []) if r]
+
+
+# Hard cap so a 50 MB scan-image PDF can't tie up uvicorn for minutes.
+_INLINE_PDF_MAX_BYTES = 30 * 1024 * 1024
+_INLINE_PDF_MAX_TEXT_BYTES = 5_000_000
+
+
+def _parse_pdf_bytes_with_pypdf(data: bytes) -> str:
+    """pypdf-only synchronous parse. Returns extracted text or '' on failure."""
+    try:
+        from io import BytesIO
+        from pypdf import PdfReader
+    except Exception as e:
+        logger.warning("inline pypdf unavailable: %s", e)
+        return ""
+    try:
+        reader = PdfReader(BytesIO(data))
+    except Exception as e:
+        logger.warning("inline pypdf open failed: %s", e)
+        return ""
+    parts: list[str] = []
+    for i, page in enumerate(reader.pages):
+        try:
+            t = page.extract_text() or ""
+        except Exception as e:
+            logger.warning("inline pypdf page %d failed: %s", i, e)
+            continue
+        if t.strip():
+            parts.append(t)
+    return "\n\n".join(parts)
+
+
+async def _read_pdf_bytes(spec: "CollectionSpec", pdf_local_path: str) -> bytes | None:
+    """Read PDF bytes from local SSD first, GridFS fallback.
+
+    Mirrors the resolution order in `pdf_storage.stream_pdf_or_file`. Returns
+    None when the file is missing in both places — the most common cause for
+    a doc with `pdf_local_path` but no `pdf_text_md` is that the scraper
+    recorded the path but the binary itself never landed on this host.
+    """
+    from pathlib import Path
+    from .pdf_storage import _filename_for_pdf, _normalize_roots
+
+    pdf_root = _pdf_root_for(spec)
+    if not pdf_root:
+        return None
+    roots = _normalize_roots(pdf_root)
+    if not roots:
+        return None
+
+    # 1) local disk
+    p = Path(pdf_local_path)
+    candidates: list[Path] = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        for root in roots:
+            if p.parts and p.parts[0] == root.name:
+                candidates.append(root.parent / p)
+            else:
+                candidates.append(root / p)
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                size = cand.stat().st_size
+                if size > _INLINE_PDF_MAX_BYTES:
+                    logger.info(
+                        "inline pdf parse skipped — too large (%d bytes): %s",
+                        size, cand,
+                    )
+                    return None
+                return await asyncio.to_thread(cand.read_bytes)
+        except Exception as e:
+            logger.warning("inline pdf disk read failed for %s: %s", cand, e)
+
+    # 2) GridFS — same DB as the doc
+    try:
+        from motor.motor_asyncio import AsyncIOMotorGridFSBucket
+        db = _get_client()[mongo_db_name_for(spec)]
+        bucket = AsyncIOMotorGridFSBucket(db)
+        gridfs_name = _filename_for_pdf(pdf_local_path, roots)
+        cursor = bucket.find({"filename": gridfs_name}, limit=1)
+        async for fdoc in cursor:
+            length = getattr(fdoc, "length", 0) or 0
+            if length and length > _INLINE_PDF_MAX_BYTES:
+                logger.info(
+                    "inline pdf parse skipped — gridfs too large (%d bytes): %s",
+                    length, gridfs_name,
+                )
+                return None
+            stream = await bucket.open_download_stream(fdoc._id)
+            try:
+                buf = bytearray()
+                while True:
+                    chunk = await stream.readchunk()
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    if len(buf) > _INLINE_PDF_MAX_BYTES:
+                        logger.info(
+                            "inline pdf parse aborted — gridfs stream exceeded cap: %s",
+                            gridfs_name,
+                        )
+                        return None
+            finally:
+                close_fn = getattr(stream, "close", None)
+                if callable(close_fn):
+                    res = close_fn()
+                    if hasattr(res, "__await__"):
+                        try:
+                            await res
+                        except Exception:
+                            pass
+            return bytes(buf)
+    except Exception as e:
+        logger.warning("inline pdf gridfs lookup failed: %s", e)
+    return None
+
+
+async def _ensure_pdf_text(spec: "CollectionSpec", doc: dict) -> str:
+    """Return PDF-extracted text, parsing inline + persisting back if needed.
+
+    The happy path (cron has populated `pdf_text_md`) returns immediately.
+    The fallback path runs only when a doc has a PDF locator but no
+    extracted text yet — typical for fresh crawler rows seen before the
+    nightly extract_pdf_texts.py run. The result is written to Mongo so
+    subsequent fetches read instantly.
+    """
+    if not (spec.has_pdf and isinstance(doc, dict)):
+        return ""
+    existing = doc.get("pdf_text_md")
+    if isinstance(existing, str) and existing.strip():
+        return existing
+    pdf_local_path = doc.get("pdf_local_path")
+    if not isinstance(pdf_local_path, str) or not pdf_local_path:
+        return ""
+    data = await _read_pdf_bytes(spec, pdf_local_path)
+    if not data:
+        return ""
+    text = await asyncio.to_thread(_parse_pdf_bytes_with_pypdf, data)
+    if not text or not text.strip():
+        return ""
+    encoded = text.encode("utf-8", errors="replace")
+    truncated = False
+    if len(encoded) > _INLINE_PDF_MAX_TEXT_BYTES:
+        text = encoded[:_INLINE_PDF_MAX_TEXT_BYTES].decode("utf-8", errors="replace")
+        truncated = True
+    update_set: dict[str, Any] = {
+        "pdf_text_md": text,
+        "pdf_text_len": len(text),
+        "pdf_parser": "inline-pypdf",
+        "pdf_text_extracted_at": datetime.now(timezone.utc),
+    }
+    if truncated:
+        update_set["pdf_text_truncated"] = True
+    try:
+        await _coll(spec).update_one({"_id": doc["_id"]}, {"$set": update_set})
+    except Exception as e:
+        logger.warning(
+            "inline pdf persist failed (returning text anyway): %s", e,
+        )
+    return text
+
+
 # ── Ticker normalization ─────────────────────────────────────────
 
 
@@ -1135,6 +1323,14 @@ async def fetch_document(
         return {"found": False, "doc_id": doc_id, "error": "not found"}
 
     text = _extract_text(spec, doc)
+    # Inline PDF fallback: PDF-bearing collections list `pdf_text_md` first in
+    # text_fields but the cron may not have populated it yet. If we got nothing
+    # (or only a one-line stub) AND the doc has a PDF locator, parse on demand.
+    if spec.has_pdf and len(text) < 200 and doc.get("pdf_local_path"):
+        pdf_text = await _ensure_pdf_text(spec, doc)
+        if pdf_text and len(pdf_text) > len(text):
+            text = pdf_text
+            doc["pdf_text_md"] = pdf_text  # so subsequent _extract_text sees it
     full_len = len(text)
 
     # Locate snippet in the full text before truncation so the snippet
@@ -1559,10 +1755,17 @@ KB_TOOLS = [
 
 
 KB_SYSTEM_PROMPT = (
-    "## 公司聚合投研知识库（kb_search — 唯一的本地投研检索工具）\n\n"
-    "本平台已将所有 8 个外部平台的全量投研数据同步到本地聚合库，**请统一使用 `kb_search`** 检索，"
-    "**不要再调用** `alphapai_recall` / `jinmen_*` 等外部 API 工具（相关数据已全部落地到本库，"
+    "## 公司聚合投研知识库（kb_search — 外部 8 个平台聚合检索）\n\n"
+    "本平台将 8 个外部投研平台的全量数据同步到本地聚合库，统一通过 `kb_search` 检索，"
+    "**不要再调用** `alphapai_recall` / `jinmen_*` 等外部 API（相关数据已全部落地到本库，"
     "且外部工具已停用）。\n\n"
+    "### 检索优先级（强制——研究类问题严格遵守）\n"
+    "**每轮工具调用必须并行发起 `user_kb_search` + `kb_search`**，二者互补：\n"
+    "1. **`user_kb_search`（最高优先级）**——团队成员私有上传（内部纪要/调研笔记/专家访谈/数据表/录音）\n"
+    "2. **`kb_search`（本工具）**——公司聚合的 8 个外部平台公开投研数据\n"
+    "3. **`web_search`（最后补充）**——上述两者均未覆盖的公开新闻/宏观/最新事件\n\n"
+    "**禁止**只调 `kb_search` 不调 `user_kb_search`——团队可能存有相关内部研究，"
+    "跳过会丢失独家信息。两者并行调用，总延迟约等于慢者，不会拖慢响应。\n\n"
     "### 覆盖内容\n"
     "- Alpha派：券商点评 / 券商研报 / 路演纪要\n"
     "- 进门财经：会议纪要 / 研报 / 海外研报\n"
@@ -1578,23 +1781,18 @@ KB_SYSTEM_PROMPT = (
     "2. **关键词 BM25**（Milvus Function API + Mongo 字符 bigram 回退）—— 擅长专业术语、公司名、产品型号、"
     "代码等精确命中。\n\n"
     "### 使用规则\n"
-    "1. **必须先调用 `kb_search`** 处理所有涉及个股、行业、业绩、管理层观点、财务拆分、产能、客户、"
-    "估值等投研问题；本库质量和时效性都高于公开网页。\n"
+    "1. **配合 user_kb_search 同轮并行**（最重要）——研究类问题必须二者同时发起，不要串行。\n"
     "2. **时间筛选**：涉及'最新/近期/本季度/最近 X 个月'等时效问题时，**必须传 `date_range.gte/lte`**，"
     "例如 `date_range={'gte':'2025-10-01','lte':'2026-04-24'}`——否则会把 3 年前的旧研报和最新"
     "数据混在一起降低准确性。跨多季度对比时可先用 `kb_list_facets(dimension='date_histogram', ...)` "
     "确认数据分布，再分时间段检索。\n"
-    "3. **并行多角度搜索**（关键）：一轮内应并行发起 **2–4 个** 不同 query / 不同筛选组合的 kb_search，"
-    "例如同时发：\n"
-    "   - 中文关键词 query + ticker 筛选\n"
-    "   - 英文关键词 query + ticker 筛选（同一标的的海外视角）\n"
-    "   - 不同子议题 query（业务/财务/产能分别检索）\n"
-    "   并行调用比串行快，也能从多视角汇聚证据。\n"
-    "4. **读原文**：对高度相关的命中，调用 `kb_fetch_document(doc_id=...)` 读取完整原文，不要仅凭"
-    "摘要片段就下结论。一次研究通常读 2–4 份最硬核的原文。\n"
+    "3. **多角度搜索**（关键）：一轮内并行发起 **2–4 个** 不同 query / 不同筛选组合的 kb_search："
+    "中文 query / 英文 query / 子议题拆分（业务/财务/产能/客户）。\n"
+    "4. **读原文**：对高度相关的命中调用 `kb_fetch_document(doc_id=...)` 读取完整原文（**自动包含 "
+    "PDF 解析后的全文**——研报 PDF 文本已离线提取，缺失时后端会实时回退到内联解析）。\n"
     "5. **弱命中回退**：若结果空或命中度低，先放宽筛选（去掉 doc_types，拉长 date_range），"
-    "再换不同关键词重试 kb_search；最后才考虑 web_search 公网信息。\n"
-    "6. **侦察优先**：不确定库内是否有某主题的数据时，先调 `kb_list_facets` 看分布，再针对性检索——"
+    "再换不同关键词重试；最后才考虑 web_search 公网信息。\n"
+    "6. **侦察优先**：不确定库内是否有某主题的数据时，先调 `kb_list_facets` 看分布——"
     "例如 `kb_list_facets(dimension='doc_types', filters={'tickers':['0700.HK']})` 看腾讯有哪些类型数据。\n"
     "7. **股票代码规范**：建议 CODE.MARKET 形式（`NVDA.US`、`0700.HK`、`600519.SH`）；裸代码会自动补全但"
     "稍不精确；HK 代码需 5 位补零（`00700.HK`）。\n"
@@ -1704,11 +1902,28 @@ async def execute_tool(
             doc_id = (arguments.get("doc_id") or "").strip()
             max_chars = int(arguments.get("max_chars") or 8000)
             if not doc_id:
+                if trace and hasattr(trace, "log_kb_fetch"):
+                    trace.log_kb_fetch(
+                        doc_id="", max_chars=max_chars,
+                        result_len=0, error="missing doc_id",
+                    )
                 return "缺少参数 doc_id。"
-            if trace and hasattr(trace, "log_kb_request"):
-                trace.log_kb_request(query=f"fetch:{doc_id}", top_k=1, sources=[doc_id.split(':', 1)[0]])
+            if trace and hasattr(trace, "log_kb_fetch"):
+                trace.log_kb_fetch(doc_id=doc_id, max_chars=max_chars)
             res = await fetch_document(doc_id, max_chars=max_chars)
-            return _format_fetch_result(res)
+            formatted = _format_fetch_result(res)
+            if trace and hasattr(trace, "log_kb_fetch"):
+                err = ""
+                if isinstance(res, dict) and res.get("error"):
+                    err = str(res.get("error"))[:200]
+                trace.log_kb_fetch(
+                    doc_id=doc_id,
+                    max_chars=max_chars,
+                    result_len=len(formatted or ""),
+                    result_preview=(formatted or "")[:400],
+                    error=err,
+                )
+            return formatted
 
         if name == "kb_list_facets":
             dimension = (arguments.get("dimension") or "").strip()
