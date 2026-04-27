@@ -302,6 +302,8 @@ def process_target(
     skip_missing_pdf: bool = True,
     id_mod: int = 0,
     id_rem: int = 0,
+    id_shard_shift: int = 0,
+    id_shard_mode: str = "numeric",
 ) -> tuple[int, int, int]:
     uri = getattr(settings, target.uri_attr)
     dbname = getattr(settings, target.db_attr)
@@ -320,21 +322,29 @@ def process_target(
         # Skip docs we've already tried and failed on, unless explicitly asked
         filt["pdf_text_error"] = {"$exists": False}
     if id_mod > 0:
-        # Doc-id sharding: only process docs where (_id-as-long) % id_mod == id_rem.
-        # Used to run multiple parallel processes against a single huge
-        # collection without overlap. Handles both numeric _id (jinmen)
-        # and numeric-string snowflake _id (gangtise). For non-numeric _ids
-        # (e.g. alphapai's hex SHA1) $convert errors → bucket -1; do not use
-        # sharding on those collections (use unsharded single-thread instead).
-        filt["$expr"] = {
-            "$eq": [
-                {"$mod": [
-                    {"$convert": {"input": "$_id", "to": "long", "onError": -1}},
-                    id_mod,
-                ]},
-                id_rem,
-            ]
-        }
+        # Doc-id sharding: only process docs where hash(_id) % id_mod == id_rem.
+        # Three modes by id_shard_mode:
+        #  "numeric" (default): cast _id to long; right-shift `id_shard_shift`
+        #    bits before mod. shift=0 for plain-int _ids (jinmen). shift=22
+        #    for snowflake decimal-string _ids (gangtise) — drops sequence+worker.
+        #  "hex": for hex-string _ids (alphapai SHA1). Use last `id_shard_shift`
+        #    hex chars (default 1) parsed as int; if id_shard_shift==0, default 1.
+        if id_shard_mode == "hex":
+            # Use last hex char (0-9a-f) via $indexOfBytes lookup → 0..15.
+            # Mongo's $convert doesn't parse hex strings, so we map each
+            # nibble manually. For id_mod up to 16 this gives a uniform split.
+            sub = {"$substrBytes": [
+                "$_id",
+                {"$subtract": [{"$strLenBytes": "$_id"}, 1]},
+                1,
+            ]}
+            hash_val = {"$indexOfBytes": ["0123456789abcdef", sub]}
+            filt["$expr"] = {"$eq": [{"$mod": [hash_val, id_mod]}, id_rem]}
+        else:
+            long_id = {"$convert": {"input": "$_id", "to": "long", "onError": -1}}
+            if id_shard_shift > 0:
+                long_id = {"$floor": {"$divide": [long_id, 1 << id_shard_shift]}}
+            filt["$expr"] = {"$eq": [{"$mod": [long_id, id_mod]}, id_rem]}
 
     # Pre-scan GridFS once per (DB) so we can skip docs whose PDF was never
     # downloaded — avoids polluting them with `pdf_text_error` rows for what
@@ -567,6 +577,23 @@ def main() -> int:
         "--id-rem", type=int, default=0,
         help="Doc-id sharding remainder (0..id_mod-1).",
     )
+    ap.add_argument(
+        "--id-shard-shift", type=int, default=0,
+        help=(
+            "Right-shift bits applied to the long-cast _id before mod-hash. "
+            "Use 22 for snowflake-style _ids (gangtise) so the timestamp "
+            "portion drives the bucket. 0 (default) for plain-int _ids. "
+            "In --id-shard-mode=hex, this is the number of trailing hex chars "
+            "to use (default 1)."
+        ),
+    )
+    ap.add_argument(
+        "--id-shard-mode", choices=["numeric", "hex"], default="numeric",
+        help=(
+            "Shard hash mode. 'numeric' (default) for int / decimal-string "
+            "_ids. 'hex' for hex-string SHA1 _ids (alphapai)."
+        ),
+    )
     args = ap.parse_args()
 
     # Console + rotating file logger. The file handler keeps long backfill runs
@@ -620,6 +647,8 @@ def main() -> int:
                 skip_missing_pdf=not args.no_skip_missing_pdf,
                 id_mod=args.id_mod,
                 id_rem=args.id_rem,
+                id_shard_shift=args.id_shard_shift,
+                id_shard_mode=args.id_shard_mode,
             )
             return t, ok, failed, skipped
         except Exception as e:  # noqa: BLE001
