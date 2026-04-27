@@ -52,12 +52,24 @@ def _jina_proxy() -> str | None:
     return _jina_proxy_cache
 
 
+def _retry_after_seconds(resp: "httpx.Response", default: float = 2.0) -> float:
+    """Parse a Retry-After header. Falls back to `default` if absent or
+    non-numeric. Capped to 8s so we don't stall a scan cycle."""
+    val = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+    if not val:
+        return default
+    try:
+        return min(float(val), 8.0)
+    except (TypeError, ValueError):
+        return default
+
+
 async def baidu_search(
     query: str,
     api_key: str,
     max_results: int = 10,
     recency: str = "year",
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | None:
     """Search via Baidu Qianfan AI Search API.
 
     Args:
@@ -67,7 +79,8 @@ async def baidu_search(
         recency: Time filter — "week", "month", "semiyear", "year".
 
     Returns:
-        List of dicts: {title, url, content, date, score, source, website}.
+        List of dicts on success, or None when the request was rate-limited
+        (HTTP 429) so callers can distinguish "no results" from "throttled".
     """
     headers = {
         "X-Appbuilder-Authorization": f"Bearer {api_key}",
@@ -80,11 +93,30 @@ async def baidu_search(
         "search_recency_filter": recency,
     }
 
+    rate_limited = False
     try:
         async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
-            resp = await client.post(BAIDU_API_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
+            for attempt in range(2):
+                resp = await client.post(BAIDU_API_URL, json=payload, headers=headers)
+                if resp.status_code == 429 and attempt == 0:
+                    wait = _retry_after_seconds(resp, default=2.0)
+                    logger.info(
+                        "Baidu 429 for '%s' — sleeping %.1fs then retrying",
+                        query[:40], wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code == 429:
+                    rate_limited = True
+                    logger.warning(
+                        "Baidu 429 (after retry) for '%s'", query[:50],
+                    )
+                    return None
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            else:  # pragma: no cover — for-else only when loop exhausts
+                return None
 
         if "code" in data and data.get("code") != 0:
             logger.warning("Baidu search API error: %s", data.get("message", "unknown"))
@@ -111,7 +143,14 @@ async def baidu_search(
     except httpx.TimeoutException:
         logger.warning("Baidu search timeout for: %s", query[:50])
         return []
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            return None
+        logger.error("Baidu search failed for '%s': %s", query[:50], e)
+        return []
     except Exception as e:
+        if "429" in str(e) or rate_limited:
+            return None
         logger.error("Baidu search failed for '%s': %s", query[:50], e)
         return []
 
@@ -123,19 +162,12 @@ async def tavily_search(
     search_depth: str = "basic",
     topic: str = "general",
     days: int | None = None,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | None:
     """Search via Tavily Search API.
 
-    Args:
-        query: Search query text (English).
-        api_key: Tavily API key.
-        max_results: Maximum number of results (up to 20).
-        search_depth: "basic" (fast) or "advanced" (thorough).
-        topic: "general" or "news" for news-focused results.
-        days: If set, limit results to the last N days.
-
     Returns:
-        List of dicts: {title, url, content, date, score, source, website}.
+        List of dicts on success, or None when the request was rate-limited
+        (HTTP 429) so callers can distinguish "no results" from "throttled".
     """
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -153,9 +185,24 @@ async def tavily_search(
 
     try:
         async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
-            resp = await client.post(TAVILY_API_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
+            for attempt in range(2):
+                resp = await client.post(TAVILY_API_URL, json=payload, headers=headers)
+                if resp.status_code == 429 and attempt == 0:
+                    wait = _retry_after_seconds(resp, default=2.0)
+                    logger.info(
+                        "Tavily 429 for '%s' — sleeping %.1fs then retrying",
+                        query[:40], wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status_code == 429:
+                    logger.warning("Tavily 429 (after retry) for '%s'", query[:50])
+                    return None
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            else:  # pragma: no cover
+                return None
 
         tavily_results = data.get("results", [])
         results = []
@@ -163,7 +210,6 @@ async def tavily_search(
             parsed_url = urlparse(item.get("url", ""))
             website = parsed_url.netloc.replace("www.", "")
 
-            # Extract date if available
             date_str = item.get("published_date", "") or ""
             if date_str and len(date_str) >= 10:
                 date_str = date_str[:10]
@@ -184,7 +230,14 @@ async def tavily_search(
     except httpx.TimeoutException:
         logger.warning("Tavily search timeout for: %s", query[:50])
         return []
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            return None
+        logger.error("Tavily search failed for '%s': %s", query[:50], e)
+        return []
     except Exception as e:
+        if "429" in str(e):
+            return None
         logger.error("Tavily search failed for '%s': %s", query[:50], e)
         return []
 
@@ -476,7 +529,9 @@ async def parallel_search(
         if not baidu_api_key:
             return q, []
         results = await baidu_search(q, baidu_api_key, max_results=max_results)
-        return q, results
+        # baidu_search returns None on 429; treat as empty for callers that
+        # don't track rate limiting separately.
+        return q, (results or [])
 
     async def _english_one(q: str, delay: float = 0.0) -> tuple[str, list[dict]]:
         """Run Tavily + Jina in parallel for each English query (A/B comparison)."""
@@ -491,11 +546,13 @@ async def parallel_search(
                 results = await tavily_search(
                     q, tavily_api_key, max_results=max_results, topic="general",
                 )
+                # tavily_search returns None on 429 — normalize to []
+                results = results or []
                 # If few results, supplement with news topic
                 if len(results) < 3:
                     news_results = await tavily_search(
                         q, tavily_api_key, max_results=max_results, topic="news",
-                    )
+                    ) or []
                     seen_urls = {r["url"] for r in results}
                     for nr in news_results:
                         if nr["url"] not in seen_urls:

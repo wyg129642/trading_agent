@@ -3,13 +3,26 @@
 v3: Time-gated search. Uses Tavily days=3/topic="news" and Baidu recency="week",
 then post-filters ALL results by published_at < 24 hours. Calls search APIs
 directly (bypasses parallel_search) for finer control over time parameters.
+
+v3.1 (2026-04-27): Three-layer recall hardening for the case where Tavily +
+Baidu are 429-throttled and only Jina (which returns no `date` field) responds.
+Without this, every undated item gets discarded by the 24h gate and the
+triage stage sees zero recent news → no alerts fire.
+  Layer 1: URL-path date heuristic (`/2026/04/27/`, `YYYY-MM-DD` in path).
+  Layer 2: Wider content_fetcher fallback (limit 15, always-on when undated>0).
+  Layer 3: Rescue mode — if recall is still 0 but we have undated items,
+           keep top-3 as `_date_presumed=True` with synthetic published_at so
+           triage can decide. Triage prompt sees `时间未知 (推测近期)` and
+           usually returns materiality=none for stale items.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 
 from engine.proactive.data_sources.base import DataSourcePlugin, DataSourceResult
 from engine.proactive.models import BreakingNewsItem, PortfolioHolding, StockBaseline
@@ -83,20 +96,23 @@ class WebSearchPlugin(DataSourcePlugin):
 
         cn_queries, en_queries = self._generate_queries(holding)
 
-        # Run all search API calls concurrently with time parameters
+        # Run search API calls with intra-stock staggering to avoid
+        # self-induced 429 storms on Tavily/Baidu (each query within a stock
+        # should not hit the API at the exact same instant; the scanner
+        # already parallelises across 6 stocks per batch).
         tasks = []
 
-        # Baidu queries with recency="week" (finest granularity available)
-        for q in cn_queries:
-            tasks.append(self._search_baidu(q))
+        # Baidu: stagger 0.4s/query
+        for i, q in enumerate(cn_queries):
+            tasks.append(self._search_baidu(q, delay=i * 0.4))
 
-        # Tavily queries with days=3 and topic="news"
-        for q in en_queries:
-            tasks.append(self._search_tavily(q))
+        # Tavily: stagger 0.3s/query
+        for i, q in enumerate(en_queries):
+            tasks.append(self._search_tavily(q, delay=i * 0.3))
 
-        # Jina queries (no time filter available, but still useful for content)
+        # Jina: free of 429s in practice; run 1 query in parallel
         if self._jina_api_key:
-            for q in en_queries[:1]:  # Limit Jina to 1 query to save time
+            for q in en_queries[:1]:
                 tasks.append(self._search_jina(q))
 
         try:
@@ -105,14 +121,28 @@ class WebSearchPlugin(DataSourcePlugin):
             logger.warning("WebSearch gather failed for %s: %s", holding.ticker, e)
             return DataSourceResult(source_name=self.name)
 
-        # Flatten and dedup by URL
+        # Track how many engines actually returned anything — the rescue
+        # path below uses this to decide whether the day is "starved".
+        successful_engines: set[str] = set()
+        rate_limited_engines: set[str] = set()
+        for r in all_results:
+            if isinstance(r, list) and r:
+                eng = r[0].get("_source_engine", "")
+                if eng:
+                    successful_engines.add(eng)
+            elif isinstance(r, dict) and r.get("_rate_limited"):
+                rate_limited_engines.add(r.get("_source_engine", ""))
+
+        # Flatten and dedup by URL (skip rate-limit markers and exceptions)
         all_items = []
         seen_urls: set[str] = set()
         for result_or_exc in all_results:
             if isinstance(result_or_exc, Exception):
                 logger.debug("Search task error: %s", result_or_exc)
                 continue
-            for item in (result_or_exc or []):
+            if not isinstance(result_or_exc, list):
+                continue
+            for item in result_or_exc:
                 url = item.get("url", "")
                 if url and url not in seen_urls:
                     seen_urls.add(url)
@@ -123,17 +153,66 @@ class WebSearchPlugin(DataSourcePlugin):
         cutoff = now_utc - timedelta(hours=self._window_hours)
         recent_items, undated_items = self._post_filter_by_recency(all_items, cutoff)
 
-        # Optionally resolve undated items via ContentFetcher
-        if undated_items and content_fetcher and len(recent_items) < 3:
+        url_recovered = sum(1 for r in recent_items if r.get("_date_from_url"))
+        fetcher_recovered = 0
+        rescued = 0
+
+        # Layer 2: ContentFetcher fallback. Drop the previous `<3 recent`
+        # gate — when Tavily/Baidu are 429-throttled, recent_items=0 with
+        # 5 undated, the gate fires but only on 5 URLs. Many Jina URLs are
+        # JS-heavy and ContentFetcher returns no date. Widen the budget to
+        # 15 so we have a real chance of recovering at least one.
+        if undated_items and content_fetcher:
             resolved = await self._resolve_undated_items(
-                undated_items[:5], content_fetcher, cutoff,
+                undated_items[:15], content_fetcher, cutoff,
             )
+            fetcher_recovered = len(resolved)
             recent_items.extend(resolved)
+            # Items resolved via fetch should not be re-considered
+            resolved_urls = {r.get("url", "") for r in resolved}
+            undated_items = [
+                u for u in undated_items if u.get("url", "") not in resolved_urls
+            ]
+
+        # Layer 3: Rescue mode. If we still have zero recent items but
+        # Jina/etc returned undated content AND at least one engine looked
+        # rate-limited (or only Jina succeeded), keep top-3 undated as
+        # `_date_presumed=True` with synthetic published_at = now-12h so
+        # the time gate downstream lets them pass to triage. The triage
+        # LLM sees a `时间未知 (推测近期)` marker and the item content; if
+        # the news is actually stale or off-topic it will return
+        # materiality=none. Worst case we waste one triage LLM call per
+        # stock per cycle; best case we resurrect a real signal that
+        # would otherwise be silently discarded.
+        starved = (
+            len(recent_items) == 0
+            and len(undated_items) > 0
+            and (
+                bool(rate_limited_engines)
+                or successful_engines.issubset({"jina"})
+            )
+        )
+        if starved:
+            presumed_age = now_utc - timedelta(hours=12)
+            for item in undated_items[:3]:
+                item["_published_at_utc"] = presumed_age
+                item["_date_presumed"] = True
+                recent_items.append(item)
+            rescued = min(3, len(undated_items))
 
         logger.info(
-            "[WebSearch:%s] %d total → %d recent (<%dh), %d undated discarded",
-            holding.ticker, len(all_items), len(recent_items),
-            self._window_hours, len(undated_items),
+            "[WebSearch:%s] %d total → %d recent (<%dh), %d undated"
+            " | engines ok=%s rate-limited=%s | recovered url=%d fetch=%d rescued=%d",
+            holding.ticker,
+            len(all_items),
+            len(recent_items),
+            self._window_hours,
+            len(undated_items),
+            ",".join(sorted(successful_engines)) or "none",
+            ",".join(sorted(rate_limited_engines)) or "none",
+            url_recovered,
+            fetcher_recovered,
+            rescued,
         )
 
         result = DataSourceResult(
@@ -141,7 +220,14 @@ class WebSearchPlugin(DataSourcePlugin):
             items=recent_items,
             item_count=len(recent_items),
             new_item_count=len(recent_items),
-            metadata={"total_before_filter": len(all_items)},
+            metadata={
+                "total_before_filter": len(all_items),
+                "url_recovered": url_recovered,
+                "fetcher_recovered": fetcher_recovered,
+                "rescued": rescued,
+                "engines_ok": sorted(successful_engines),
+                "engines_rate_limited": sorted(rate_limited_engines),
+            },
         )
         result.formatted_text = self.format_for_llm(result, holding)
         return result
@@ -150,8 +236,13 @@ class WebSearchPlugin(DataSourcePlugin):
     # Search API wrappers with time parameters
     # ------------------------------------------------------------------
 
-    async def _search_baidu(self, query: str) -> list[dict]:
+    async def _search_baidu(self, query: str, delay: float = 0.0) -> list[dict] | dict:
+        """Returns either a list of results, or a `{_rate_limited: True}` marker
+        so the caller can detect 429 storms."""
+        import asyncio
         from engine.tools.web_search import baidu_search
+        if delay > 0:
+            await asyncio.sleep(delay)
         try:
             results = await baidu_search(
                 query=query,
@@ -159,16 +250,23 @@ class WebSearchPlugin(DataSourcePlugin):
                 max_results=10,
                 recency="week",  # Finest Baidu granularity
             )
-            # Tag source for timezone parsing
+            if results is None:
+                return {"_rate_limited": True, "_source_engine": "baidu"}
             for r in results:
                 r["_source_engine"] = "baidu"
             return results
         except Exception as e:
+            msg = str(e)
+            if "429" in msg or "Too Many Requests" in msg:
+                return {"_rate_limited": True, "_source_engine": "baidu"}
             logger.debug("Baidu search error: %s", e)
             return []
 
-    async def _search_tavily(self, query: str) -> list[dict]:
+    async def _search_tavily(self, query: str, delay: float = 0.0) -> list[dict] | dict:
+        import asyncio
         from engine.tools.web_search import tavily_search
+        if delay > 0:
+            await asyncio.sleep(delay)
         try:
             results = await tavily_search(
                 query=query,
@@ -177,10 +275,15 @@ class WebSearchPlugin(DataSourcePlugin):
                 days=1,          # Last 24h — tighter window, fresher results
                 topic="news",    # News-focused results
             )
+            if results is None:
+                return {"_rate_limited": True, "_source_engine": "tavily"}
             for r in results:
                 r["_source_engine"] = "tavily"
             return results
         except Exception as e:
+            msg = str(e)
+            if "429" in msg or "Too Many Requests" in msg:
+                return {"_rate_limited": True, "_source_engine": "tavily"}
             logger.debug("Tavily search error: %s", e)
             return []
 
@@ -211,18 +314,30 @@ class WebSearchPlugin(DataSourcePlugin):
         Timezone handling:
         - Tavily: dates are ISO format, assumed UTC
         - Baidu: dates are Chinese locale, assumed CST (UTC+8)
-        - Jina: typically no date
+        - Jina: typically no date — falls back to URL-path heuristic
         """
         recent = []
         undated = []
 
         for item in items:
-            date_str = (item.get("date") or "").strip()
-            if not date_str:
-                undated.append(item)
-                continue
+            parsed_dt = None
 
-            parsed_dt = self._parse_search_date(date_str, item.get("_source_engine", ""))
+            date_str = (item.get("date") or "").strip()
+            if date_str:
+                parsed_dt = self._parse_search_date(
+                    date_str, item.get("_source_engine", ""),
+                )
+
+            # Layer 1: URL-path date heuristic for items without a
+            # parseable `date` field (most Jina results, some Tavily
+            # general-topic results). Many news outlets encode the
+            # publish date in the URL path.
+            if parsed_dt is None:
+                url = item.get("url") or ""
+                parsed_dt = self._extract_date_from_url(url)
+                if parsed_dt is not None:
+                    item["_date_from_url"] = True
+
             if parsed_dt is None:
                 undated.append(item)
                 continue
@@ -230,9 +345,52 @@ class WebSearchPlugin(DataSourcePlugin):
             item["_published_at_utc"] = parsed_dt
             if parsed_dt >= cutoff:
                 recent.append(item)
-            # else: too old, silently discard
+            # else: dated and too old, silently discard
 
         return recent, undated
+
+    # Compiled once. Captures the date components from URL paths like:
+    #   /2026/04/27/some-article
+    #   /news/2026-04-27/some-article
+    #   /2026-04-27_some-article.html
+    _URL_DATE_PATTERNS = [
+        re.compile(r"/(\d{4})/(\d{1,2})/(\d{1,2})(?:/|[-_]|\b)"),
+        re.compile(r"[/_-](\d{4})-(\d{1,2})-(\d{1,2})(?:[/.\-_]|\b)"),
+    ]
+
+    def _extract_date_from_url(self, url: str) -> datetime | None:
+        """Best-effort: pull a YYYY-MM-DD from the URL path, treat as
+        midnight UTC. Cheap, no I/O, and works for many news outlets
+        (cnbc, reuters, bloomberg, etc.) where Jina returns no date."""
+        if not url:
+            return None
+        try:
+            path = urlparse(url).path
+        except (ValueError, AttributeError):
+            return None
+        if not path:
+            return None
+        for pat in self._URL_DATE_PATTERNS:
+            m = pat.search(path)
+            if not m:
+                continue
+            try:
+                year, month, day = (int(m.group(i)) for i in (1, 2, 3))
+            except (ValueError, IndexError):
+                continue
+            # Sanity-bound to plausible publish-date range
+            if not (2000 <= year <= 2100):
+                continue
+            if not (1 <= month <= 12 and 1 <= day <= 31):
+                continue
+            try:
+                # Treat the URL date as 12:00 UTC of that day — a midpoint
+                # so a story posted "today" still falls inside a 24h window
+                # regardless of which timezone the publisher used.
+                return datetime(year, month, day, 12, 0, tzinfo=timezone.utc)
+            except ValueError:
+                continue
+        return None
 
     def _parse_search_date(self, date_str: str, source_engine: str) -> datetime | None:
         """Parse a date string from a search result into a UTC-aware datetime.
@@ -363,9 +521,21 @@ class WebSearchPlugin(DataSourcePlugin):
             if pub_dt:
                 age = now_utc - pub_dt
                 age_hours = age.total_seconds() / 3600
-                # Display in CST for Chinese context
                 pub_cst = pub_dt.astimezone(CST)
-                time_str = f"{pub_cst.strftime('%m-%d %H:%M')} CST ({age_hours:.0f}h前)"
+                if item.get("_date_presumed"):
+                    # Rescue-mode item: time unverified, flag clearly so triage
+                    # LLM does not treat synthetic timestamp as authoritative.
+                    time_str = "时间未知 (推测近期)"
+                elif item.get("_date_from_url"):
+                    time_str = (
+                        f"{pub_cst.strftime('%m-%d')} CST "
+                        f"(~{age_hours:.0f}h前, URL推断)"
+                    )
+                else:
+                    time_str = (
+                        f"{pub_cst.strftime('%m-%d %H:%M')} CST "
+                        f"({age_hours:.0f}h前)"
+                    )
             else:
                 date_str = item.get("date", "")
                 time_str = date_str if date_str else "时间未知"
