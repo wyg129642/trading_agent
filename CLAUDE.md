@@ -109,7 +109,7 @@ and `src/tools/web_search.py`.
     RRF-merged)
   - `user_kb_service.py` / `user_kb_tools.py` — per-team personal KB (`user_kb_search`,
     `user_kb_fetch_document`)
-  - `web_search_tool.py` — Baidu + Tavily + Jina + `read_webpage`
+  - `web_search_tool.py` — Tavily + Jina + `read_webpage` (Baidu disabled 2026-04-27)
   - `alphapai_service.py` / `jinmen_service.py` — **retired to deprecation shims** (2026-04-24).
     `*_TOOLS = []`; frontend `alphapai_enabled` / `jinmen_enabled` toggles coerce `kb_enabled=True`.
 - **Quote Service:** `backend/app/services/stock_quote.py` routes to `quote_providers/` (Futu primary,
@@ -178,8 +178,11 @@ All health/status `curl` calls use `--noproxy '*'` because shell has `HTTP_PROXY
 - `user_kb_search` is team-wide (not user-scoped). BM25 stays available even if Milvus is down.
 
 ### Web Search
-- 3 engines in parallel: Baidu (CN, fast), Tavily (intl), Jina (intl, via proxy). Keys in `.env`:
-  `BAIDU_API_KEY`, `TAVILY_API_KEY`, `JINA_API_KEY`. `read_webpage` for LLM-initiated deep reads.
+- 2 engines in parallel for the chat assistant: Tavily (intl) + Jina (intl, via proxy). Keys in `.env`:
+  `TAVILY_API_KEY`, `JINA_API_KEY`. **Baidu is disabled for chat (2026-04-27)** — `BAIDU_API_KEY` is
+  still consumed by `stock_verifier`, AlphaPai/Jiuqian enrichment processors, and the prod analysis
+  pipeline (`src/analysis/pipeline.py`), so the key stays in `.env`. `read_webpage` for LLM-initiated
+  deep reads.
 
 ### Platform homepage widgets
 - `/api/platform-info` proxies homepage widgets (hot searches, hot stocks, daily topics) from AlphaPai

@@ -1043,6 +1043,46 @@ def normalize_with_unmatched(raw: Any) -> tuple[list[str], list[str]]:
     return matched, unmatched
 
 
+def normalize_raw_for_storage(raw: Any) -> list:
+    """Flatten extractor output into a JSON-safe list for the ``_raw_tickers``
+    Mongo field. Preserves dict structure (so ``{code, name}`` stays intact)
+    but flattens nested lists into a single flat list. Skips None / blanks.
+
+    Used by both ``crawl/ticker_tag.py`` (ingest-time) and
+    ``scripts/enrich_tickers.py`` (back-fill) so coverage stays uniform."""
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, str):
+        return [raw] if raw.strip() else []
+    if isinstance(raw, (list, tuple)):
+        out: list = []
+        for item in raw:
+            if item is None:
+                continue
+            if isinstance(item, dict):
+                out.append(item)
+            elif isinstance(item, str):
+                if item.strip():
+                    out.append(item)
+            elif isinstance(item, (list, tuple)):
+                for sub in item:
+                    if sub is None:
+                        continue
+                    if isinstance(sub, dict):
+                        out.append(sub)
+                    elif isinstance(sub, str):
+                        if sub.strip():
+                            out.append(sub)
+                    else:
+                        out.append(str(sub))
+            else:
+                out.append(str(item))
+        return out
+    return [str(raw)]
+
+
 # --------------------------------------------------------------------------- #
 # Title / free-text extractor (2026-04-24)
 # --------------------------------------------------------------------------- #

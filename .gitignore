@@ -1,5 +1,6 @@
 # 敏感文件 — 绝对不能提交到 Git
 .env
+.env.bak*
 config/settings.yaml
 config/portfolio_sources.yaml
 crawl/*/login_saved.json

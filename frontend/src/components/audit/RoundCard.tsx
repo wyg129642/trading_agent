@@ -374,8 +374,104 @@ export default function RoundCard({ round, modelId, onInspect }: Props) {
               ))}
             </div>
           )}
+
+          {/* 6. Defensive escape hatch: any event in this round that didn't
+             land in a known slot above. Keeps newly-added event types
+             visible without a frontend update. */}
+          <OtherEvents round={round} onInspect={onInspect} />
         </div>
       )}
     </div>
   )
+}
+
+function OtherEvents({
+  round,
+  onInspect,
+}: {
+  round: RoundData
+  onInspect?: (e: AuditEvent) => void
+}) {
+  // Anything we already rendered in a structured slot is excluded.
+  const claimed = new Set<string>()
+  if (round.request) claimed.add(round.request.id)
+  if (round.reasoning) claimed.add(round.reasoning.id)
+  if (round.responseContent) claimed.add(round.responseContent.id)
+  if (round.done) claimed.add(round.done.id)
+  if (round.toolCallsDecision) claimed.add(round.toolCallsDecision.id)
+  for (const e of round.errors) claimed.add(e.id)
+  for (const p of round.toolPairs) {
+    claimed.add(p.start.id)
+    if (p.done) claimed.add(p.done.id)
+    for (const s of p.subEvents) claimed.add(s.id)
+  }
+  // SSE meta-events and a couple of structural duplicates are noise.
+  const SKIP = new Set(['LLM_FULL_RESPONSE'])
+  const others = round.events.filter(
+    (e) => !claimed.has(e.id) && !SKIP.has(e.event_type),
+  )
+  if (others.length === 0) return null
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div
+        style={{
+          fontSize: 11,
+          fontWeight: 600,
+          color: '#64748b',
+          letterSpacing: 0.4,
+          marginBottom: 4,
+        }}
+      >
+        OTHER EVENTS · {others.length}
+      </div>
+      <div
+        style={{
+          background: '#fafbfc',
+          border: '1px dashed #e2e8f0',
+          borderRadius: 4,
+          padding: 6,
+        }}
+      >
+        {others.map((e) => (
+          <div
+            key={e.id}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              padding: '2px 0',
+              cursor: onInspect ? 'pointer' : 'default',
+              fontSize: 12,
+            }}
+            onClick={() => onInspect?.(e)}
+          >
+            <Tag style={{ fontSize: 10 }}>#{e.sequence}</Tag>
+            <Tag color="geekblue" style={{ fontSize: 10 }}>
+              {e.event_type}
+            </Tag>
+            {e.tool_name && (
+              <Tag style={{ fontSize: 10 }}>{e.tool_name}</Tag>
+            )}
+            {e.latency_ms != null && (
+              <Tag style={{ fontSize: 10 }}>{e.latency_ms}ms</Tag>
+            )}
+            <Typography.Text type="secondary" style={{ fontSize: 11 }}>
+              {summarizePayload(e.payload)}
+            </Typography.Text>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function summarizePayload(p: any): string {
+  if (!p || typeof p !== 'object') return ''
+  // Pull the most useful field for a one-line preview.
+  if (typeof p.query === 'string') return `query="${p.query.slice(0, 80)}"`
+  if (typeof p.text === 'string') return `${p.text.slice(0, 80)}`
+  if (typeof p.content === 'string') return `${p.content.slice(0, 80)}`
+  if (typeof p.tool_name === 'string') return `tool=${p.tool_name}`
+  if (typeof p.error === 'string') return p.error.slice(0, 100)
+  return ''
 }

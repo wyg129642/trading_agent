@@ -116,6 +116,13 @@ export default function ToolCallPair({ pair, onInspect }: Props) {
             {(pair.result.length / 1024).toFixed(1)}KB returned
           </Tag>
         )}
+        {pair.done?.payload_truncated && (
+          <Tooltip title="Stored payload exceeded the per-event size cap and was truncated. The 'raw event' view shows the truncation marker.">
+            <Tag color="orange" style={{ fontSize: 10 }}>
+              truncated
+            </Tag>
+          </Tooltip>
+        )}
         <span style={{ flex: 1 }} />
         <Tooltip title={`#${pair.start.sequence} → #${pair.done?.sequence ?? '?'}`}>
           <Typography.Text type="secondary" style={{ fontSize: 10 }}>

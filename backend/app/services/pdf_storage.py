@@ -135,11 +135,13 @@ async def stream_pdf_or_file(
             tried.append(f"{cand} [outside roots]")
             continue
         if cand.is_file():
+            headers = _cd_headers(download_filename, download,
+                                  size=cand.stat().st_size)
+            headers["X-PDF-Source"] = "disk"
             return FileResponse(
                 cand,
                 media_type=media_type,
-                headers=_cd_headers(download_filename, download,
-                                    size=cand.stat().st_size),
+                headers=headers,
             )
         tried.append(str(cand))
 
@@ -152,10 +154,19 @@ async def stream_pdf_or_file(
             file_id = fdoc._id
             file_length = getattr(fdoc, "length", None)
             stream = await bucket.open_download_stream(file_id)
+            # Tag the response so we can spot legacy GridFS reads in nginx /
+            # browser devtools. After the 2026-04-27 GridFS→SSD extraction,
+            # this path should be hit <1% of the time.
+            logger.info(
+                "PDF served from GridFS fallback: rel=%s gridfs_key=%s",
+                pdf_rel_path, gridfs_name,
+            )
+            headers = _cd_headers(download_filename, download, size=file_length)
+            headers["X-PDF-Source"] = "gridfs"
             return StreamingResponse(
                 _gridfs_iter(stream),
                 media_type=media_type,
-                headers=_cd_headers(download_filename, download, size=file_length),
+                headers=headers,
             )
     except HTTPException:
         raise

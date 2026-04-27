@@ -1,6 +1,7 @@
-"""Enrich every crawled document with ``_canonical_tickers`` + ``_unmatched_raw``.
+"""Enrich every crawled document with ``_canonical_tickers`` + ``_unmatched_raw``
++ ``_raw_tickers``.
 
-Idempotent, non-destructive — only adds/updates the two derived fields; all
+Idempotent, non-destructive — only adds/updates the derived fields; all
 original fields are left untouched. Safe to re-run after alias-table edits.
 
 Usage::
@@ -10,6 +11,9 @@ Usage::
 
     # Only one DB
     python3 scripts/enrich_tickers.py --source alphapai
+
+    # Skip specific source.collection combos
+    python3 scripts/enrich_tickers.py --exclude jinmen.oversea_reports
 
     # Show what would be updated without writing
     python3 scripts/enrich_tickers.py --dry-run
@@ -23,6 +27,9 @@ Fields added to each document::
     _canonical_tickers_at:       ISODate     # last enrichment timestamp
     _unmatched_raw:              list[str]   # raw strings we could NOT map
     _canonical_extract_source:   str         # which extractor was used (provenance)
+    _raw_tickers:                list        # preserved raw extractor output
+                                             # (list of dict | str), unified
+                                             # access regardless of platform schema
 
 Indexes created::
 
@@ -50,6 +57,7 @@ from backend.app.config import get_settings  # noqa: E402
 from backend.app.services.ticker_normalizer import (  # noqa: E402
     EXTRACTORS,
     extract_tickers_from_text,
+    normalize_raw_for_storage,
     normalize_with_unmatched,
     reload_aliases,
 )
@@ -228,6 +236,7 @@ async def enrich_collection(
                 "_canonical_tickers_at": now,
                 "_unmatched_raw": unmatched,
                 "_canonical_extract_source": extract_source,
+                "_raw_tickers": normalize_raw_for_storage(raw),
             }},
         ))
         if len(pending) >= BATCH:
@@ -269,6 +278,10 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.reload_aliases:
         reload_aliases()
 
+    exclude_set: set[str] = set()
+    if args.exclude:
+        exclude_set = {x.strip() for x in args.exclude.split(",") if x.strip()}
+
     total_scanned = 0
     total_updated = 0
     total_with = 0
@@ -289,6 +302,10 @@ async def main_async(args: argparse.Namespace) -> int:
         extractor = EXTRACTORS[source_key]
 
         for coll_name in collections:
+            full_tag = f"{source_key}.{coll_name}"
+            if full_tag in exclude_set:
+                print(f"{full_tag:<36} {'(skipped via --exclude)':>50}")
+                continue
             scanned, updated, with_tickers, unmatched, from_title = await enrich_collection(
                 client,
                 db_name,
@@ -363,6 +380,13 @@ def main() -> int:
         default=0,
         metavar="N",
         help="Print top-N unmatched raw strings at the end (for alias dict expansion)",
+    )
+    ap.add_argument(
+        "--exclude",
+        type=str,
+        default="",
+        metavar="SOURCE.COLL[,SOURCE.COLL]",
+        help="Skip these source.collection combos (e.g. jinmen.oversea_reports)",
     )
     args = ap.parse_args()
     return asyncio.run(main_async(args))

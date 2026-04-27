@@ -228,9 +228,6 @@ export default function StockHub() {
   }, [canonicalId])
 
   // ── Detail drawer ────────────────────────────────────────
-  // Strip leading "/api" because axios has baseURL: '/api'. If we pass
-  // "/api/foo" axios would call "/api/api/foo".
-  const trimApi = (u: string) => (u.startsWith('/api/') ? u.slice(4) : u)
 
   const clearPdf = useCallback(() => {
     setPdfError(null)
@@ -272,6 +269,69 @@ export default function StockHub() {
     clearPdf()
   }, [clearPdf])
 
+  // PDF fetches use the browser's native fetch() rather than axios. axios
+  // wraps XMLHttpRequest and surfaces a generic "Network Error" when a
+  // streamed blob response stalls or hits transient WAN flakiness, even if
+  // the server is still happily writing bytes. fetch() lets the browser
+  // manage the stream end-to-end and reports a real status / specific
+  // failure cause when something actually breaks. The same workaround is
+  // used by AudioTranscriptViewer for the same reason.
+  const fetchPdfBlob = useCallback(
+    async (path: string, onProgress?: (loaded: number, total: number) => void): Promise<Blob> => {
+      // Pull JWT from the auth-storage entry that the zustand store
+      // persists. Resolved lazily here to avoid hard-coupling this hook.
+      let token = ''
+      try {
+        const raw = localStorage.getItem('auth-storage') || ''
+        if (raw) token = JSON.parse(raw)?.state?.token || ''
+      } catch { /* fall through with empty token; backend will 401 */ }
+
+      const url = path.startsWith('/') ? path : `/api/${path.replace(/^\/?api\/?/, '')}`
+      const resp = await fetch(url, {
+        method: 'GET',
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+        credentials: 'same-origin',
+      })
+      if (!resp.ok) {
+        // Try to surface a structured detail from FastAPI (JSON) before
+        // falling back to a bare HTTP status.
+        let detail = ''
+        try {
+          const txt = await resp.text()
+          try { detail = JSON.parse(txt)?.detail || '' } catch { detail = txt }
+        } catch { /* ignore */ }
+        throw new Error(detail || `HTTP ${resp.status}`)
+      }
+      const total = Number(resp.headers.get('content-length') || 0)
+      // No progress callback OR no streaming reader → fall through to blob().
+      if (!onProgress || !resp.body) {
+        return await resp.blob()
+      }
+      const reader = resp.body.getReader()
+      const chunks: BlobPart[] = []
+      let received = 0
+      // Streaming read for progress reporting. The browser keeps the
+      // socket alive even when the server is slow, so this is the
+      // reliable path for large GridFS responses.
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value) {
+          // Copy into a fresh ArrayBuffer so the Blob constructor's strict
+          // BlobPart typing accepts it under TS5 strict mode (Uint8Array
+          // can be backed by SharedArrayBuffer, which Blob rejects).
+          const copy = new Uint8Array(value.byteLength)
+          copy.set(value)
+          chunks.push(copy.buffer)
+          received += value.byteLength
+          onProgress(received, total)
+        }
+      }
+      return new Blob(chunks, { type: 'application/pdf' })
+    },
+    [],
+  )
+
   const loadPdf = useCallback(async (pdfUrl: string) => {
     // Collapse duplicate concurrent loads for the same URL. The PDF endpoint
     // is on the slow Mongo GridFS path (~50-250 s for ~10 MB) so stacking
@@ -282,43 +342,19 @@ export default function StockHub() {
     setPdfError(null)
     setPdfProgress(null)
     try {
-      const res = await api.get(trimApi(pdfUrl), {
-        responseType: 'blob',
-        // GridFS reads have measured at 0.2-0.5 MB/s, so a 10 MB PDF can
-        // legitimately take 1-3 minutes. 10 min covers the worst case
-        // without giving up early.
-        timeout: 600000,
-        onDownloadProgress: (e) => {
-          // e.total is set when Content-Length is known (always, for PDFs).
-          if (e.total) setPdfProgress({ loaded: e.loaded, total: e.total })
-          else setPdfProgress({ loaded: e.loaded, total: 0 })
-        },
+      const blob = await fetchPdfBlob(pdfUrl, (loaded, total) => {
+        setPdfProgress({ loaded, total })
       })
       // Ignore stale responses if the user moved on.
       if (inflightPdfRef.current !== pdfUrl) return
-      const blob = new Blob([res.data], { type: 'application/pdf' })
       const url = URL.createObjectURL(blob)
       setPdfBlobUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev)
         return url
       })
     } catch (err: any) {
-      // Don't surface errors from a request the user has already abandoned.
       if (inflightPdfRef.current !== pdfUrl) return
-      const status = err?.response?.status
-      let msg = err?.response?.data?.detail
-      // When axios gets a Blob error response, data is a Blob — decode it
-      if (err?.response?.data instanceof Blob) {
-        try {
-          const text = await err.response.data.text()
-          const j = JSON.parse(text)
-          msg = j?.detail || text
-        } catch {
-          msg = `HTTP ${status ?? '?'}`
-        }
-      }
-      msg = msg || (status ? `HTTP ${status}` : err?.message) || '加载 PDF 失败'
-      setPdfError(typeof msg === 'string' ? msg : JSON.stringify(msg))
+      setPdfError(err?.message || '加载 PDF 失败')
     } finally {
       if (inflightPdfRef.current === pdfUrl) {
         inflightPdfRef.current = null
@@ -326,7 +362,7 @@ export default function StockHub() {
         setPdfProgress(null)
       }
     }
-  }, [])
+  }, [fetchPdfBlob])
 
   const downloadPdf = useCallback(async (pdfUrl: string, filename: string) => {
     const hide = message.loading('正在下载 PDF…', 0)
@@ -335,12 +371,7 @@ export default function StockHub() {
       // that honor it (alphapai/gangtise/jinmen/alphaengine). Meritco's /pdf
       // already forces download via its route.
       const sep = pdfUrl.includes('?') ? '&' : '?'
-      const res = await api.get(trimApi(`${pdfUrl}${sep}download=1`), {
-        responseType: 'blob',
-        // Same 10-min ceiling as loadPdf — slow GridFS path applies here too.
-        timeout: 600000,
-      })
-      const blob = new Blob([res.data], { type: 'application/pdf' })
+      const blob = await fetchPdfBlob(`${pdfUrl}${sep}download=1`)
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
@@ -353,20 +384,9 @@ export default function StockHub() {
       message.success('下载完成')
     } catch (err: any) {
       hide()
-      let msg = err?.response?.data?.detail
-      if (err?.response?.data instanceof Blob) {
-        try {
-          const text = await err.response.data.text()
-          const j = JSON.parse(text)
-          msg = j?.detail || text
-        } catch {
-          msg = `HTTP ${err?.response?.status ?? '?'}`
-        }
-      }
-      msg = msg || err?.message || '下载失败'
-      message.error(`下载失败: ${msg}`)
+      message.error(`下载失败: ${err?.message || '未知错误'}`)
     }
-  }, [])
+  }, [fetchPdfBlob])
 
   // Revoke blob URL on unmount
   useEffect(() => {
@@ -1072,7 +1092,7 @@ function PdfPane({
             <Spin size="large" />
             <div style={{ color: '#475569', fontSize: 13 }}>{progressLabel}</div>
             <div style={{ color: '#94a3b8', fontSize: 11, maxWidth: 360 }}>
-              首次加载从远端 GridFS 拉取，约需 1-3 分钟；缓存命中后秒开。
+              正在从本地 SSD 加载；首次大文件偶尔需几秒，缓存命中后秒开。
             </div>
           </div>
         ) : error ? (

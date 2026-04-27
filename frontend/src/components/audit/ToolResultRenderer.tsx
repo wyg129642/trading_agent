@@ -336,9 +336,54 @@ function KbSearchResult({
   )
 }
 
-function FetchDocumentResult({ result }: { result: string }) {
+function FetchDocumentResult({
+  subEvents,
+  result,
+}: {
+  subEvents: AuditEvent[]
+  result: string
+}) {
+  // KB_FETCH (new, kb_fetch_document) carries doc_id, source, sizes, error.
+  // Two events are emitted per fetch: one before the IO with just the
+  // request, one after with result_len/error. Prefer the after-event.
+  const fetches = subEvents.filter((e) => e.event_type === 'KB_FETCH')
+  const fetchAfter = fetches.find((e) => (e.payload?.result_len ?? 0) > 0) || fetches[fetches.length - 1]
+  const fetchBefore = fetches[0]
+  const meta = fetchAfter?.payload || fetchBefore?.payload || {}
+  // Older runs may not have KB_FETCH — fall back to KB_REQUEST.
+  const legacyReq = subEvents.find((e) => e.event_type === 'KB_REQUEST')
+  const docId =
+    meta.doc_id ||
+    (legacyReq?.payload?.query?.startsWith('fetch:')
+      ? String(legacyReq.payload.query).slice(6)
+      : '')
+  const source = meta.source || (legacyReq?.payload?.sources || [])[0] || ''
+
   return (
     <div>
+      {(docId || meta.max_chars || meta.result_len != null) && (
+        <Space size={[4, 4]} wrap style={{ marginBottom: 6 }}>
+          {docId && (
+            <Tag color="blue" style={{ fontSize: 11 }}>
+              doc_id: {docId}
+            </Tag>
+          )}
+          {source && <Tag style={{ fontSize: 11 }}>source: {source}</Tag>}
+          {meta.max_chars != null && (
+            <Tag style={{ fontSize: 11 }}>max_chars: {meta.max_chars}</Tag>
+          )}
+          {meta.result_len != null && (
+            <Tag color={meta.result_len > 0 ? 'green' : 'orange'} style={{ fontSize: 11 }}>
+              returned: {meta.result_len} chars
+            </Tag>
+          )}
+          {meta.error && (
+            <Tag color="red" style={{ fontSize: 11 }}>
+              error: {meta.error}
+            </Tag>
+          )}
+        </Space>
+      )}
       <CollapsibleBlock title="Document content returned to LLM" defaultOpen>
         <div
           style={{
@@ -378,7 +423,7 @@ export default function ToolResultRenderer({
   if (toolName === 'kb_search' || toolName === 'user_kb_search')
     return <KbSearchResult subEvents={subEvents} result={result} />
   if (toolName === 'kb_fetch_document' || toolName === 'user_kb_fetch_document')
-    return <FetchDocumentResult result={result} />
+    return <FetchDocumentResult subEvents={subEvents} result={result} />
 
   // Default: show whatever the tool returned as text
   if (!result) return <Empty image={null} description="(no result)" />

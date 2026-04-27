@@ -518,6 +518,22 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to start kb_vector_sync (non-fatal)")
 
+    # Realtime LLM ticker tagger — fallback NER for docs whose rule path
+    # landed empty. Off by default; enable via LLM_TAG_REALTIME_ENABLED=true.
+    if getattr(settings, "llm_tag_realtime_enabled", False):
+        try:
+            import asyncio as _aio_llmtag
+            from backend.app.services.realtime_llm_tagger import (
+                realtime_llm_tagger_loop,
+            )
+            app.state.realtime_llm_tagger_task = _aio_llmtag.create_task(
+                realtime_llm_tagger_loop(settings, app.state.redis),
+                name="realtime_llm_tagger",
+            )
+            logger.info("realtime_llm_tagger task scheduled")
+        except Exception:
+            logger.exception("Failed to start realtime_llm_tagger (non-fatal)")
+
     yield
 
     # Shutdown
@@ -540,6 +556,9 @@ async def lifespan(app: FastAPI):
     if task:
         task.cancel()
     task = getattr(app.state, "staging_user_sync_task", None)
+    if task:
+        task.cancel()
+    task = getattr(app.state, "realtime_llm_tagger_task", None)
     if task:
         task.cancel()
     if kb_vector_sync_svc is not None:

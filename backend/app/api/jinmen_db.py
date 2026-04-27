@@ -51,6 +51,15 @@ def _to_py_id(value: Any) -> Any:
     return value
 
 
+def _path_under(child: Path, parent: Path) -> bool:
+    """True iff `child` (resolved) lives under `parent` (resolved)."""
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 # ------------------------------------------------------------------ #
 # On-demand PDF fetch: local file → fall back to upstream (brm.comein.cn).
 # The scraper can't keep up with 1 600+ oversea reports in real time, so many
@@ -235,13 +244,16 @@ async def _ensure_local_pdf(
     """
     settings = get_settings()
     base = Path(settings.jinmen_pdf_dir).resolve()
+    # oversea_reports 历史 pdf_local_path 落在独立目录, 也算合法 root.
+    allowed_bases = [base, Path(settings.jinmen_oversea_pdf_dir).resolve()]
 
     rel = doc.get("pdf_local_path")
     if rel:
         target: Path | None = None
         try:
             target = Path(rel).resolve()
-            target.relative_to(base)
+            if not any(_path_under(target, b) for b in allowed_bases):
+                raise ValueError("outside allowed bases")
         except ValueError:
             # Stale path from 2026-04-17 PDF data migration (old
             # crawl/jinmen/pdfs/... → /home/ygwang/crawl_data/jinmen_pdfs/...).
@@ -592,12 +604,24 @@ async def get_report_pdf(
     if not doc:
         raise HTTPException(404, "Report not found")
 
-    # 先查 GridFS, miss 时才走 _ensure_local_pdf 源头回源
+    # 先查本地 SSD / GridFS, miss 时才走 _ensure_local_pdf 源头回源
     from ..services.pdf_storage import stream_pdf_or_file, _filename_for_pdf
     settings = get_settings()
+    pdf_roots = [settings.jinmen_pdf_dir, settings.jinmen_oversea_pdf_dir]
     rel_from_doc = doc.get("pdf_local_path")
     if rel_from_doc:
-        gfs_name = _filename_for_pdf(rel_from_doc, settings.jinmen_pdf_dir)
+        # 本地 SSD 命中是最快路径; 优先尝试.
+        if Path(rel_from_doc).is_file():
+            title = (doc.get("title") or f"jinmen-{report_id}")[:120]
+            return await stream_pdf_or_file(
+                db=_db(),
+                pdf_rel_path=rel_from_doc,
+                pdf_root=pdf_roots,
+                download_filename=title,
+                download=bool(download),
+            )
+        # 本地 miss → 看 GridFS 有没有 (慢, 但比上游回源快得多).
+        gfs_name = _filename_for_pdf(rel_from_doc, pdf_roots)
         existing = await _db()["fs.files"].find_one(
             {"filename": gfs_name}, projection={"_id": 1})
         if existing:
@@ -605,17 +629,17 @@ async def get_report_pdf(
             return await stream_pdf_or_file(
                 db=_db(),
                 pdf_rel_path=rel_from_doc,
-                pdf_root=settings.jinmen_pdf_dir,
+                pdf_root=pdf_roots,
                 download_filename=title,
                 download=bool(download),
             )
-    # GridFS miss → 维持原路径: 本地缓存 + 源头回源 + 本地流
+    # 本地 + GridFS 都 miss → 维持原路径: 上游回源 + 落盘 + 本地流
     target = await _ensure_local_pdf(coll_name, doc)
     title = (doc.get("title") or target.stem)[:120]
     return await stream_pdf_or_file(
         db=_db(),
         pdf_rel_path=str(target),
-        pdf_root=settings.jinmen_pdf_dir,
+        pdf_root=pdf_roots,
         download_filename=title,
         download=bool(download),
     )
@@ -803,9 +827,21 @@ async def get_oversea_report_pdf(
 
     from ..services.pdf_storage import stream_pdf_or_file, _filename_for_pdf
     settings = get_settings()
+    pdf_roots = [settings.jinmen_pdf_dir, settings.jinmen_oversea_pdf_dir]
     rel_from_doc = doc.get("pdf_local_path")
     if rel_from_doc:
-        gfs_name = _filename_for_pdf(rel_from_doc, settings.jinmen_pdf_dir)
+        # 本地 SSD 命中是最快路径; oversea_reports 历史 pdf_local_path 走 overseas_pdf,
+        # 必须把它和 jinmen_pdfs 一起放进 root list, 否则 _is_under 校验拒读.
+        if Path(rel_from_doc).is_file():
+            title = (doc.get("title") or f"jinmen-oversea-{report_id}")[:120]
+            return await stream_pdf_or_file(
+                db=_db(),
+                pdf_rel_path=rel_from_doc,
+                pdf_root=pdf_roots,
+                download_filename=title,
+                download=bool(download),
+            )
+        gfs_name = _filename_for_pdf(rel_from_doc, pdf_roots)
         existing = await _db()["fs.files"].find_one(
             {"filename": gfs_name}, projection={"_id": 1})
         if existing:
@@ -813,7 +849,7 @@ async def get_oversea_report_pdf(
             return await stream_pdf_or_file(
                 db=_db(),
                 pdf_rel_path=rel_from_doc,
-                pdf_root=settings.jinmen_pdf_dir,
+                pdf_root=pdf_roots,
                 download_filename=title,
                 download=bool(download),
             )
@@ -822,7 +858,7 @@ async def get_oversea_report_pdf(
     return await stream_pdf_or_file(
         db=_db(),
         pdf_rel_path=str(target),
-        pdf_root=settings.jinmen_pdf_dir,
+        pdf_root=pdf_roots,
         download_filename=title,
         download=bool(download),
     )

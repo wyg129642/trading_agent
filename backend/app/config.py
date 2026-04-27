@@ -152,6 +152,10 @@ class Settings(BaseSettings):
     jinmen_mongo_uri: str = REMOTE_CRAWL_MONGO_URI
     jinmen_mongo_db: str = "jinmen-full"
     jinmen_pdf_dir: str = "/home/ygwang/crawl_data/jinmen_pdfs"
+    # 外资研报 (oversea_reports) 落盘到独立目录 — scraper 历史路径与 jinmen_pdf_dir
+    # 不同, 必须在 stream_pdf_or_file 的允许 root 列表里, 否则 _is_under 校验拒读
+    # 本地文件、被迫走 GridFS / upstream 慢路径.
+    jinmen_oversea_pdf_dir: str = "/home/ygwang/crawl_data/overseas_pdf"
 
     # Meritco MongoDB (久谦中台 → 远端 jiuqian-full)
     meritco_mongo_uri: str = REMOTE_CRAWL_MONGO_URI
@@ -289,6 +293,20 @@ class Settings(BaseSettings):
     llm_enrichment_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_enrichment_model: str = "qwen-plus"
     realtime_llm_enrichment_enabled: bool = False
+
+    # Realtime LLM ticker tagger — fallback NER for docs the rule path
+    # leaves with `_canonical_tickers: []`. Polls fresh empty-canonical docs
+    # (newer than `lookback_hours`) every `interval_sec`, calls a cheap chat
+    # model, writes `_llm_canonical_tickers` etc. Daily budget is enforced via
+    # Redis (`llm_tagger:cost:YYYY-MM-DD`). Service implementation lives at
+    # `backend/app/services/realtime_llm_tagger.py`. Use the manual script
+    # `scripts/llm_tag_tickers.py` for explicit large backfills.
+    llm_tag_realtime_enabled: bool = False
+    llm_tag_realtime_model: str = "qwen-plus"
+    llm_tag_realtime_daily_budget_usd: float = 5.0
+    llm_tag_realtime_interval_sec: int = 60
+    llm_tag_realtime_lookback_hours: int = 2
+    llm_tag_realtime_batch_size: int = 50
 
     # OpenRouter (for AI Chat multi-model)
     openrouter_api_key: str = ""

@@ -50,6 +50,12 @@ _current_trace_id: ContextVar[str] = ContextVar("chat_trace_id", default="no-tra
 # values do not bleed between sibling tasks in the fan-out.
 _current_model_id_var: ContextVar[str] = ContextVar("chat_model_id", default="")
 
+# Per-task tool-call round number. chat_llm sets it inside dispatch_tool so
+# downstream services (kb_service, user_kb_service) emit KB_REQUEST /
+# KB_RESULTS / USER_KB_* events with the round they fired in, instead of the
+# default 0 (which made the audit timeline miss the round filter).
+_current_round_num_var: ContextVar[int] = ContextVar("chat_round_num", default=0)
+
 
 def setup_chat_debug_logging(log_dir: str | Path = "logs") -> None:
     """Configure the chat_debug logger with a rotating file handler.
@@ -471,23 +477,33 @@ class ChatTrace:
             "calls": normalised,
         }, round_num=round_num)
 
-    def log_tool_exec_start(self, tool_name: str, arguments: dict):
+    def log_tool_exec_start(self, tool_name: str, arguments: dict, round_num: int | None = None):
+        rn = round_num if round_num is not None else _current_round_num_var.get()
         _logger.info(
-            "%s | TOOL_EXEC_START | tool=%s args=%s",
-            self._prefix(), tool_name, _safe_json(arguments, 800),
+            "%s | TOOL_EXEC_START | tool=%s round=%s args=%s",
+            self._prefix(), tool_name, rn, _safe_json(arguments, 800),
         )
         self._emit("TOOL_EXEC_START", {
             "tool_name": tool_name,
             "arguments": arguments,
-        }, tool_name=tool_name)
+            "round_num": rn,
+        }, tool_name=tool_name, round_num=rn or None)
 
-    def log_tool_exec_done(self, tool_name: str, result: str, elapsed_ms: int, error: bool = False):
+    def log_tool_exec_done(
+        self,
+        tool_name: str,
+        result: str,
+        elapsed_ms: int,
+        error: bool = False,
+        round_num: int | None = None,
+    ):
+        rn = round_num if round_num is not None else _current_round_num_var.get()
         level = logging.WARNING if error else logging.INFO
         _logger.log(
             level,
-            "%s | TOOL_EXEC_DONE | tool=%s elapsed=%dms result_len=%d error=%s\n"
+            "%s | TOOL_EXEC_DONE | tool=%s round=%s elapsed=%dms result_len=%d error=%s\n"
             "  result_preview: %s",
-            self._prefix(), tool_name, elapsed_ms, len(result), error,
+            self._prefix(), tool_name, rn, elapsed_ms, len(result), error,
             _truncate(result, 1000),
         )
         # Count tool executions for run-level rollups.
@@ -503,12 +519,14 @@ class ChatTrace:
             "result_len": len(result),
             "result": result,
             "error": error,
-        }, tool_name=tool_name, latency_ms=elapsed_ms)
+            "round_num": rn,
+        }, tool_name=tool_name, latency_ms=elapsed_ms, round_num=rn or None)
 
-    def log_tool_timeout(self, tool_name: str, timeout_s: float):
+    def log_tool_timeout(self, tool_name: str, timeout_s: float, round_num: int | None = None):
+        rn = round_num if round_num is not None else _current_round_num_var.get()
         _logger.error(
-            "%s | TOOL_TIMEOUT | tool=%s timeout=%.0fs",
-            self._prefix(), tool_name, timeout_s,
+            "%s | TOOL_TIMEOUT | tool=%s round=%s timeout=%.0fs",
+            self._prefix(), tool_name, rn, timeout_s,
         )
         self._state["any_error"] = True
         if not self._state.get("first_error"):
@@ -516,7 +534,8 @@ class ChatTrace:
         self._emit("TOOL_TIMEOUT", {
             "tool_name": tool_name,
             "timeout_s": timeout_s,
-        }, tool_name=tool_name)
+            "round_num": rn,
+        }, tool_name=tool_name, round_num=rn or None)
 
     # ── Gemini-specific ──────────────────────────────────────────
 
@@ -807,14 +826,17 @@ class ChatTrace:
         sources: list | None = None,
         date_range: dict | None = None,
         top_k: int = 0,
+        round_num: int | None = None,
+        tool_name: str = "kb_search",
     ):
         """Log a KB tool invocation (query + full filter stack)."""
+        rn = round_num if round_num is not None else _current_round_num_var.get()
         _logger.info(
-            "%s | KB_REQUEST | query='%s' tickers=%s doc_types=%s sources=%s "
-            "date_range=%s top_k=%d",
-            self._prefix(), _truncate(query, 200),
+            "%s | KB_REQUEST | tool=%s query='%s' tickers=%s doc_types=%s sources=%s "
+            "date_range=%s top_k=%d round=%s",
+            self._prefix(), tool_name, _truncate(query, 200),
             tickers or [], doc_types or [], sources or [],
-            date_range or {}, top_k,
+            date_range or {}, top_k, rn,
         )
         self._emit("KB_REQUEST", {
             "query": query,
@@ -823,7 +845,40 @@ class ChatTrace:
             "sources": list(sources or []),
             "date_range": dict(date_range or {}),
             "top_k": top_k,
-        }, tool_name="kb_search")
+            "round_num": rn,
+        }, tool_name=tool_name, round_num=rn or None)
+
+    def log_kb_fetch(
+        self,
+        doc_id: str,
+        max_chars: int = 0,
+        result_len: int = 0,
+        result_preview: str = "",
+        error: str = "",
+        round_num: int | None = None,
+    ):
+        """Log a kb_fetch_document call: doc_id, requested length, returned size.
+
+        Pairs with the surrounding TOOL_EXEC_START / TOOL_EXEC_DONE so the
+        audit UI can show *which document* the LLM pulled, separate from the
+        full markdown body that's already on the DONE event.
+        """
+        rn = round_num if round_num is not None else _current_round_num_var.get()
+        source = doc_id.split(":", 1)[0] if doc_id else ""
+        _logger.info(
+            "%s | KB_FETCH | doc_id=%s source=%s max_chars=%d result_len=%d round=%s%s",
+            self._prefix(), doc_id, source, max_chars, result_len, rn,
+            f" error={_truncate(error, 200)}" if error else "",
+        )
+        self._emit("KB_FETCH", {
+            "doc_id": doc_id,
+            "source": source,
+            "max_chars": max_chars,
+            "result_len": result_len,
+            "result_preview": _truncate(result_preview, 800) if result_preview else "",
+            "error": error or "",
+            "round_num": rn,
+        }, tool_name="kb_fetch_document", round_num=rn or None)
 
     def log_user_kb_request(
         self,
@@ -831,30 +886,37 @@ class ChatTrace:
         query: str,
         top_k: int = 0,
         document_ids: list[str] | None = None,
+        round_num: int | None = None,
+        tool_name: str = "user_kb_search",
     ):
         """Log a user_kb_* tool invocation."""
+        rn = round_num if round_num is not None else _current_round_num_var.get()
         _logger.info(
-            "%s | USER_KB_REQUEST | user=%s query='%s' top_k=%d doc_ids=%s",
-            self._prefix(), user_id, _truncate(query, 200), top_k,
-            document_ids or [],
+            "%s | USER_KB_REQUEST | tool=%s user=%s query='%s' top_k=%d doc_ids=%s round=%s",
+            self._prefix(), tool_name, user_id, _truncate(query, 200), top_k,
+            document_ids or [], rn,
         )
         self._emit("USER_KB_REQUEST", {
             "user_id": user_id,
             "query": query,
             "top_k": top_k,
             "document_ids": list(document_ids or []),
-        }, tool_name="user_kb_search")
+            "round_num": rn,
+        }, tool_name=tool_name, round_num=rn or None)
 
     def log_user_kb_results(
         self,
         query: str,
         result_count: int,
         top_titles: list[str],
+        round_num: int | None = None,
+        tool_name: str = "user_kb_search",
     ):
         """Log user_kb search hit summary."""
+        rn = round_num if round_num is not None else _current_round_num_var.get()
         _logger.info(
-            "%s | USER_KB_RESULTS | query='%s' count=%d\n  top_titles:\n%s",
-            self._prefix(), _truncate(query, 120), result_count,
+            "%s | USER_KB_RESULTS | tool=%s query='%s' count=%d round=%s\n  top_titles:\n%s",
+            self._prefix(), tool_name, _truncate(query, 120), result_count, rn,
             "\n".join(f"    - {_truncate(t, 180)}" for t in top_titles[:10])
             or "    (none)",
         )
@@ -862,7 +924,8 @@ class ChatTrace:
             "query": query,
             "result_count": result_count,
             "top_titles": list(top_titles or []),
-        }, tool_name="user_kb_search")
+            "round_num": rn,
+        }, tool_name=tool_name, round_num=rn or None)
 
     def log_kb_results(
         self,
@@ -870,15 +933,18 @@ class ChatTrace:
         result_count: int,
         top_titles: list[str],
         sources: list[str] | None = None,
+        round_num: int | None = None,
+        tool_name: str = "kb_search",
     ):
         """Log structured KB search results (titles + source distribution)."""
+        rn = round_num if round_num is not None else _current_round_num_var.get()
         src_counts: dict[str, int] = {}
         for s in (sources or []):
             if s:
                 src_counts[s] = src_counts.get(s, 0) + 1
         _logger.info(
-            "%s | KB_RESULTS | query='%s' count=%d src_dist=%s\n  top_titles:\n%s",
-            self._prefix(), _truncate(query, 120), result_count, src_counts,
+            "%s | KB_RESULTS | tool=%s query='%s' count=%d round=%s src_dist=%s\n  top_titles:\n%s",
+            self._prefix(), tool_name, _truncate(query, 120), result_count, rn, src_counts,
             "\n".join(f"    - {_truncate(t, 180)}" for t in top_titles[:10]) or "    (none)",
         )
         self._emit("KB_RESULTS", {
@@ -886,7 +952,8 @@ class ChatTrace:
             "result_count": result_count,
             "top_titles": list(top_titles or []),
             "src_distribution": src_counts,
-        }, tool_name="kb_search")
+            "round_num": rn,
+        }, tool_name=tool_name, round_num=rn or None)
 
     # ── Final summary at request end ─────────────────────────────
 
@@ -1000,3 +1067,19 @@ def get_current_model_id() -> str:
     automatically when model_id is not explicitly passed.
     """
     return _current_model_id_var.get()
+
+
+def get_current_round_num() -> int:
+    """Round (1-based) of the active tool dispatch, or 0 outside one."""
+    return _current_round_num_var.get()
+
+
+def set_current_round_num(round_num: int) -> None:
+    """Set the active tool-dispatch round in this task's context.
+
+    Called by ``chat_llm.dispatch_tool`` so KB / web tools log events with
+    the correct round_num without each callsite having to thread it
+    through. asyncio.create_task copies the parent context, so this stays
+    scoped to the dispatching task.
+    """
+    _current_round_num_var.set(int(round_num or 0))

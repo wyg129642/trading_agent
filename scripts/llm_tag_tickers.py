@@ -12,28 +12,27 @@
   2. 拼 title + 正文片段 → LLM `chat.completions`(强制 JSON 输出)
   3. LLM 返回 `{"tickers": ["AAPL.US", "0700.HK", ...]}`
   4. 走 `ticker_normalizer.normalize_with_unmatched()` 标准化(白名单卡死,
-     LLM 编造的 market 后缀会被丢进 `_unmatched_raw` 而不会污染 canonical)
+     LLM 编造的 market 后缀会被丢进 `_llm_unmatched_raw` 而不会污染 canonical)
   5. 写回 Mongo + 累计 token / 美元开销;触达预算或文档上限即停
 
 设计原则:
 
-- **跟 `enrich_tickers.py` 严格分工** —— 它做"无成本的规则路径",本脚本做
-  "按量付费的 LLM 路径"。两边都用 `normalize_with_unmatched`,后台审计字段
-  `_canonical_extract_source` 一眼区分:
-      * `<source>`            ← 结构化字段命中
-      * `<source>_title`      ← 标题正则兜底
-      * `<source>_llm:<model>` ← 本脚本
+- **跟 `enrich_tickers.py` 严格分工 + 字段独立** —— 规则路径写
+  `_canonical_tickers` / `_canonical_extract_source`;LLM 路径写**独立的**
+  `_llm_canonical_tickers` / `_llm_canonical_tickers_at` /
+  `_llm_unmatched_raw` / `_llm_extract_source`。两边互不覆写,
+  下游做联合查询时用 `$or` 同时取两个字段(见 TICKER_AGGREGATION.md §1)。
 - **预算先行,样本估算** —— 跑前先抽样 N 条(默认 20)估算 in/out 平均
   tokens,投影到目标文档总数,弹出 `(预估 tokens / 美元 / 时长)` 表;
   `--yes` 跳过确认。
 - **预算硬停** —— `--max-cost-usd` / `--max-docs` 任一触达即 `await _flush()`
   + `sys.exit(0)`,不会偷偷超标。
-- **幂等** —— 已被 LLM 打过标的文档(`_canonical_extract_source` 含 `_llm:`)
+- **幂等** —— 已被 LLM 打过标的文档(`_llm_canonical_tickers` 字段已存在)
   默认 skip,除非 `--force-relabel`。
 - **失败退避** —— LLM 单条失败不写回,下次再扫;500/502/503/429 指数退避两次。
 
 使用文档 + 模型菜单 + token 预估见
-``crawl/ticker_untagged_snapshot_2026_04_25.md`` 末尾的 "LLM 自动打标脚本" 一节。
+``crawl/TICKER_AGGREGATION.md`` §7.2 "LLM 路径"。
 """
 from __future__ import annotations
 
@@ -252,13 +251,46 @@ CODE format rules:
 - KS: 6-digit code + .KS                        (e.g. 005930.KS for Samsung)
 - Others: native ticker + market code           (e.g. NESN.CH, ASML.NL)
 
-Strict rules — follow them to avoid garbage tags:
-1. Tag ONLY the document's primary analysis subject(s). Casual mentions ("compared to AAPL...") DO NOT count.
-2. If the document is macro / industry / strategy / weekly with no single-stock subject, return {"tickers": []}.
-3. If the title gives a Chinese or English company name with no code, use your knowledge — but ONLY when you are confident which listing exchange. If multiply-listed, prefer the primary listing for that company's main market.
-4. Return at most 5 tickers, in importance order.
-5. NEVER invent or guess CODE.MARKET pairs you are not sure of. Output empty list when uncertain.
-6. Output exactly the JSON object — no prose, no markdown fences."""
+STRICT RULES — follow them or your output is rejected:
+
+1. **EVIDENCE REQUIRED**: For every ticker you output, the company's name (Chinese or English) MUST appear verbatim in the Title or Body. Inferring from theme/industry alone is forbidden. Example: a "原奶 / 乳品" report mentioning 伊利 → 600887.SH OK; the same report does NOT justify 蒙牛 unless the body literally contains "蒙牛".
+2. **NO CODE FABRICATION**: If a Chinese / HK company is named in the text but you cannot recall its exact 6-digit (A-share) or 5-digit (HK) code with high confidence, **omit it**. Hallucinated codes are far worse than missing tags. When in doubt, output empty.
+3. **PRIMARY SUBJECT ONLY**: Tag only stocks that are the document's analysis subject. Casual mentions ("compared to AAPL...", "competitors include...") do NOT count.
+4. **EMPTY IS OK**: Macro / industry / strategy / weekly / theme reports with no specific named company → return `{"tickers": []}`. Industry round-ups (e.g. "化妆品行业拆解", "银行周观点") that don't name specific companies → empty.
+5. **MULTIPLY-LISTED**: Prefer the primary listing of the company's home market. For US ADRs of foreign companies (e.g. ALZCF, BFSAF, DNKEY), output the .US form when the title shows the .US ticker explicitly.
+6. **CAP**: at most 5 tickers, in order of importance.
+7. **JSON ONLY**: output exactly the JSON object — no prose, no markdown fences.
+
+EXAMPLES:
+
+Title: "Lyft 2024年第2季度业绩电话会议纪要"
+Body: "Lyft Inc. reported Q2 2024 revenue of …"
+→ {"tickers":["LYFT.US"]}    (Lyft is named subject, US ADR)
+
+Title: "PRADA 24H1业绩交流纪要"
+Body: "Prada S.p.A. reported H1 results…"
+→ {"tickers":["01913.HK"]}   (PRADA HK-listed; named in title)
+
+Title: "兴证食饮 | 原奶周期展望及乳品春节反馈"
+Body: "原奶价格持续下行,头部乳企盈利改善 …"
+→ {"tickers":[]}              (industry topic, no specific company named in body excerpt)
+
+Title: "兴证食饮 | 原奶周期展望"
+Body: "我们看好伊利股份(600887)的盈利改善 …"
+→ {"tickers":["600887.SH"]}   (伊利 named in body)
+
+Title: "Moncler 25Q2会议纪要"
+Body: "Moncler reported revenue of …"
+→ {"tickers":[]}              (Moncler is MI/MIL listed; if you don't recall the code, leave empty — never guess HK)
+
+Title: "兴证电子 | 功率行业密集涨价函怎么看?"
+Body: "(无具体公司点名)"
+→ {"tickers":[]}              (industry note; no named subject in excerpt)
+
+Title: "兴证汽车 | 2月车企销量解读"
+Body: "比亚迪、长城汽车销量同比 …"
+→ {"tickers":["002594.SZ","601633.SH"]}    (only those literally named)
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +357,131 @@ def _parse_json_response(text: str) -> list[str]:
             if isinstance(code, str) and isinstance(mkt, str):
                 out.append(f"{code.strip()}.{mkt.strip()}".upper())
     return out
+
+
+# ---------------------------------------------------------------------------
+# Mention validation — reject hallucinated tickers whose company name doesn't
+# appear in the prompt text the LLM saw. Cheap defense against the most common
+# qwen-plus failure mode (confident 6-digit / 5-digit code drift).
+# ---------------------------------------------------------------------------
+_ALIAS_INDEX_CACHE: dict[str, set[str]] | None = None
+
+_CJK_CORP_SUFFIXES = (
+    "有限公司", "股份有限公司", "集团有限公司",
+    "股份", "集团", "公司", "科技", "证券",
+)
+
+
+def _is_cjk_char(c: str) -> bool:
+    return "一" <= c <= "鿿"
+
+
+def _has_cjk(s: str) -> bool:
+    return any(_is_cjk_char(c) for c in s)
+
+
+def _alias_min_len(alias: str) -> bool:
+    """Drop aliases too short for substring matching (false-positive risk)."""
+    if not alias:
+        return False
+    if _has_cjk(alias):
+        return len(alias) >= 2          # CN: 2-char names like "伊利", "BYD" passable
+    return len(alias) >= 3               # ASCII: 3+ chars to dodge "AI" / "IT" / "US"
+
+
+def _expand_alias(alias: str) -> set[str]:
+    """Expand one alias into matchable variants (all lowercased).
+
+    For "Prada S.p.A." → {"prada s.p.a.", "prada"}.
+    For "长城汽车" → {"长城汽车", "长城"} (after stripping CJK corp suffixes).
+    For "Bank of Ningbo Co.,Ltd." → {"bank of ningbo co.,ltd.", "bank", "ningbo", "co.,ltd."} —
+      then min-len filter weeds out "co.,ltd." style noise downstream.
+    """
+    out: set[str] = {alias}
+    # ASCII tokens (split on space; strip surrounding punctuation)
+    for tok in alias.split():
+        t = tok.strip(".,()[]\"'")
+        if len(t) >= 3 and all(ord(c) < 128 for c in t):
+            out.add(t)
+    # CJK stem after stripping corporate suffixes
+    if _has_cjk(alias):
+        cur = alias
+        # Strip iteratively: "...有限公司" then "...股份" then ...
+        for _ in range(3):
+            stripped = cur
+            for sfx in _CJK_CORP_SUFFIXES:
+                if stripped.endswith(sfx) and len(stripped) > len(sfx) + 1:
+                    stripped = stripped[: -len(sfx)]
+                    break
+            if stripped == cur:
+                break
+            cur = stripped
+        if cur != alias and len(cur) >= 2:
+            out.add(cur)
+    return out
+
+
+def _load_alias_index() -> dict[str, set[str]]:
+    """Build ticker → set(alias_lower) by reverse-mapping aliases_bulk + curated.
+    Each alias is expanded into its matchable variants (stems / leading word)."""
+    global _ALIAS_INDEX_CACHE
+    if _ALIAS_INDEX_CACHE is not None:
+        return _ALIAS_INDEX_CACHE
+    base = _ROOT / "backend/app/services/ticker_data"
+    rev: dict[str, set[str]] = {}
+    for fname in ("aliases_bulk.json", "aliases.json"):
+        try:
+            data = json.loads((base / fname).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        for name, tk in data.items():
+            if name == "_meta" or not isinstance(tk, str) or not tk:
+                continue
+            n = name.strip()
+            if not _alias_min_len(n):
+                continue
+            for variant in _expand_alias(n.lower()):
+                if _alias_min_len(variant):
+                    rev.setdefault(tk.upper(), set()).add(variant)
+    _ALIAS_INDEX_CACHE = rev
+    return rev
+
+
+def _validate_by_mention(
+    tickers: list[str],
+    prompt_text: str,
+    alias_index: dict[str, set[str]],
+) -> tuple[list[str], list[str]]:
+    """Drop tickers whose any alias does NOT appear in prompt_text.
+
+    Rules:
+    - Code-prefix in haystack (e.g. ALZCF in "(ALZCF)") → keep (ADR convention)
+    - Any alias / alias-stem substring-matches haystack → keep
+    - No aliases AND ticker is CN/HK (.SH/.SZ/.BJ/.HK) → drop (likely fabricated)
+    - No aliases AND ticker is non-CN → keep (benefit of doubt; usually US/JP)
+
+    Returns (kept, dropped)."""
+    haystack = prompt_text.lower()
+    kept: list[str] = []
+    dropped: list[str] = []
+    for tk in tickers:
+        tk_up = tk.upper()
+        code, _, market = tk_up.partition(".")
+        # 1. Code prefix mentioned in haystack (covers explicit ADR tags)
+        if code and len(code) >= 3 and code.lower() in haystack:
+            kept.append(tk)
+            continue
+        aliases = alias_index.get(tk_up, set())
+        # 2. Any alias / stem matches haystack
+        if aliases and any(a in haystack for a in aliases):
+            kept.append(tk)
+            continue
+        # 3. No evidence → drop CN/HK tickers; keep others (US/JP rarely fabricated)
+        if not aliases and market not in ("SH", "SZ", "BJ", "HK"):
+            kept.append(tk)
+        else:
+            dropped.append(tk)
+    return kept, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -495,11 +652,8 @@ async def process_collection(
 
     query: dict = {"_canonical_tickers": []}
     if not force_relabel:
-        # Skip docs we already LLM-tagged (provenance audit)
-        query["$or"] = [
-            {"_canonical_extract_source": {"$exists": False}},
-            {"_canonical_extract_source": {"$not": {"$regex": "_llm:"}}},
-        ]
+        # Skip docs we already LLM-tagged (presence of dedicated LLM field)
+        query["_llm_canonical_tickers"] = {"$exists": False}
 
     projection = {f: 1 for f in (
         *spec.title_fields,
@@ -511,6 +665,7 @@ async def process_collection(
         cursor = cursor.limit(max_docs)
 
     sem = asyncio.Semaphore(model_spec.speed_qps)
+    alias_index = _load_alias_index()
     pending: list[UpdateOne] = []
     scanned = 0
     written = 0
@@ -543,16 +698,24 @@ async def process_collection(
             budget.docs_done += 1
 
             matched, unmatched = normalize_with_unmatched(tickers_raw)
+            # Mention-validation post-filter: ticker must be backed by an alias
+            # appearing in title+body that the LLM saw. Drops typical hallucinations
+            # (09988.HK in dairy report, 重庆银行 for Moncler, etc.).
+            kept, dropped_by_mention = _validate_by_mention(matched, user_prompt, alias_index)
+            if dropped_by_mention:
+                # Surface drops alongside normalizer-rejects for audit
+                unmatched = list(unmatched) + [f"mention_drop:{tk}" for tk in dropped_by_mention]
+            matched = kept
             if matched:
                 budget.docs_tagged += 1
             now = datetime.now(timezone.utc)
             pending.append(UpdateOne(
                 {"_id": doc["_id"]},
                 {"$set": {
-                    "_canonical_tickers": matched,
-                    "_canonical_tickers_at": now,
-                    "_unmatched_raw": unmatched,
-                    "_canonical_extract_source": f"{source}_llm:{model_spec.key}",
+                    "_llm_canonical_tickers": matched,
+                    "_llm_canonical_tickers_at": now,
+                    "_llm_unmatched_raw": unmatched,
+                    "_llm_extract_source": f"{source}_llm:{model_spec.key}",
                 }},
             ))
 
@@ -612,10 +775,7 @@ async def _count_targets(
         coll = clients[uri][db_name][coll_name]
         q: dict = {"_canonical_tickers": []}
         if not force_relabel:
-            q["$or"] = [
-                {"_canonical_extract_source": {"$exists": False}},
-                {"_canonical_extract_source": {"$not": {"$regex": "_llm:"}}},
-            ]
+            q["_llm_canonical_tickers"] = {"$exists": False}
         total += await coll.count_documents(q)
     return total
 
@@ -735,7 +895,7 @@ async def _main(args: argparse.Namespace) -> int:
 
     # ---- Estimate
     target_total = await _count_targets(targets, clients_by_uri, args.force_relabel)
-    print(f"\nTarget docs (`_canonical_tickers: []` & not yet LLM-tagged): {target_total:,}")
+    print(f"\nTarget docs (`_canonical_tickers: []` & `_llm_canonical_tickers` not set): {target_total:,}")
     if max_docs is not None:
         target_total = min(target_total, max_docs)
         print(f"Capped by --max-docs to: {target_total:,}")
@@ -877,7 +1037,7 @@ def main() -> int:
         "--force-relabel",
         action="store_true",
         help="Re-tag docs already touched by a previous LLM run "
-             "(default: skip docs whose _canonical_extract_source already contains '_llm:').",
+             "(default: skip docs that already have a `_llm_canonical_tickers` field).",
     )
     ap.add_argument(
         "--reload-aliases",

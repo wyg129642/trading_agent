@@ -99,22 +99,42 @@ class Target:
 # (higher m = faster — shorter throttle, larger burst+cap, shorter cooldown).
 #
 # 2026-04-26 第二轮调速 — 基于真实测量校准:
-#   gangtise    10x    实测无反爬信号, 保留观察
+#   gangtise     5x    原 10x 让 burst=300 在 2.6min 吃掉一大块 bg-budget;
+#                      改 5x 让 base=0.8s/burst=150, 配合扩大的 bg-budget=8000
+#                      慢慢 24h 撑开抓
 #   jinmen       3x    15x 被平台返回 "msg:稍后再试" + 60min 静默, 实际比 1x 还慢;
 #                      降到 3x = base 1.3s 接近合理边界
 #   alphaengine  1x    5x 秒触发 REFRESH_LIMIT (quota 是平台日定额, 跟请求率无关),
 #                      加速等于"快速消耗 quota → 进入 30min cooldown → 每天少做几个
 #                      cycle", 反而是负优化. 1x 让单 cycle 慢慢吃满 400 条 quota.
 SPEED_MULT: dict[str, float] = {
-    "gangtise":    10.0,
+    "gangtise":     5.0,
     "jinmen":       3.0,
     "alphaengine":  1.0,
     # other platforms default to 1.0 (alphapai/meritco/funda/acecamp)
 }
 
+# 2026-04-27: 调高 24h backfill 桶上限解决 "scraper 启动立即 [antibot] daily-cap 达到"
+# 现象 — antibot _PLATFORM_BACKFILL_DEFAULTS 的 1500/day 在 6 个月回填语境下太紧,
+# burst+0.4s base 一启动 16min 就撞顶, 之后 24h 整个 zset 滚出窗口前都 0 入库.
+# 用户授权: "增多一些上限 慢慢爬取一般不会封号的". 配合 SPEED_MULT 降速 + Gaussian
+# throttle 节奏保持温和.
+PLATFORM_BG_BUDGETS: dict[str, int] = {
+    "alphapai":      5000,
+    "jinmen":        6000,
+    "meritco":       3000,
+    "funda":         4000,
+    "gangtise":     10000,   # 5 个 type 共用一个 G_token (research+summary+chief × backfill+watch)
+    "acecamp":       2000,
+    "alphaengine":   4000,
+    "thirdbridge":    600,
+    "semianalysis":  2000,
+}
+
 
 def universal_flags_for(platform: str) -> list[str]:
     m = SPEED_MULT.get(platform, 1.0)
+    bg_budget = PLATFORM_BG_BUDGETS.get(platform, 4000)
     return [
         "--throttle-base",        f"{4.0 / m:.3f}",
         "--throttle-jitter",      f"{2.5 / m:.3f}",
@@ -123,6 +143,7 @@ def universal_flags_for(platform: str) -> list[str]:
         "--burst-cooldown-max",   str(max(15, int(180 / m))),
         "--daily-cap",            str(int(400 * m)),
         "--account-role",         "bg",
+        "--bg-budget",            str(bg_budget),
         # Stream mode: each scraper dumps per-page instead of list-first-then-dump,
         # so DB writes start on page 1 and deep_page checkpoint enables resume.
         "--stream-backfill",
@@ -290,6 +311,13 @@ def probe_count(mc: MongoClient, target: Target) -> int:
 class PlatformRunner:
     """Drives one platform's target list sequentially."""
 
+    # Stall watchdog: kill child if its log file hasn't been written for this
+    # many seconds while the process is still alive. Catches scrapers that
+    # silently hang in select() / blocked socket I/O without exiting (observed
+    # 2026-04-27: 3 alphaengine PIDs hung in do_select for 14h, orchestrator's
+    # `proc.poll()` check kept them as "running" forever).
+    STALL_TIMEOUT_S = 1800   # 30 min
+
     def __init__(self, platform: str, targets: list[Target], cutoff_ms: int):
         self.platform = platform
         self.targets = targets
@@ -297,6 +325,7 @@ class PlatformRunner:
         self.idx = 0
         self.proc: subprocess.Popen | None = None
         self.log_file = None
+        self.log_path: Path | None = None
         self.started_at: float | None = None
         self.start_count: int = 0
         self.start_oldest_ms: int | None = None
@@ -344,6 +373,7 @@ class PlatformRunner:
             if self.start_oldest_ms else "empty"
         )
         log_path = LOG_DIR / f"{t.key}.log"
+        self.log_path = log_path
         # Inject remote Mongo URI + resolved DB name. Post-migration the local
         # crawl_data container is gone; scraper's hardcoded "alphapai" default
         # must be overridden with the remote "alphapai-full" alias.
@@ -424,7 +454,31 @@ class PlatformRunner:
                     f"— scraper 保持活跃以 refresh 新 docs"
                 )
                 self._cutoff_logged = True
-        # 2) process exit check
+        # 2a) stall watchdog: if process is alive but its log file hasn't been
+        # written for STALL_TIMEOUT_S seconds, force-kill so step 2b restarts it.
+        # Guards against scrapers hanging in select() / blocked socket I/O.
+        if self.proc and self.proc.poll() is None and self.log_path is not None:
+            try:
+                age = time.time() - self.log_path.stat().st_mtime
+            except OSError:
+                age = 0
+            if age > self.STALL_TIMEOUT_S:
+                logging.warning(
+                    f"[{t.key}] STALLED — log idle {age/60:.1f}min "
+                    f"(threshold {self.STALL_TIMEOUT_S/60:.0f}min), "
+                    f"killing pid={self.proc.pid}"
+                )
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                # Don't return — fall through to step 2b which will detect the
+                # exit on this same poll cycle and restart.
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        # 2b) process exit check
         if self.proc and self.proc.poll() is not None:
             rc = self.proc.returncode
             self._finalize_and_log(mc, f"process exited rc={rc}")

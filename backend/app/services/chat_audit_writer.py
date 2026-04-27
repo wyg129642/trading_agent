@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import insert, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.database import async_session_factory
@@ -40,8 +41,11 @@ logger = logging.getLogger(__name__)
 
 # ── Tunables ────────────────────────────────────────────────────────
 
-#: Max payload size per event (bytes after JSON serialisation).
-PAYLOAD_MAX_BYTES = 32 * 1024
+#: Max payload size per event (bytes after JSON serialisation). Raised from
+#: 32 KB so kb_search / kb_fetch_document results — the actual text the LLM
+#: read — survive intact for audit replay. Postgres JSONB has no hard limit
+#: short of ~1 GB; this is a memory-safety cap, not a correctness one.
+PAYLOAD_MAX_BYTES = 256 * 1024
 
 #: Drain at most every N seconds even if the batch isn't full.
 FLUSH_INTERVAL_S = 0.25
@@ -64,6 +68,11 @@ SENSITIVE_KEYS = {
 #: Token-shaped strings inside free-form text get stripped.
 _BEARER_RE = re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{8,}", re.I)
 _SK_KEY_RE = re.compile(r"sk-[A-Za-z0-9]{20,}")
+
+#: Postgres JSONB rejects U+0000; PDF/HTML extracted text occasionally smuggles
+#: it through. Strip on the way in so a single bad payload can't poison the
+#: whole batch.
+_NUL_RE = re.compile(r"\x00")
 
 
 # ── Queue records ───────────────────────────────────────────────────
@@ -95,6 +104,24 @@ class _Shutdown:
 _queue: asyncio.Queue | None = None
 _task: asyncio.Task | None = None
 
+#: Run IDs we have ever submitted a run_start for. Used so the consumer knows
+#: it's safe to insert events for that run without first synthesising a stub.
+#: Bounded to avoid unbounded growth on a long-lived process; oldest entries
+#: drop off on overflow which only costs us one extra ON CONFLICT no-op.
+_RUNS_SEEN_MAX = 5000
+_runs_started: set[uuid.UUID] = set()
+_runs_started_order: list[uuid.UUID] = []
+
+
+def _mark_run_started(run_id: uuid.UUID) -> None:
+    if run_id in _runs_started:
+        return
+    _runs_started.add(run_id)
+    _runs_started_order.append(run_id)
+    if len(_runs_started_order) > _RUNS_SEEN_MAX:
+        old = _runs_started_order.pop(0)
+        _runs_started.discard(old)
+
 
 def _get_queue() -> asyncio.Queue | None:
     return _queue
@@ -104,11 +131,44 @@ def is_running() -> bool:
     return _task is not None and not _task.done()
 
 
+def _stub_run_payload(run_id: uuid.UUID, trace_id: str) -> dict[str, Any]:
+    """Build a minimal run row when an event arrives before its run_start.
+
+    This fires when the master trace's run_start was lost (process restart,
+    earlier batch failure, race with per-model fan-out). Inserting a stub
+    keeps the FK satisfied so the events themselves persist; the real
+    run_start INSERT later becomes a no-op via ON CONFLICT DO NOTHING.
+    """
+    now = datetime.now(timezone.utc)
+    return dict(
+        id=run_id,
+        trace_id=trace_id or f"orphan-{run_id.hex[:12]}",
+        user_id=None,
+        username="",
+        conversation_id=None,
+        message_id=None,
+        user_content="",
+        models_requested=[],
+        mode="standard",
+        web_search_mode="off",
+        feature_flags={},
+        system_prompt_len=0,
+        history_messages=0,
+        tools_offered=[],
+        status="running",
+        started_at=now,
+        client_ip=None,
+        user_agent=None,
+    )
+
+
 # ── Redaction ───────────────────────────────────────────────────────
 
 def _redact_str(s: str) -> str:
     s = _BEARER_RE.sub("Bearer <redacted>", s)
     s = _SK_KEY_RE.sub("<redacted-key>", s)
+    if "\x00" in s:
+        s = _NUL_RE.sub("", s)
     return s
 
 
@@ -276,6 +336,30 @@ def submit_run_finalize(
 
 # ── Background consumer ─────────────────────────────────────────────
 
+async def _insert_run_stubs_if_missing(
+    session: AsyncSession,
+    events: list[_Event],
+) -> None:
+    """Synthesize and insert run rows for any event whose run_start wasn't
+    submitted in this writer's lifetime. Idempotent via ON CONFLICT.
+    """
+    needed: dict[uuid.UUID, dict[str, Any]] = {}
+    for e in events:
+        rid = e.payload.get("run_id")
+        if not isinstance(rid, uuid.UUID):
+            continue
+        if rid in _runs_started or rid in needed:
+            continue
+        trace_id = e.payload.get("trace_id") or ""
+        needed[rid] = _stub_run_payload(rid, trace_id)
+    if not needed:
+        return
+    stmt = pg_insert(ChatAuditRun).on_conflict_do_nothing(index_elements=["id"])
+    await session.execute(stmt, list(needed.values()))
+    for rid in needed:
+        _mark_run_started(rid)
+
+
 async def _flush_batch(
     session: AsyncSession,
     run_starts: list[_RunStart],
@@ -283,11 +367,20 @@ async def _flush_batch(
     finalizes: list[_RunFinalize],
 ) -> None:
     if run_starts:
-        await session.execute(
-            insert(ChatAuditRun),
-            [r.payload for r in run_starts],
-        )
+        # ON CONFLICT DO NOTHING — protects against duplicate stubs and lets
+        # us re-emit run_start safely (e.g. after a restart where the in-
+        # memory _runs_started cache was reset).
+        stmt = pg_insert(ChatAuditRun).on_conflict_do_nothing(index_elements=["id"])
+        await session.execute(stmt, [r.payload for r in run_starts])
+        for r in run_starts:
+            rid = r.payload.get("id")
+            if isinstance(rid, uuid.UUID):
+                _mark_run_started(rid)
     if events:
+        # Insert minimal stub runs for any event whose parent run_start we
+        # have never seen — the most common cause of FK violations that
+        # used to drop entire batches.
+        await _insert_run_stubs_if_missing(session, events)
         await session.execute(
             insert(ChatAuditEvent),
             [e.payload for e in events],
@@ -301,6 +394,34 @@ async def _flush_batch(
     await session.commit()
 
 
+async def _flush_events_individually(events: list[_Event]) -> int:
+    """Fallback when the batch INSERT fails: insert each event in its own
+    transaction so a single bad row no longer poisons up to 199 valid ones.
+
+    Returns the number of events successfully persisted.
+    """
+    if not events:
+        return 0
+    saved = 0
+    for e in events:
+        try:
+            async with async_session_factory() as session:
+                await _insert_run_stubs_if_missing(session, [e])
+                await session.execute(insert(ChatAuditEvent), [e.payload])
+                await session.commit()
+                saved += 1
+        except Exception:
+            logger.exception(
+                "chat_audit_writer per-event fallback dropped event_type=%s "
+                "tool=%s seq=%s trace=%s",
+                e.payload.get("event_type"),
+                e.payload.get("tool_name"),
+                e.payload.get("sequence"),
+                e.payload.get("trace_id"),
+            )
+    return saved
+
+
 async def _consumer_loop() -> None:
     assert _queue is not None
     pending_starts: list[_RunStart] = []
@@ -312,21 +433,63 @@ async def _consumer_loop() -> None:
         nonlocal pending_starts, pending_events, pending_finalizes
         if not (pending_starts or pending_events or pending_finalizes):
             return
+        starts = pending_starts
+        events = pending_events
+        finalizes = pending_finalizes
+        pending_starts = []
+        pending_events = []
+        pending_finalizes = []
         try:
             async with async_session_factory() as session:
-                await _flush_batch(
-                    session, pending_starts, pending_events, pending_finalizes,
-                )
+                await _flush_batch(session, starts, events, finalizes)
+            return
         except Exception:
             logger.exception(
-                "chat_audit_writer flush failed; dropping batch "
-                "(starts=%d events=%d finalizes=%d)",
-                len(pending_starts), len(pending_events), len(pending_finalizes),
+                "chat_audit_writer batch flush failed "
+                "(starts=%d events=%d finalizes=%d); falling back to per-row",
+                len(starts), len(events), len(finalizes),
             )
-        finally:
-            pending_starts = []
-            pending_events = []
-            pending_finalizes = []
+
+        # Per-row fallback: split the failed batch so one bad row no longer
+        # discards all the others. Each phase isolates its own session.
+        if starts:
+            for r in starts:
+                try:
+                    async with async_session_factory() as session:
+                        stmt = pg_insert(ChatAuditRun).on_conflict_do_nothing(
+                            index_elements=["id"],
+                        )
+                        await session.execute(stmt, [r.payload])
+                        await session.commit()
+                        rid = r.payload.get("id")
+                        if isinstance(rid, uuid.UUID):
+                            _mark_run_started(rid)
+                except Exception:
+                    logger.exception(
+                        "chat_audit_writer per-run fallback dropped run trace=%s",
+                        r.payload.get("trace_id"),
+                    )
+        saved = await _flush_events_individually(events)
+        if events and saved < len(events):
+            logger.warning(
+                "chat_audit_writer per-event fallback: %d/%d events persisted",
+                saved, len(events),
+            )
+        if finalizes:
+            for fin in finalizes:
+                try:
+                    async with async_session_factory() as session:
+                        await session.execute(
+                            update(ChatAuditRun)
+                            .where(ChatAuditRun.id == fin.run_id)
+                            .values(**fin.values)
+                        )
+                        await session.commit()
+                except Exception:
+                    logger.exception(
+                        "chat_audit_writer per-finalize fallback dropped run_id=%s",
+                        fin.run_id,
+                    )
 
     while True:
         try:
@@ -380,6 +543,10 @@ async def start_writer() -> None:
     global _queue, _task
     if _task is not None and not _task.done():
         return
+    # Drop the stale "runs we've inserted" cache from any previous lifetime —
+    # the DB is the source of truth and ON CONFLICT keeps re-inserts safe.
+    _runs_started.clear()
+    _runs_started_order.clear()
     _queue = asyncio.Queue(maxsize=QUEUE_MAX)
     _task = asyncio.create_task(_consumer_loop(), name="chat_audit_writer")
     logger.info("chat_audit_writer started (queue_max=%d, batch=%d, interval=%.2fs)",

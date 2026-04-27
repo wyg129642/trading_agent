@@ -268,15 +268,14 @@ def _build_messages(
 async def search_for_chat(query: str) -> str | None:
     """Run web search and return formatted context for the chat LLM.
 
-    Uses Baidu (Chinese) + Tavily/Jina (English) in parallel.
+    Uses Tavily + Jina in parallel (Baidu disabled for the chat assistant).
     Returns None if no results or search is not needed.
     """
     settings = get_settings()
-    baidu_key = settings.baidu_api_key
     tavily_key = settings.tavily_api_key
     jina_key = settings.jina_api_key
 
-    if not baidu_key and not tavily_key and not jina_key:
+    if not tavily_key and not jina_key:
         return None
 
     try:
@@ -284,7 +283,7 @@ async def search_for_chat(query: str) -> str | None:
 
         results = await multi_search(
             query,
-            baidu_api_key=baidu_key,
+            baidu_api_key="",
             tavily_api_key=tavily_key,
             jina_api_key=jina_key,
             use_english_search=bool(tavily_key or jina_key),
@@ -962,7 +961,11 @@ async def call_model_stream_with_tools(
 
     async def dispatch_tool(name: str, arguments: dict, round_num: int = 0) -> str:
         """Execute a single tool with timeout protection."""
-        trace.log_tool_exec_start(name, arguments)
+        # Set the round_num contextvar so KB / user_kb tools — which call
+        # chat_trace() lazily — emit events tagged with the correct round.
+        from backend.app.services.chat_debug import set_current_round_num
+        set_current_round_num(round_num)
+        trace.log_tool_exec_start(name, arguments, round_num=round_num)
         activity["tool_call_names"].append(name)
         if name == "web_search":
             q = arguments.get("query_cn", "")
@@ -1002,17 +1005,17 @@ async def call_model_stream_with_tools(
             result = await asyncio.wait_for(coro, timeout=_TOOL_EXEC_TIMEOUT)
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
             if name in ("web_search", "read_webpage"):
-                trace.log_tool_exec_done(name, result[0], elapsed_ms)
+                trace.log_tool_exec_done(name, result[0], elapsed_ms, round_num=round_num)
                 return result[0]
-            trace.log_tool_exec_done(name, result, elapsed_ms)
+            trace.log_tool_exec_done(name, result, elapsed_ms, round_num=round_num)
             return result
         except asyncio.TimeoutError:
-            trace.log_tool_timeout(name, _TOOL_EXEC_TIMEOUT)
+            trace.log_tool_timeout(name, _TOOL_EXEC_TIMEOUT, round_num=round_num)
             logger.warning("Tool %s timed out after %.0fs", name, _TOOL_EXEC_TIMEOUT)
             return f"Tool {name} timed out after {int(_TOOL_EXEC_TIMEOUT)} seconds."
         except Exception as e:
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
-            trace.log_tool_exec_done(name, f"ERROR: {e}", elapsed_ms, error=True)
+            trace.log_tool_exec_done(name, f"ERROR: {e}", elapsed_ms, error=True, round_num=round_num)
             raise
 
     start = time.monotonic()
@@ -1433,7 +1436,11 @@ async def _gemini_stream_with_tools(
 
     async def dispatch_tool(name: str, arguments: dict, round_num: int = 0) -> str:
         """Execute a single tool with timeout protection."""
-        trace.log_tool_exec_start(name, arguments)
+        # Set the round_num contextvar so KB / user_kb tools — which call
+        # chat_trace() lazily — emit events tagged with the correct round.
+        from backend.app.services.chat_debug import set_current_round_num
+        set_current_round_num(round_num)
+        trace.log_tool_exec_start(name, arguments, round_num=round_num)
         activity["tool_call_names"].append(name)
         if name == "web_search":
             q = arguments.get("query_cn", "")
@@ -1473,17 +1480,17 @@ async def _gemini_stream_with_tools(
             result = await asyncio.wait_for(coro, timeout=_TOOL_EXEC_TIMEOUT)
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
             if name in ("web_search", "read_webpage"):
-                trace.log_tool_exec_done(name, result[0], elapsed_ms)
+                trace.log_tool_exec_done(name, result[0], elapsed_ms, round_num=round_num)
                 return result[0]
-            trace.log_tool_exec_done(name, result, elapsed_ms)
+            trace.log_tool_exec_done(name, result, elapsed_ms, round_num=round_num)
             return result
         except asyncio.TimeoutError:
-            trace.log_tool_timeout(name, _TOOL_EXEC_TIMEOUT)
+            trace.log_tool_timeout(name, _TOOL_EXEC_TIMEOUT, round_num=round_num)
             logger.warning("Tool %s timed out after %.0fs", name, _TOOL_EXEC_TIMEOUT)
             return f"Tool {name} timed out after {int(_TOOL_EXEC_TIMEOUT)} seconds."
         except Exception as e:
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
-            trace.log_tool_exec_done(name, f"ERROR: {e}", elapsed_ms, error=True)
+            trace.log_tool_exec_done(name, f"ERROR: {e}", elapsed_ms, error=True, round_num=round_num)
             raise
 
     _TRANSIENT_KEYWORDS = ("500", "503", "overloaded", "unavailable", "deadline", "timeout", "reset", "rate")

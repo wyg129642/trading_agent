@@ -2,8 +2,8 @@
 
 Called by every scraper immediately before ``col.replace_one({"_id": …}, doc, upsert=True)``
 so new docs land with ``_canonical_tickers`` / ``_canonical_tickers_at`` /
-``_unmatched_raw`` / ``_canonical_extract_source`` already set — no more waiting
-for the hourly cron to catch up.
+``_unmatched_raw`` / ``_canonical_extract_source`` / ``_raw_tickers`` already
+set — no more waiting for the hourly cron to catch up.
 
 Design
 ------
@@ -41,12 +41,14 @@ try:
     from backend.app.services.ticker_normalizer import (  # noqa: E402
         EXTRACTORS,
         extract_tickers_from_text,
+        normalize_raw_for_storage,
         normalize_with_unmatched,
     )
     _AVAILABLE = True
 except Exception:
     EXTRACTORS = {}  # type: ignore
     extract_tickers_from_text = None  # type: ignore
+    normalize_raw_for_storage = None  # type: ignore
     _AVAILABLE = False
 
 
@@ -91,6 +93,8 @@ def stamp(doc: dict, source_key: str, col: Any) -> dict:
         doc["_canonical_tickers_at"] = datetime.now(timezone.utc)
         doc["_unmatched_raw"] = unmatched
         doc["_canonical_extract_source"] = extract_source
+        if normalize_raw_for_storage is not None:
+            doc["_raw_tickers"] = normalize_raw_for_storage(raw)
     except Exception:
         pass
     return doc
