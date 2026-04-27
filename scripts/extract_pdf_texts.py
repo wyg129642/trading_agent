@@ -191,6 +191,16 @@ def _fetch_pdf_bytes(fs: GridFS, pdf_local_path: str, pdf_root: str) -> bytes:
     well under a second. We always prefer disk when the file is present and
     fall through to GridFS only if disk is missing.
     """
+    # Absolute-path direct read — covers cases where the doc's pdf_local_path
+    # points outside pdf_root (e.g. jinmen oversea_reports stores PDFs under
+    # /home/ygwang/crawl_data/overseas_pdf/ while jinmen_pdf_dir is the
+    # sibling /home/ygwang/crawl_data/jinmen_pdfs/). Without this, the
+    # _gridfs_filename relativization strips to basename and the file lookup
+    # silently misses every real file.
+    abs_path = Path(pdf_local_path)
+    if abs_path.is_absolute() and abs_path.is_file():
+        return abs_path.read_bytes()
+
     name = _gridfs_filename(pdf_local_path, pdf_root)
     root = Path(pdf_root).resolve()
     if "/" in name:
@@ -310,12 +320,21 @@ def process_target(
         # Skip docs we've already tried and failed on, unless explicitly asked
         filt["pdf_text_error"] = {"$exists": False}
     if id_mod > 0:
-        # Doc-id sharding: only process docs where _id % id_mod == id_rem.
+        # Doc-id sharding: only process docs where (_id-as-long) % id_mod == id_rem.
         # Used to run multiple parallel processes against a single huge
-        # collection (e.g. jinmen oversea_reports) without overlap.
-        # Requires _id to be numeric — only enable for collections we know
-        # use integer IDs (currently jinmen reports + oversea_reports).
-        filt["$expr"] = {"$eq": [{"$mod": ["$_id", id_mod]}, id_rem]}
+        # collection without overlap. Handles both numeric _id (jinmen)
+        # and numeric-string snowflake _id (gangtise). For non-numeric _ids
+        # (e.g. alphapai's hex SHA1) $convert errors → bucket -1; do not use
+        # sharding on those collections (use unsharded single-thread instead).
+        filt["$expr"] = {
+            "$eq": [
+                {"$mod": [
+                    {"$convert": {"input": "$_id", "to": "long", "onError": -1}},
+                    id_mod,
+                ]},
+                id_rem,
+            ]
+        }
 
     # Pre-scan GridFS once per (DB) so we can skip docs whose PDF was never
     # downloaded — avoids polluting them with `pdf_text_error` rows for what
