@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from backend.app.config import get_settings
 from backend.app.deps import get_current_user
 from backend.app.models.user import User
+from backend.app.services.ticker_tags_builder import build_ticker_tags
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -456,6 +457,7 @@ async def get_meeting(meeting_id: str, user: User = Depends(get_current_user)):
         "indicators_md": doc.get("indicators_md") or "",
         "transcript_md": doc.get("transcript_md") or "",
         "present_url": doc.get("present_url"),
+        "ticker_tags": build_ticker_tags(doc, "jinmen", "meetings"),
     }
 
 
@@ -572,6 +574,7 @@ async def get_report(
         "link_url": doc.get("link_url") or "",
         "pdf_local_path": doc.get("pdf_local_path") or "",
         "pdf_download_error": doc.get("pdf_download_error") or "",
+        "ticker_tags": build_ticker_tags(doc, "jinmen", "reports"),
     }
 
 
@@ -784,6 +787,7 @@ async def get_oversea_report(
         "country_list": doc.get("country_list") or [],
         "language_list": doc.get("language_list") or [],
         "authors": doc.get("authors") or [],
+        "ticker_tags": build_ticker_tags(doc, "jinmen", "oversea_reports"),
     }
 
 

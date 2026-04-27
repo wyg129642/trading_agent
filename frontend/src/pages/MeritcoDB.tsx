@@ -56,6 +56,7 @@ import relativeTime from 'dayjs/plugin/relativeTime'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import api from '../services/api'
+import TickerTagsTabs, { TickerTags } from '../components/TickerTagsTabs'
 
 dayjs.extend(relativeTime)
 
@@ -162,6 +163,7 @@ interface ForumDetail extends ForumBrief {
   topic_md: string
   background_md: string
   expert_content_md: string
+  ticker_tags?: TickerTags
 }
 
 interface ListResponse {
@@ -860,6 +862,7 @@ export default function MeritcoDB() {
                   ))}
                 </div>
               )}
+              <TickerTagsTabs tags={detail.ticker_tags} />
               {detail.experts.length > 0 && (
                 <div style={{ marginBottom: 8 }}>
                   <Text type="secondary" style={{ marginRight: 8, fontSize: 12 }}>

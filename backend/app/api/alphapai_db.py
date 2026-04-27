@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from backend.app.config import get_settings
 from backend.app.deps import get_current_boss_or_admin, get_current_user
 from backend.app.models.user import User
+from backend.app.services.ticker_tags_builder import build_ticker_tags
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -482,6 +483,7 @@ async def get_item(
         "pdf_local_path": doc.get("pdf_local_path"),
         "pdf_size": doc.get("pdf_size"),
         "raw_id": doc.get("raw_id"),
+        "ticker_tags": build_ticker_tags(doc, "alphapai", CATEGORY_COLLECTION[category]),
     }
 
 

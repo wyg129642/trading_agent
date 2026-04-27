@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from backend.app.config import get_settings
 from backend.app.deps import get_current_user
 from backend.app.models.user import User
+from backend.app.services.ticker_tags_builder import build_ticker_tags
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -205,6 +206,7 @@ async def get_item(
         "content_md": doc.get("content_md") or "",
         "content_html": doc.get("content_html") or "",
         "preview_body": doc.get("previewBody") or "",
+        "ticker_tags": build_ticker_tags(doc, "funda", CATEGORY_COLLECTION[category]),
     }
 
 

@@ -39,6 +39,7 @@ import remarkGfm from 'remark-gfm'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import api from '../services/api'
+import TickerTagsTabs, { TickerTags } from '../components/TickerTagsTabs'
 
 dayjs.extend(relativeTime)
 
@@ -127,6 +128,7 @@ interface Detail extends Interview {
   introduction_md: string
   transcript_md: string
   commentary_md: string
+  ticker_tags?: TickerTags
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -494,6 +496,7 @@ export default function ThirdBridgeDB() {
                   )}
                 </div>
               )}
+              <TickerTagsTabs tags={detail.ticker_tags} />
               {detail.specialists.length > 0 && (
                 <div style={{ marginBottom: 10 }}>
                   <Text type="secondary" style={{ marginRight: 6 }}>

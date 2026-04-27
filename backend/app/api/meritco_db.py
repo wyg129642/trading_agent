@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from backend.app.config import get_settings
 from backend.app.deps import get_current_user
 from backend.app.models.user import User
+from backend.app.services.ticker_tags_builder import build_ticker_tags
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -336,6 +337,7 @@ async def get_forum_item(forum_id: str, user: User = Depends(get_current_user)):
         "topic_md": doc.get("topic_md") or "",
         "background_md": doc.get("background_md") or "",
         "expert_content_md": doc.get("expert_content_md") or "",
+        "ticker_tags": build_ticker_tags(doc, "meritco", "forum"),
     }
 
 

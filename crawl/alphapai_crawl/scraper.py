@@ -1150,21 +1150,25 @@ def enrich_report_doc(session, doc: dict, item: dict, pdf_dir: Path,
 
 # -------------------- Truncated retry (每轮 watch 末尾, 跨天自动补齐) --------------------
 
-def retry_truncated_roadshows(session, db, max_retry: int = 100,
-                              consec_quota_break: int = 5,
-                              min_gain_chars: int = 200) -> dict:
+def retry_truncated_roadshows(session, db, max_retry: int = 500,
+                              consec_quota_break: int = 20,
+                              min_gain_chars: int = 50,
+                              tokens_in_pool: list = None,
+                              pool_label_hint: str = "") -> dict:
     """每轮 watch 末尾扫 content_truncated=True 的 roadshow doc, 调 detail 接口
-    尝试补全. 替代独立 bypass_backfill.py 进程.
+    尝试补全. 替代独立 bypass_backfill.py.
 
     - cur_len 大的优先(更可能藏 rich aiSummary, 命中价值高).
-    - 连续 N 个 400000 → 今日额度耗尽, 本轮提前 break.
+    - 命中 400000 时主动 mark + 池里切下一个 token, 热替换 session.headers
+      继续同一轮 retry. 全部 token 耗尽后 break.
     - 500020 短期 throttle → cool 90s.
-    - 如果有多 token 池, api_call 自动切下一个 (mark_token_exhausted 触发).
+    - min_gain_chars=50: 任何明显增长都算 hit, 不再卡 200 字门槛.
 
-    Returns: {"scanned", "refilled", "quota_blocked", "throttled", "skipped"}
+    Returns: {"scanned","refilled","quota_blocked","throttled","skipped",
+              "rotations"}
     """
     stats = {"scanned": 0, "refilled": 0, "quota_blocked": 0,
-             "throttled": 0, "skipped": 0}
+             "throttled": 0, "skipped": 0, "rotations": 0}
     if max_retry <= 0:
         return stats
     if "roadshows" not in db.list_collection_names():
@@ -1182,6 +1186,27 @@ def retry_truncated_roadshows(session, db, max_retry: int = 100,
         return stats
     print(f"[retry-truncated] roadshow candidates: {len(cands)}")
     consec_quota = 0
+    global _CURRENT_ACCOUNT_ID
+
+    def _try_rotate_token() -> bool:
+        """池里挑下一个未耗尽的 token, 热替换 session.headers.
+        成功返 True, 没下一个返 False."""
+        if not tokens_in_pool:
+            return False
+        # 排除当前已耗尽的
+        next_t = pick_available_token(tokens_in_pool, label_hint=pool_label_hint)
+        if next_t is None:
+            return False
+        if next_t["account_id"] == _CURRENT_ACCOUNT_ID:
+            return False  # 没新 token
+        session.headers["Authorization"] = next_t["token"]
+        new_acc = next_t["account_id"]
+        print(f"  [rotate] {_CURRENT_ACCOUNT_ID} (耗尽) → "
+              f"{next_t.get('label','?')} ({new_acc})")
+        _CURRENT_ACCOUNT_ID = new_acc
+        stats["rotations"] += 1
+        return True
+
     for d in cands:
         rid = d.get("raw_id")
         cur = d.get("_cur_len", 0)
@@ -1219,9 +1244,15 @@ def retry_truncated_roadshows(session, db, max_retry: int = 100,
         elif code == 400000:
             stats["quota_blocked"] += 1
             consec_quota += 1
+            # 优先尝试切到池里下一个未耗尽的 token, 切成功就 reset consec_quota 继续
+            if _try_rotate_token():
+                consec_quota = 0
+                continue
+            # 切不动 → 池里全死, 走 consec break 逻辑
             if consec_quota >= consec_quota_break:
-                print(f"[retry-truncated] {consec_quota}× 连续 400000, "
-                      f"本轮提前结束 (refilled={stats['refilled']})")
+                print(f"[retry-truncated] {consec_quota}× 连续 400000 且池内"
+                      f"无可用 token, 本轮结束 (refilled={stats['refilled']}, "
+                      f"rotations={stats['rotations']})")
                 break
         elif code == 500020:
             stats["throttled"] += 1
@@ -1229,7 +1260,8 @@ def retry_truncated_roadshows(session, db, max_retry: int = 100,
         else:
             stats["skipped"] += 1
     print(f"[retry-truncated] 扫 {stats['scanned']}, 补 {stats['refilled']}, "
-          f"额度阻塞 {stats['quota_blocked']}, throttled {stats['throttled']}")
+          f"额度阻塞 {stats['quota_blocked']}, throttled {stats['throttled']}, "
+          f"切 token {stats['rotations']} 次")
     return stats
 
 

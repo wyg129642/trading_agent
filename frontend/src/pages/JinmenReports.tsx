@@ -24,6 +24,7 @@ import {
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import api from '../services/api'
+import TickerTagsTabs, { TickerTags } from '../components/TickerTagsTabs'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 
 dayjs.extend(relativeTime)
@@ -61,6 +62,7 @@ interface ReportDetail extends ReportItem {
   link_url: string
   pdf_local_path: string
   pdf_download_error: string
+  ticker_tags?: TickerTags
 }
 
 interface ReportsStats {
@@ -566,6 +568,7 @@ export default function JinmenReports() {
                   {detail.companies.map((c) => <Tag key={c} color="cyan">{c}</Tag>)}
                 </div>
               )}
+              <TickerTagsTabs tags={detail.ticker_tags} />
 
               {/* Inline PDF preview — 与 GangtiseDB 同构 iframe 方案, blob
                   URL 在 clearPdf 里 revoke. 抽屉宽度在 pdfVisible 时切到 1280px. */}

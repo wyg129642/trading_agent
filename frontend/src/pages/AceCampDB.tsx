@@ -50,6 +50,7 @@ import remarkGfm from 'remark-gfm'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import api from '../services/api'
+import TickerTagsTabs, { TickerTags } from '../components/TickerTagsTabs'
 
 dayjs.extend(relativeTime)
 
@@ -155,6 +156,7 @@ interface DetailResponse extends Item {
   co_host_organizations: any[]
   expert_public_resume: string | null
   meeting_ids: (number | string)[]
+  ticker_tags?: TickerTags
 }
 
 // URL slug → backend category key
@@ -645,6 +647,8 @@ export default function AceCampDB() {
                   <Tag key={h}>#{h}</Tag>
                 ))}
               </Space>
+
+              <TickerTagsTabs tags={detail.ticker_tags} />
 
               {(detail.addresses?.length > 0 || detail.expert_public_resume) && (
                 <div style={{ marginBottom: 8, fontSize: 12, color: '#64748b' }}>

@@ -33,6 +33,7 @@ import {
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import api from '../services/api'
+import TickerTagsTabs, { TickerTags } from '../components/TickerTagsTabs'
 
 dayjs.extend(relativeTime)
 
@@ -84,6 +85,7 @@ interface StatsResponse {
 interface DetailResponse extends Item {
   content: string
   raw_id: string | null
+  ticker_tags?: TickerTags
 }
 
 export default function AlphaPaiComments() {
@@ -399,6 +401,7 @@ export default function AlphaPaiComments() {
                   ))}
                 </div>
               )}
+              <TickerTagsTabs tags={detail.ticker_tags} />
               {detail.industries.length > 0 && (
                 <div style={{ marginBottom: 10 }}>
                   <Text type="secondary" style={{ marginRight: 6 }}>

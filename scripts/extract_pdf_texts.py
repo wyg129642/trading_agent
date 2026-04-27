@@ -290,6 +290,8 @@ def process_target(
     dry_run: bool,
     retry_errors: bool,
     skip_missing_pdf: bool = True,
+    id_mod: int = 0,
+    id_rem: int = 0,
 ) -> tuple[int, int, int]:
     uri = getattr(settings, target.uri_attr)
     dbname = getattr(settings, target.db_attr)
@@ -307,6 +309,13 @@ def process_target(
     if not retry_errors:
         # Skip docs we've already tried and failed on, unless explicitly asked
         filt["pdf_text_error"] = {"$exists": False}
+    if id_mod > 0:
+        # Doc-id sharding: only process docs where _id % id_mod == id_rem.
+        # Used to run multiple parallel processes against a single huge
+        # collection (e.g. jinmen oversea_reports) without overlap.
+        # Requires _id to be numeric — only enable for collections we know
+        # use integer IDs (currently jinmen reports + oversea_reports).
+        filt["$expr"] = {"$eq": [{"$mod": ["$_id", id_mod]}, id_rem]}
 
     # Pre-scan GridFS once per (DB) so we can skip docs whose PDF was never
     # downloaded — avoids polluting them with `pdf_text_error` rows for what
@@ -527,6 +536,18 @@ def main() -> int:
         ),
     )
     ap.add_argument("--list", action="store_true", help="List targets and exit")
+    ap.add_argument(
+        "--id-mod", type=int, default=0,
+        help=(
+            "Doc-id sharding modulus. Pair with --id-rem to run multiple "
+            "parallel processes against a single big collection (e.g. jinmen "
+            "oversea_reports). Requires numeric _id."
+        ),
+    )
+    ap.add_argument(
+        "--id-rem", type=int, default=0,
+        help="Doc-id sharding remainder (0..id_mod-1).",
+    )
     args = ap.parse_args()
 
     # Console + rotating file logger. The file handler keeps long backfill runs
@@ -578,6 +599,8 @@ def main() -> int:
                 dry_run=args.dry_run,
                 retry_errors=args.retry_errors,
                 skip_missing_pdf=not args.no_skip_missing_pdf,
+                id_mod=args.id_mod,
+                id_rem=args.id_rem,
             )
             return t, ok, failed, skipped
         except Exception as e:  # noqa: BLE001

@@ -41,6 +41,7 @@ import relativeTime from 'dayjs/plugin/relativeTime'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import api from '../services/api'
+import TickerTagsTabs, { TickerTags } from '../components/TickerTagsTabs'
 
 dayjs.extend(relativeTime)
 
@@ -111,6 +112,7 @@ interface MeetingDetail extends MeetingBrief {
   indicators_md: string
   transcript_md: string
   present_url: string | null
+  ticker_tags?: TickerTags
 }
 
 interface ListResponse {
@@ -443,6 +445,7 @@ export default function JinmenDB() {
                   ))}
                 </div>
               )}
+              <TickerTagsTabs tags={detail.ticker_tags} />
               {detail.industries.length > 0 && (
                 <div style={{ marginBottom: 6 }}>
                   <Text type="secondary" style={{ marginRight: 6 }}>

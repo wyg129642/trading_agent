@@ -114,36 +114,41 @@ SPEED_MULT: dict[str, float] = {
     # other platforms default to 1.0 (alphapai/meritco/funda/acecamp)
 }
 
-# 2026-04-27: 调高 24h backfill 桶上限解决 "scraper 启动立即 [antibot] daily-cap 达到"
-# 现象 — antibot _PLATFORM_BACKFILL_DEFAULTS 的 1500/day 在 6 个月回填语境下太紧,
-# burst+0.4s base 一启动 16min 就撞顶, 之后 24h 整个 zset 滚出窗口前都 0 入库.
-# 用户授权: "增多一些上限 慢慢爬取一般不会封号的". 配合 SPEED_MULT 降速 + Gaussian
-# throttle 节奏保持温和.
+# 2026-04-27: 完全禁用 quota 闸 — 用户授权 "不限额, 慢慢爬一般不会封号".
+# 节奏闸 (burst-size + burst-cooldown + Gaussian throttle) 仍然保留, 防风控仍靠
+# 节奏不是数量.
+#
+# 实现细节: antibot.budget_from_args 把 `bg_budget=0` 当 "未指定" fallback 到
+# _PLATFORM_BACKFILL_DEFAULTS (`if not limit: limit = ...`), 不能简单设 0 禁用.
+# 设 999999 让 args.bg_budget 真值且不会撞顶 = 实质不限额.
+# daily-cap=0 在 universal_flags_for 直接 work (cap_from_args 的 falsy 路径正常禁用).
+_NO_LIMIT = 999_999
+
 PLATFORM_BG_BUDGETS: dict[str, int] = {
-    "alphapai":      5000,
-    "jinmen":        6000,
-    "meritco":       3000,
-    "funda":         4000,
-    "gangtise":     10000,   # 5 个 type 共用一个 G_token (research+summary+chief × backfill+watch)
-    "acecamp":       2000,
-    "alphaengine":   4000,
-    "thirdbridge":    600,
-    "semianalysis":  2000,
+    "alphapai":     _NO_LIMIT,
+    "jinmen":       _NO_LIMIT,
+    "meritco":      _NO_LIMIT,
+    "funda":        _NO_LIMIT,
+    "gangtise":     _NO_LIMIT,
+    "acecamp":      _NO_LIMIT,
+    "alphaengine":  _NO_LIMIT,
+    "thirdbridge":  _NO_LIMIT,
+    "semianalysis": _NO_LIMIT,
 }
 
 
 def universal_flags_for(platform: str) -> list[str]:
     m = SPEED_MULT.get(platform, 1.0)
-    bg_budget = PLATFORM_BG_BUDGETS.get(platform, 4000)
+    bg_budget = PLATFORM_BG_BUDGETS.get(platform, 0)
     return [
         "--throttle-base",        f"{4.0 / m:.3f}",
         "--throttle-jitter",      f"{2.5 / m:.3f}",
         "--burst-size",           str(int(30 * m)),
         "--burst-cooldown-min",   str(max(5, int(60 / m))),
         "--burst-cooldown-max",   str(max(15, int(180 / m))),
-        "--daily-cap",            str(int(400 * m)),
+        "--daily-cap",            "0",                   # 不限单轮抓取数 (节奏靠 burst+cooldown)
         "--account-role",         "bg",
-        "--bg-budget",            str(bg_budget),
+        "--bg-budget",            str(bg_budget),        # 0 = 禁用 24h 账号桶
         # Stream mode: each scraper dumps per-page instead of list-first-then-dump,
         # so DB writes start on page 1 and deep_page checkpoint enables resume.
         "--stream-backfill",

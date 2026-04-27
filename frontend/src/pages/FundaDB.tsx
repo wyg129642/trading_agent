@@ -38,6 +38,7 @@ import remarkGfm from 'remark-gfm'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import api from '../services/api'
+import TickerTagsTabs, { TickerTags } from '../components/TickerTagsTabs'
 
 dayjs.extend(relativeTime)
 
@@ -111,6 +112,7 @@ interface DetailResponse extends Item {
   content_md: string
   content_html: string
   preview_body: string
+  ticker_tags?: TickerTags
 }
 
 // URL slug → backend category key
@@ -482,6 +484,8 @@ export default function FundaDB() {
                   </Tag>
                 )}
               </Space>
+
+              <TickerTagsTabs tags={detail.ticker_tags} />
 
               {detail.tags.length > 0 && (
                 <div style={{ marginBottom: 8 }}>

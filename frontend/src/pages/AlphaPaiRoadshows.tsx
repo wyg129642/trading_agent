@@ -39,6 +39,7 @@ import remarkGfm from 'remark-gfm'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import api from '../services/api'
+import TickerTagsTabs, { TickerTags } from '../components/TickerTagsTabs'
 
 dayjs.extend(relativeTime)
 
@@ -109,6 +110,7 @@ interface DetailResponse extends Item {
   pdf_local_path: string | null
   pdf_size: number | null
   raw_id: string | null
+  ticker_tags?: TickerTags
 }
 
 export default function AlphaPaiRoadshows() {
@@ -420,6 +422,7 @@ export default function AlphaPaiRoadshows() {
                   ))}
                 </div>
               )}
+              <TickerTagsTabs tags={detail.ticker_tags} />
               {detail.industries.length > 0 && (
                 <div style={{ marginBottom: 10 }}>
                   <Text type="secondary" style={{ marginRight: 6 }}>

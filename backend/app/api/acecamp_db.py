@@ -39,6 +39,7 @@ from pydantic import BaseModel
 from backend.app.config import get_settings
 from backend.app.deps import get_current_user
 from backend.app.models.user import User
+from backend.app.services.ticker_tags_builder import build_ticker_tags
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -288,6 +289,7 @@ async def get_item(
         "event_ids": doc.get("event_ids") or [],
         "meeting_ids": doc.get("meeting_ids") or [],
         "data_level_rule": doc.get("data_level_rule"),
+        "ticker_tags": build_ticker_tags(doc, "acecamp", CATEGORY_SPEC[category][0]),
     }
 
 

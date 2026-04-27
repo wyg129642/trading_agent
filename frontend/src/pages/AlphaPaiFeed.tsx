@@ -31,6 +31,7 @@ import {
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import api from '../services/api'
+import TickerTagsTabs, { TickerTags } from '../components/TickerTagsTabs'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 
 dayjs.extend(relativeTime)
@@ -81,6 +82,7 @@ interface StatsResponse {
 interface DetailResponse extends Item {
   content: string
   raw_id: string | null
+  ticker_tags?: TickerTags
 }
 
 // Soft deterministic avatar color from account name
@@ -394,6 +396,7 @@ export default function AlphaPaiFeed() {
                   ))}
                 </div>
               )}
+              <TickerTagsTabs tags={detail.ticker_tags} />
               <Card
                 size="small"
                 title="文章内容"

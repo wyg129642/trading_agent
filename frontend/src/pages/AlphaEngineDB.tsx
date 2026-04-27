@@ -43,6 +43,7 @@ import remarkGfm from 'remark-gfm'
 import dayjs from 'dayjs'
 import relativeTime from 'dayjs/plugin/relativeTime'
 import api from '../services/api'
+import TickerTagsTabs, { TickerTags } from '../components/TickerTagsTabs'
 
 dayjs.extend(relativeTime)
 
@@ -111,6 +112,7 @@ interface DetailResponse extends Item {
   first_industry_name: string[]
   company_show_name: string[]
   pdf_download_error: string
+  ticker_tags?: TickerTags
 }
 
 interface StatsResponse {
@@ -695,13 +697,10 @@ export default function AlphaEngineDB() {
                       : ''}
                   </Tag>
                 ))}
-                {(detail._canonical_tickers || []).map((t) => (
-                  <Tag key={t} color="geekblue">
-                    {t}
-                  </Tag>
-                ))}
               </Space>
             )}
+
+            <TickerTagsTabs tags={detail.ticker_tags} />
 
             {detail.pdf_download_error && (
               <Alert

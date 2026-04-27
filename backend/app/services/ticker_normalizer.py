@@ -219,6 +219,14 @@ _EXCHANGE_SUFFIX_MAP: dict[str, str] = {
     "PER": "PE", "COL": "CO",
     "USA": "US", "HKG": "HK", "CHN": "CN",
     "RUS": "RU",
+    # Gangtise / Refinitiv 3-letter exchange codes (added 2026-04-27 after
+    # _unmatched_raw audit — top gaps were 2269.TKS / PRN.LON / PMI.SIX).
+    # Industry indices (.SWI / .CI / .GT) are intentionally NOT mapped here —
+    # they are sector/concept codes, not equities, and would dirty the canonical
+    # ticker space. Track them separately if needed.
+    "TKS": "JP",   # Tokyo (gangtise convention) — alongside existing .T / .JP / .JPN
+    "LON": "GB",   # London Refinitiv — alongside existing .L / .LN
+    "SIX": "CH",   # Swiss SIX Refinitiv — alongside existing .S / .SW
 }
 # Fold identity mappings (A → A) for canonical markets ONLY if they don’t
 # already have a non-identity alias set above. This preserves the Jinmen/Reuters
@@ -1041,46 +1049,6 @@ def normalize_with_unmatched(raw: Any) -> tuple[list[str], list[str]]:
                 if isinstance(label, str) and label.strip():
                     unmatched.append(label.strip())
     return matched, unmatched
-
-
-def normalize_raw_for_storage(raw: Any) -> list:
-    """Flatten extractor output into a JSON-safe list for the ``_raw_tickers``
-    Mongo field. Preserves dict structure (so ``{code, name}`` stays intact)
-    but flattens nested lists into a single flat list. Skips None / blanks.
-
-    Used by both ``crawl/ticker_tag.py`` (ingest-time) and
-    ``scripts/enrich_tickers.py`` (back-fill) so coverage stays uniform."""
-    if raw is None:
-        return []
-    if isinstance(raw, dict):
-        return [raw]
-    if isinstance(raw, str):
-        return [raw] if raw.strip() else []
-    if isinstance(raw, (list, tuple)):
-        out: list = []
-        for item in raw:
-            if item is None:
-                continue
-            if isinstance(item, dict):
-                out.append(item)
-            elif isinstance(item, str):
-                if item.strip():
-                    out.append(item)
-            elif isinstance(item, (list, tuple)):
-                for sub in item:
-                    if sub is None:
-                        continue
-                    if isinstance(sub, dict):
-                        out.append(sub)
-                    elif isinstance(sub, str):
-                        if sub.strip():
-                            out.append(sub)
-                    else:
-                        out.append(str(sub))
-            else:
-                out.append(str(item))
-        return out
-    return [str(raw)]
 
 
 # --------------------------------------------------------------------------- #

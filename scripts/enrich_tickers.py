@@ -1,5 +1,4 @@
-"""Enrich every crawled document with ``_canonical_tickers`` + ``_unmatched_raw``
-+ ``_raw_tickers``.
+"""Enrich every crawled document with ``_canonical_tickers`` + ``_unmatched_raw``.
 
 Idempotent, non-destructive — only adds/updates the derived fields; all
 original fields are left untouched. Safe to re-run after alias-table edits.
@@ -27,9 +26,10 @@ Fields added to each document::
     _canonical_tickers_at:       ISODate     # last enrichment timestamp
     _unmatched_raw:              list[str]   # raw strings we could NOT map
     _canonical_extract_source:   str         # which extractor was used (provenance)
-    _raw_tickers:                list        # preserved raw extractor output
-                                             # (list of dict | str), unified
-                                             # access regardless of platform schema
+
+For the **raw upstream** ticker fields (e.g. ``doc.stock`` for alphapai,
+``doc.stocks`` for jinmen, etc.), see TICKER_AGGREGATION.md §2 — those are
+the platform-native fields, *not* a separate derived field.
 
 Indexes created::
 
@@ -57,7 +57,6 @@ from backend.app.config import get_settings  # noqa: E402
 from backend.app.services.ticker_normalizer import (  # noqa: E402
     EXTRACTORS,
     extract_tickers_from_text,
-    normalize_raw_for_storage,
     normalize_with_unmatched,
     reload_aliases,
 )
@@ -236,7 +235,6 @@ async def enrich_collection(
                 "_canonical_tickers_at": now,
                 "_unmatched_raw": unmatched,
                 "_canonical_extract_source": extract_source,
-                "_raw_tickers": normalize_raw_for_storage(raw),
             }},
         ))
         if len(pending) >= BATCH:
