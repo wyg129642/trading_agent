@@ -2,16 +2,25 @@
 
 Layered over one MongoDB database (``ti-user-knowledge-base`` on
 ``mongodb://127.0.0.1:27018/`` = local ``ta-mongo-crawl`` container by
-default; override via ``USER_KB_MONGO_URI`` / ``USER_KB_MONGO_DB``):
+default; override via ``USER_KB_MONGO_URI`` / ``USER_KB_MONGO_DB``) plus
+local SSD storage for the original file bytes:
 
 * ``documents``  — one row per uploaded file. Holds metadata, upload status,
                    parse status, extracted text (for small-file convenience)
-                   and user-editable fields (title/description/tags).
+                   and user-editable fields (title/description/tags). The
+                   on-disk path of the original binary lives in
+                   ``local_path`` (relative to ``settings.user_kb_disk_root``).
 * ``chunks``     — text chunks produced by the parser; indexed by
                    ``(user_id, text)`` so BM25-ish ``$text`` retrieval can be
                    scoped to the current user efficiently.
-* ``fs.files`` / ``fs.chunks`` — GridFS; stores the original file binary so
-                   users can download what they uploaded.
+* SSD ``user_kb_disk_root`` — original uploaded bytes, partitioned per user
+                   under ``<root>/<user_id>/<document_oid><.ext>``. Atomic
+                   write via tmp + fsync + rename; deletes are best-effort.
+* ``fs.files`` / ``fs.chunks`` — **legacy GridFS**, retired 2026-04-27. Only
+                   read by the dual-read fallback for rows whose
+                   ``local_path`` field hasn't been backfilled by
+                   ``scripts/migrate_user_kb_gridfs_to_disk.py`` yet. New
+                   uploads never touch GridFS.
 
 Every document is scoped by ``user_id`` (UUID string). Retrieval tools and
 API routes **must** pass the user ID so one account can never read another
@@ -29,9 +38,11 @@ import asyncio
 import contextvars
 import hashlib
 import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta as _timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from bson import ObjectId
@@ -169,10 +180,99 @@ def _chunks() -> AsyncIOMotorCollection:
 
 
 def _gridfs() -> AsyncIOMotorGridFSBucket:
-    # GridFS materializes as `{bucket}.files` + `{bucket}.chunks`, so the
-    # bucket prefix keeps binary uploads isolated too (`fs.*` for prod,
-    # `stg_fs.*` for staging).
+    # Legacy bucket — only read by the dual-read fallback for rows that
+    # predate the 2026-04-27 disk cutover. New uploads land on SSD via
+    # `_write_disk_blob` / `_disk_path_for` and never call this.
     return AsyncIOMotorGridFSBucket(_db(), bucket_name=get_settings().user_kb_gridfs_bucket)
+
+
+# ── On-disk binary storage (post-2026-04-27 cutover) ───────────
+
+
+def _disk_root() -> Path:
+    return Path(get_settings().user_kb_disk_root)
+
+
+def _disk_path_for(user_id: str, document_oid: ObjectId, original_filename: str) -> Path:
+    """Resolve the absolute SSD path for a doc's original bytes.
+
+    Layout: ``<root>/<user_id>/<oid><.ext>``. We keep the extension so the
+    file is still recognizable on disk during ops debugging, but use the
+    ObjectId as the stem so collisions and unsafe filename chars are both
+    impossible. ``user_id`` is a UUID — already filesystem-safe.
+    """
+    ext = ""
+    if "." in original_filename:
+        ext = "." + original_filename.rsplit(".", 1)[-1].lower()
+        # Defensive — refuse anything wild. Lowercase ext fields seen so far
+        # are 1–8 alnum chars (pdf, docx, xlsx, m4a, mp3, jpg, …).
+        if not ext[1:].isalnum() or len(ext) > 12:
+            ext = ""
+    return _disk_root() / user_id / f"{document_oid}{ext}"
+
+
+def _disk_relpath(absolute: Path) -> str:
+    """Path stored on the documents row — relative to the configured root so
+    the on-disk root can be moved without rewriting Mongo."""
+    try:
+        return str(absolute.relative_to(_disk_root()))
+    except ValueError:
+        # Caller passed a path outside the root — should never happen, but
+        # falling back to absolute keeps us functional rather than crashing.
+        return str(absolute)
+
+
+def _resolve_disk_path(local_path: str | None) -> Path | None:
+    """Inverse of ``_disk_relpath`` — returns ``None`` for empty input."""
+    if not local_path:
+        return None
+    p = Path(local_path)
+    if not p.is_absolute():
+        p = _disk_root() / p
+    return p
+
+
+def _write_disk_blob_sync(path: Path, data: bytes) -> None:
+    """Atomic write: tmp + fsync + rename. Sync; call via ``asyncio.to_thread``.
+
+    Uses the same disk + same directory for the tmp file so the rename is
+    atomic on POSIX. fsync the tmp file *and* its parent directory so a hard
+    crash between rename and dirsync still leaves us with a complete file
+    rather than zero bytes (this is what the crawler PDF migrator does too).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        # fsync the directory entry so the rename is durable.
+        dir_fd = os.open(path.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _read_disk_blob_sync(path: Path) -> bytes:
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _delete_disk_blob_sync(path: Path) -> bool:
+    """Best-effort delete. Returns True if a file was removed."""
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 # ── Index setup ────────────────────────────────────────────────
@@ -766,12 +866,16 @@ async def create_document(
     folder_id: str | None = None,
     scope: str = SCOPE_PERSONAL,
 ) -> UploadOutcome:
-    """Persist the file binary to GridFS and create a ``pending`` documents row.
+    """Persist the file binary to local SSD and create a ``pending`` documents row.
 
     * Validates extension + size.
     * Computes a SHA-256 content hash; if the user already uploaded the same
       bytes, returns the existing id with ``was_duplicate=True`` and no new
       storage is consumed.
+    * Writes the bytes atomically (tmp + fsync + rename) to
+      ``<user_kb_disk_root>/<user_id>/<oid><.ext>`` and stores the relative
+      path on the documents row as ``local_path``. GridFS is no longer
+      written (see module docstring).
     * The heavy parse work is scheduled by the caller (the API layer) via
       ``asyncio.create_task(parse_document(...))`` so the HTTP response
       returns immediately.

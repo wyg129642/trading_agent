@@ -115,9 +115,11 @@ class Settings(BaseSettings):
     # 数据目录 /home/ygwang/crawl_data/mongo。远端保留作为只读备份。
     # MONGO_URI 环境变量统一驱动 REMOTE_CRAWL_MONGO_URI，crawler scrapers 也用同
     # 一个 env 变量。env 不写则默认本机 27018。
-    # PDF 全部从本地 SSD `/home/ygwang/crawl_data/<plat>_pdfs/` 加载，仅在
-    # 本地 disk miss 时回退到 GridFS (fs.files + fs.chunks)。/mnt/share fallback
-    # 已于 2026-04-26 移除 — alphapai_pdfs 已 rsync 回本机。
+    # PDF / DOCX / XLSX / 音频 全部从本地 SSD 加载 — crawler PDFs 在
+    # `/home/ygwang/crawl_data/<plat>_pdfs/`；user KB 上传文件在
+    # `/home/ygwang/crawl_data/user_kb_files/<user_id>/`. GridFS 已于
+    # 2026-04-27 全面退役 (crawler 5 库 fs.* drop, user KB 走双读 fallback
+    # 直到迁移脚本把残留 2 文件搬到磁盘)。
     REMOTE_CRAWL_MONGO_URI: str = os.environ.get(
         "MONGO_URI",
         "mongodb://127.0.0.1:27018/",
@@ -194,16 +196,28 @@ class Settings(BaseSettings):
     # / `user_kb_fetch_document` tools to the AI chat assistant. Each user's
     # uploads are isolated by user_id filtering on every query.
     # 2026-04-26: replicated back to local Mongo (ta-mongo-crawl :27018).
-    # Schema is unchanged — shared `documents` + `chunks` + GridFS, scoped
-    # by user_id. Per-user collections would blow past Mongo's soft-limit on
-    # collection count and fracture GridFS buckets; user_id scoping is the
-    # right pattern at scale. Override via USER_KB_MONGO_URI / USER_KB_MONGO_DB
-    # (defaults to MONGO_URI env so a single setting drives all workloads).
+    # Schema: shared `documents` + `chunks` collections, scoped by user_id
+    # (per-user collections would blow past Mongo's soft-limit on collection
+    # count). Original uploaded binaries live on local SSD under
+    # `user_kb_disk_root` — GridFS is no longer the source of truth (retired
+    # 2026-04-27); a small dual-read fallback remains in user_kb_service so
+    # legacy rows whose bytes haven't been migrated yet still serve.
+    # Override via USER_KB_MONGO_URI / USER_KB_MONGO_DB (defaults to MONGO_URI
+    # env so a single setting drives all workloads).
     user_kb_mongo_uri: str = os.environ.get(
         "USER_KB_MONGO_URI",
         os.environ.get("MONGO_URI", "mongodb://127.0.0.1:27018/"),
     )
     user_kb_mongo_db: str = "ti-user-knowledge-base"
+    # On-disk root for user-uploaded originals. One subdir per user_id; each
+    # file lives at `<root>/<user_id>/<document_oid><.ext>`. Same path is
+    # used by prod and staging because user KB collections are shared
+    # (USER_KB_SHARE_WITH_PROD=true) — no env-suffixing needed. Override via
+    # USER_KB_DISK_ROOT.
+    user_kb_disk_root: str = os.environ.get(
+        "USER_KB_DISK_ROOT",
+        "/home/ygwang/crawl_data/user_kb_files",
+    )
     # Per-file upload ceiling (bytes) for text/document uploads. 50 MB is
     # comfortable for reports / transcripts without letting a single upload
     # exhaust Mongo memory. Audio uploads use ``user_kb_max_audio_bytes``.
@@ -552,7 +566,10 @@ class Settings(BaseSettings):
 
     @property
     def user_kb_gridfs_bucket(self) -> str:
-        """GridFS bucket name — maps to `{bucket}.files` + `{bucket}.chunks`."""
+        """Legacy GridFS bucket — only read by the dual-read fallback for
+        rows uploaded before the disk cutover (2026-04-27). New uploads go
+        straight to ``user_kb_disk_root`` and never touch GridFS.
+        Maps to ``{bucket}.files`` + ``{bucket}.chunks``."""
         if self.user_kb_share_with_prod:
             return "fs"
         return self._prefixed("fs")
