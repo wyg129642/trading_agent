@@ -171,7 +171,7 @@ def http_get(session: requests.Session, path_or_url: str,
         if status == 403:
             body = r.text[:400]
             if "Just a moment" in body or "challenge" in body.lower() or "cloudflare" in body.lower():
-                SoftCooldown.trigger(PLATFORM, reason="cf_challenge", minutes=60)
+                SoftCooldown.trigger(PLATFORM, reason="cf_challenge", minutes=10)
                 raise RuntimeError(f"{what or url} Cloudflare 拦截 (cf_challenge)")
             # 普通 403, 走 SessionDead
             raise SessionDead(f"{what or url} → HTTP 403, body={body}")

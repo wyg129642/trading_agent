@@ -203,8 +203,7 @@ def api_get(session: requests.Session, path: str, params: Optional[dict] = None,
                                           cookies=dict(r.cookies),
                                           platform=PLATFORM)
             if reason:
-                SoftCooldown.trigger(PLATFORM, reason=reason,
-                                     minutes=45 if status == 429 else 30)
+                SoftCooldown.trigger(PLATFORM, reason=reason, minutes=10)
             wait = ra if ra is not None else min(2 ** attempt + 2, 30)
             _THROTTLE.on_retry()
             if attempt < retries:
@@ -226,7 +225,7 @@ def api_get(session: requests.Session, path: str, params: Optional[dict] = None,
             body = r.text[:400]
             if "Just a moment" in body or "cf-chl" in body.lower():
                 SoftCooldown.trigger(PLATFORM, reason="waf_cookie:cf_challenge",
-                                     minutes=60)
+                                     minutes=10)
                 raise RuntimeError(f"{what or path} Cloudflare challenge (HTML)")
             raise RuntimeError(f"{what or path} 非 JSON 响应 ct={ct}: {body}")
         try:
@@ -239,7 +238,7 @@ def api_get(session: requests.Session, path: str, params: Optional[dict] = None,
                                       cookies=dict(r.cookies),
                                       platform=PLATFORM)
         if reason:
-            SoftCooldown.trigger(PLATFORM, reason=reason, minutes=45)
+            SoftCooldown.trigger(PLATFORM, reason=reason, minutes=10)
             _THROTTLE.on_warning()
 
         return data

@@ -158,8 +158,7 @@ def decrypt_response(resp: requests.Response) -> dict:
         reason = detect_soft_warning(resp.status_code, body=body,
                                       cookies=dict(resp.cookies))
         if reason:
-            mins = 30 if "quota" in reason or "code_7" in reason else 60
-            SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=mins)
+            SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=10)
             _THROTTLE.on_warning()
     except Exception:
         pass

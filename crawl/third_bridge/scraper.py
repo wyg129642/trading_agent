@@ -202,10 +202,9 @@ def _retry_request(fn, *, what: str, max_retries: int = DEFAULT_MAX_RETRIES):
             raise AuthExpired(f"HTTP {resp.status_code}: {resp.text[:200]}")
         if resp.status_code == 429 or 500 <= resp.status_code < 600:
             if resp.status_code == 429:
-                # ThirdBridge 走 AWS WAF, 429 一旦出 → 全平台 60min 静默
-                # (相当于其他平台的 45min 但 ThirdBridge 保守一档)
+                # ThirdBridge 走 AWS WAF, 429 一旦出 → 全平台 10min 静默
                 SoftCooldown.trigger(_PLATFORM, reason=f"http_429:{what}",
-                                      minutes=60)
+                                      minutes=10)
             ra = parse_retry_after(resp.headers.get("Retry-After"))
             tqdm.write(f"  [{what}] HTTP {resp.status_code}, retry {attempt}/{max_retries}"
                        + (f" (Retry-After={ra:.0f}s)" if ra else ""))
@@ -222,8 +221,7 @@ def _retry_request(fn, *, what: str, max_retries: int = DEFAULT_MAX_RETRIES):
                                       text_preview=resp.text[:400] if resp.text else "",
                                       cookies=dict(resp.cookies))
         if reason:
-            mins = 30 if "quota" in reason or "code_7" in reason else 60
-            SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=mins)
+            SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=10)
             _THROTTLE.on_warning()
         return resp
     raise RuntimeError(f"[{what}] 达到最大重试次数 ({max_retries}), 最后错误: {last_err}")

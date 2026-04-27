@@ -237,8 +237,7 @@ def with_retry(fn, cfg: HttpConfig, label: str, *args, **kwargs):
             if isinstance(result, dict):
                 reason = detect_soft_warning(200, body=result)
                 if reason:
-                    mins = 30 if "quota" in reason or "code_7" in reason else 60
-                    SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=mins)
+                    SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=10)
                     _THROTTLE.on_warning()
             return result
         except AuthExpired:
@@ -248,7 +247,7 @@ def with_retry(fn, cfg: HttpConfig, label: str, *args, **kwargs):
             if status == 429 or status >= 500:
                 if status == 429:
                     SoftCooldown.trigger(_PLATFORM, reason=f"http_429:{label}",
-                                          minutes=45)
+                                          minutes=10)
                 ra = parse_retry_after(e.response.headers.get("Retry-After"))
                 tqdm.write(f"  {label}: HTTP {status}, retry {attempt}/{cfg.max_retries}"
                            + (f" (Retry-After={ra:.0f}s)" if ra else ""))

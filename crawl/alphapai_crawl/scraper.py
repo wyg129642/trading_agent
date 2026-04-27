@@ -553,10 +553,10 @@ def api_call(session: requests.Session, method: str, path: str,
             if is_auth_dead(r.status_code):
                 raise SessionDead(f"HTTP {r.status_code} on {path}: {r.text[:200]}")
             if r.status_code == 429 or 500 <= r.status_code < 600:
-                # 软警告: 429 / 5xx 触发同平台全局冷却 (45 min), 而不是单请求重试
+                # 软警告: 429 / 5xx 触发同平台全局冷却 (10 min), 而不是单请求重试
                 if r.status_code == 429:
                     SoftCooldown.trigger(_PLATFORM, reason=f"http_429:{path}",
-                                          minutes=45)
+                                          minutes=10)
                 ra = parse_retry_after(r.headers.get("Retry-After"))
                 _THROTTLE.on_retry(retry_after_sec=ra, attempt=attempt)
                 _THROTTLE.sleep_before_next()
@@ -601,12 +601,15 @@ def api_call(session: requests.Session, method: str, path: str,
                 )
                 if is_daily_quota:
                     _THROTTLE.on_warning()
-                    # token 池: 标当前账号今日额度耗尽 → watch loop 切到下个 token
+                    # 撞到账号级日配额 (400000 / 今日查看上限 / 请明日再来 等):
+                    # 立即把账号标记为 today exhausted → outer loop 重选 token, 单
+                    # token 场景下 sleep 到 BJ 第二天 0:02 — 期间 watch loop 不再
+                    # fetch / 不写库, 避免在配额耗尽下继续打 list 端点 + 把残缺
+                    # 的 ~134 字 list summary 当 content 入库污染数据.
                     if _CURRENT_ACCOUNT_ID:
                         mark_token_exhausted(_CURRENT_ACCOUNT_ID)
                 else:
-                    mins = 30 if "quota" in reason else 60
-                    SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=mins)
+                    SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=10)
                     _THROTTLE.on_warning()
             return body if body is not None else {"code": -1,
                 "message": "non-json response", "data": None}

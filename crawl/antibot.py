@@ -20,7 +20,7 @@
    的比较基准 (backfill 在 rt 用量 >= 70% 时暂停). floor 参考值见
    `_DEFAULT_ACCOUNT_BUDGET`, 已不作为 rt 硬闸.
 7. **SoftCooldown (核心)**: 软警告全局冷却. 任何 watcher 触发警告 (软 429 / 配额
-   截断 / captcha cookie / 风控关键词) → 同平台所有 watcher 静默 30~60min,
+   截断 / captcha cookie / 风控关键词) → 同平台所有 watcher 静默 10min,
    不等到 401/403 才退. Redis backed, 跨进程立即生效. 实时档去掉数量闸后,
    这一层 + 指纹 + 节奏是主要防线.
 8. **时段倍增**: 23:00-07:00 CST × 2.5, 周末 × 1.8, 12:00-13:30 × 1.3.
@@ -441,14 +441,20 @@ class SoftCooldown:
     def _key(platform: str) -> str:
         return f"crawl:soft_cooldown:{platform}"
 
+    MAX_MINUTES: float = 10.0
+
     @staticmethod
-    def trigger(platform: str, reason: str = "", minutes: float = 45.0,
+    def trigger(platform: str, reason: str = "", minutes: float = 10.0,
                 verbose: bool = True) -> None:
         """Set / extend the cooldown flag for a platform.
 
         Existing cooldown is **extended** (not reset) if longer remaining than
         the new one — multiple warnings shouldn't shorten safety window.
+
+        Caller-supplied `minutes` is clamped to `MAX_MINUTES` (10min) — long
+        windows starve the orchestrator with no real anti-bot benefit.
         """
+        minutes = min(minutes, SoftCooldown.MAX_MINUTES)
         ends_at = time.time() + max(60.0, minutes * 60.0)
         r = _get_redis()
         key = SoftCooldown._key(platform)

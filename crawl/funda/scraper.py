@@ -299,7 +299,7 @@ def trpc_get(client: httpx.Client, procedure: str, input_obj: dict,
         if resp.status_code == 429 or 500 <= resp.status_code < 600:
             if resp.status_code == 429:
                 SoftCooldown.trigger(_PLATFORM, reason=f"http_429:{procedure}",
-                                      minutes=45)
+                                      minutes=10)
             ra = parse_retry_after(resp.headers.get("Retry-After"))
             tqdm.write(f"  [{what or procedure}] HTTP {resp.status_code} "
                        f"retry {attempt}/{DEFAULT_MAX_RETRIES}"
@@ -326,7 +326,7 @@ def trpc_get(client: httpx.Client, procedure: str, input_obj: dict,
             err_msg = (err.get("message") or "") if isinstance(err, dict) else str(err)
             reason = detect_soft_warning(200, body={"message": err_msg})
             if reason:
-                SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=45)
+                SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=10)
                 _THROTTLE.on_warning()
             raise RuntimeError(f"[{procedure}] tRPC error: "
                                f"{first.get('error')!r}"[:400])
@@ -338,8 +338,7 @@ def trpc_get(client: httpx.Client, procedure: str, input_obj: dict,
             reason = detect_soft_warning(200, body=body_json,
                                           cookies=dict(resp.cookies))
             if reason:
-                mins = 30 if "quota" in reason or "code_7" in reason else 60
-                SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=mins)
+                SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=10)
                 _THROTTLE.on_warning()
         return body_json
     raise RuntimeError(f"[{procedure}] 达到最大重试次数 ({DEFAULT_MAX_RETRIES}), "

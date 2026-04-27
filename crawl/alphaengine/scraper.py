@@ -402,7 +402,7 @@ def fetch_list_page(session: requests.Session, code: str,
             if r.status_code == 429 or 500 <= r.status_code < 600:
                 if r.status_code == 429:
                     SoftCooldown.trigger(_PLATFORM, reason=f"http_429:{SEARCH_PATH}",
-                                          minutes=45)
+                                          minutes=10)
                 ra = parse_retry_after(r.headers.get("Retry-After"))
                 _THROTTLE.on_retry(retry_after_sec=ra, attempt=attempt)
                 _THROTTLE.sleep_before_next()
@@ -427,17 +427,16 @@ def fetch_list_page(session: requests.Session, code: str,
                     inner = (err.get("data") or {})
                     inner_code = inner.get("code") if isinstance(inner, dict) else None
                     if err.get("code") == 450 and inner_code == "REFRESH_LIMIT":
-                        # REFRESH_LIMIT 是该账号 list quota 用尽 — 触发同平台 30 min
+                        # REFRESH_LIMIT 是该账号 list quota 用尽 — 触发同平台 10 min
                         # 软冷却让其它 watcher 一起退场, detail enrich worker 仍能跑
                         SoftCooldown.trigger(_PLATFORM, reason="REFRESH_LIMIT",
-                                              minutes=30)
+                                              minutes=10)
                         raise RefreshLimit(
                             f"REFRESH_LIMIT: {inner.get('description') or err.get('msg')}")
                     # 通用业务级软警告 (限流关键词等)
                     reason = detect_soft_warning(200, body=err)
                     if reason:
-                        mins = 30 if "quota" in reason or "code_7" in reason else 60
-                        SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=mins)
+                        SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=10)
                         _THROTTLE.on_warning()
                     return {"_err": f"biz code={err.get('code')} msg={err.get('msg')}",
                             "results": [], "has_next_page": False}
