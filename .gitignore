@@ -119,3 +119,16 @@ REVENUE_MODELING_PROGRESS.md
 
 # Twitter/X experimental scraper — scratch only, outside main pipeline
 twitter_playwright.py
+
+# Staging-only nav override: 数据库看板 menu entry + route guard 放开,
+# 让任何登录用户都能在 staging 访问. 两个文件本身保持 tracked (生产 main
+# 仍保留 AdminRoute 网关), 但 staging 的本地修改通过 skip-worktree 不让其
+# 进入 commit / push:
+#   git update-index --skip-worktree frontend/src/components/AppLayout.tsx
+#   git update-index --skip-worktree frontend/src/App.tsx
+# 此 .gitignore 段仅作日志, 对已 tracked 文件无作用. 要恢复跟踪 (例如 main
+# 上这两个文件有更新需要 merge), 撤销 skip-worktree:
+#   git update-index --no-skip-worktree frontend/src/components/AppLayout.tsx
+#   git update-index --no-skip-worktree frontend/src/App.tsx
+# frontend/src/components/AppLayout.tsx
+# frontend/src/App.tsx
