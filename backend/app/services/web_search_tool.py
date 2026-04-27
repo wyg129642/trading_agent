@@ -252,21 +252,20 @@ def _is_downrank_host(url: str, website: str = "") -> bool:
 
 
 def _rerank_results(results: list[dict], max_results: int = 8) -> list[dict]:
-    """Sort by trust tier > relevance > authority > recency; filter empty."""
-    def sort_key(r: dict) -> tuple:
-        score = r.get("score", 0) or 0
-        authority = r.get("authority", 0) or 0
-        has_date = 1 if r.get("date") else 0
-        # Trust tier: 1 = trusted (default), 0 = downranked aggregator/forum.
-        # Putting trust first guarantees a single low-authority article never
-        # outranks a real news/research result regardless of relevance score.
-        trust = 0 if _is_downrank_host(r.get("url", ""), r.get("website", "")) else 1
-        return (trust, score, authority, has_date)
-
-    # Filter out empty content
+    # Engines (Tavily/Jina/...) already return results in their own ranked order;
+    # the previous score/authority/has_date sort mixed unnormalized signals
+    # (Jina/DDG always reported score=0) and effectively randomized ties.
+    # We now preserve arrival order and only enforce two hard rules: drop empty
+    # content, and push downrank-list hosts to the back so a real news/research
+    # source always wins a tie against a low-trust aggregator.
     results = [r for r in results if r.get("content", "").strip()]
-    results.sort(key=sort_key, reverse=True)
-    return results[:max_results]
+    trusted, downranked = [], []
+    for r in results:
+        if _is_downrank_host(r.get("url", ""), r.get("website", "")):
+            downranked.append(r)
+        else:
+            trusted.append(r)
+    return (trusted + downranked)[:max_results]
 
 
 # ── Citation tracking ──────────────────────────────────────────
