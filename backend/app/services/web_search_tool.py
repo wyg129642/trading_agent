@@ -5,8 +5,10 @@ a system prompt for search behavior guidance, and tool execution with
 smart engine routing and citation tracking.
 
 Engine routing:
-  - Chinese stock / A-share queries → Baidu + Jina (Chinese keywords only)
-  - General / international queries  → Baidu (Chinese) + Tavily + Jina (Chinese + English)
+  - Chinese stock / A-share queries → Tavily + Jina (Chinese + English keywords)
+  - General / international queries  → Tavily + Jina (English; Chinese fallback if no en query)
+
+Baidu is intentionally disabled (2026-04-27); only Tavily and Jina are used.
 """
 from __future__ import annotations
 
@@ -40,7 +42,7 @@ WEB_SEARCH_TOOLS: list[dict] = [
                     "query_cn": {
                         "type": "string",
                         "description": (
-                            "中文搜索关键词（必填）。用于百度和Jina搜索。"
+                            "中文搜索关键词（必填）。用于Tavily和Jina搜索（中文输入）。"
                             "应当简洁、精准，针对搜索引擎优化。"
                         ),
                     },
@@ -534,12 +536,11 @@ async def _execute_web_search(
 ) -> tuple[str, list[dict]]:
     """Execute web_search with smart engine routing."""
     from src.tools.web_search import (
-        baidu_search, tavily_search, jina_search, duckduckgo_search,
+        tavily_search, jina_search, duckduckgo_search,
         format_search_results,
     )
 
     settings = get_settings()
-    baidu_key = settings.baidu_api_key
     tavily_key = settings.tavily_api_key
     jina_key = settings.jina_api_key
 
@@ -552,13 +553,9 @@ async def _execute_web_search(
         return "Error: query_cn is required.", []
 
     # Map recency to engine-specific params
-    recency_map_baidu = {
-        "day": "week", "week": "week", "month": "month", "year": "year",
-    }
     recency_map_tavily_days = {
         "day": 1, "week": 7, "month": 30, "year": 365,
     }
-    baidu_recency = recency_map_baidu.get(recency, "month")
     tavily_days = recency_map_tavily_days.get(recency)
     tavily_topic = "news" if search_type == "news" else "general"
 
@@ -586,16 +583,10 @@ async def _execute_web_search(
         return format_search_results(cached, max_per_result=600), []
 
     # Build search tasks based on routing logic
-    # All three engines are always used. Keyword strategy differs:
-    #   Chinese stock: Baidu(CN) + Tavily(CN+EN) + Jina(CN+EN)
-    #   Other:         Baidu(CN) + Tavily(EN)    + Jina(EN)
+    # Baidu is disabled — only Tavily + Jina are used. Keyword strategy:
+    #   Chinese stock: Tavily(CN+EN) + Jina(CN+EN)
+    #   Other:         Tavily(EN)    + Jina(EN)
     tasks: list[tuple[str, Any]] = []
-
-    # Baidu: always Chinese keywords
-    if baidu_key:
-        tasks.append(("baidu_cn", baidu_search(
-            query_cn, baidu_key, max_results=10, recency=baidu_recency,
-        )))
 
     if is_cn_stock:
         # Chinese stock/market: Tavily and Jina get BOTH Chinese + English keywords
