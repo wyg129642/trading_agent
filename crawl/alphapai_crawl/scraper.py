@@ -60,6 +60,10 @@ _THROTTLE: AdaptiveThrottle = AdaptiveThrottle(base_delay=3.0, jitter=2.0,
 # 模块级账号预算 (跨进程 24h 滚动窗, Redis 共享)
 _BUDGET: AccountBudget = AccountBudget("alphapai", "default", 0)
 _PLATFORM = "alphapai"
+# 当前 watcher 进程绑定的账号 ID (从 JWT 解出). 多 token 池场景下,
+# api_call 检测到 daily-quota 时 mark 这个 ID, watch loop 切到下一个可用 token,
+# 全部耗尽则 sleep 到 BJ 第二天 0:02.
+_CURRENT_ACCOUNT_ID: str = ""
 
 # ==================== 请配置以下内容 ====================
 
@@ -78,15 +82,126 @@ USER_AUTH_TOKEN = (
 CREDS_FILE = Path(__file__).resolve().parent / "credentials.json"
 
 
-def _load_token_from_file() -> str:
-    """从 credentials.json 读取 token. 飞书机器人会写入此文件做热更新."""
+def _load_tokens_from_file() -> list:
+    """读 credentials.json 返回 token 列表(支持新旧两种 schema).
+
+    新版 (多账号 token 池):
+        {"tokens": [{"token":"...", "label":"main", "updated_at":"..."},
+                    {"token":"...", "label":"alt1", ...}],
+         "schema_version": 2}
+
+    旧版 (单账号, 向后兼容):
+        {"token": "...", "updated_at": "..."}
+
+    返回: [{token, label, updated_at}, ...] 或 [] 表示无 token.
+    """
     if not CREDS_FILE.exists():
-        return ""
+        return []
     try:
         d = json.loads(CREDS_FILE.read_text(encoding="utf-8"))
-        return (d.get("token") or "").strip()
+        if isinstance(d, dict):
+            if isinstance(d.get("tokens"), list):
+                return [t for t in d["tokens"]
+                        if isinstance(t, dict) and t.get("token")]
+            if d.get("token"):
+                return [{"token": d["token"].strip(),
+                         "label": "main",
+                         "updated_at": d.get("updated_at", "")}]
+        return []
     except Exception:
-        return ""
+        return []
+
+
+def _load_token_from_file() -> str:
+    """向后兼容: 返回 token 池里第一个 token."""
+    tokens = _load_tokens_from_file()
+    return tokens[0]["token"].strip() if tokens else ""
+
+
+# -------- Token 池跨进程协调 --------
+
+class TokenExhausted(Exception):
+    """当前 token 当日额度耗尽; watch loop 应切换 token 或 sleep 到午夜."""
+
+
+_TOKEN_EXHAUSTED_KEY = "crawl:tokenpool:alphapai:exhausted_today:{account_id}"
+
+
+def _redis_or_none():
+    """复用 antibot 的 Redis 客户端 (容错). 失败返 None."""
+    try:
+        from antibot import _redis_client  # type: ignore
+        return _redis_client()
+    except Exception:
+        try:
+            import redis as _r
+            host = os.environ.get("REDIS_HOST", "127.0.0.1")
+            port = int(os.environ.get("REDIS_PORT", "6379"))
+            c = _r.Redis(host=host, port=port, decode_responses=True,
+                         socket_timeout=2.0, socket_connect_timeout=2.0)
+            c.ping()
+            return c
+        except Exception:
+            return None
+
+
+def _seconds_until_bj_midnight(extra_seconds: int = 120) -> int:
+    """到 BJ 第二天 0 点 + extra 秒. 单账号每日 quota 重置点."""
+    BJ = timezone(timedelta(hours=8))
+    now = datetime.now(BJ)
+    tomorrow = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return max(60, int((tomorrow - now).total_seconds()) + extra_seconds)
+
+
+def is_token_exhausted(account_id: str) -> bool:
+    if not account_id:
+        return False
+    r = _redis_or_none()
+    if r is None:
+        return False
+    try:
+        return bool(r.exists(_TOKEN_EXHAUSTED_KEY.format(account_id=account_id)))
+    except Exception:
+        return False
+
+
+def mark_token_exhausted(account_id: str) -> None:
+    """标该账号今日额度耗尽; TTL 到 BJ 第二天 0:02."""
+    if not account_id:
+        return
+    r = _redis_or_none()
+    if r is None:
+        return
+    try:
+        r.set(_TOKEN_EXHAUSTED_KEY.format(account_id=account_id),
+              "1", ex=_seconds_until_bj_midnight(extra_seconds=120))
+    except Exception:
+        pass
+
+
+def pick_available_token(tokens: list, label_hint: str = "") -> dict:
+    """从 token list 里挑一个未耗尽的; 用 label_hint hash 让多 watcher 分到不同 token.
+
+    返回的 dict 含 token / label / account_id (后者 JWT 解出).
+    全部耗尽返 None — 调用方决定 sleep-until-midnight 或退出.
+    """
+    if not tokens:
+        return None
+    enriched = []
+    for t in tokens:
+        tok = (t.get("token") or "").strip()
+        if not tok:
+            continue
+        acc_id = t.get("account_id") or _account_id_from_token(tok)
+        enriched.append({**t, "token": tok, "account_id": acc_id})
+    if not enriched:
+        return None
+    available = [t for t in enriched if not is_token_exhausted(t["account_id"])]
+    if not available:
+        return None
+    seed = abs(hash(label_hint or "default"))
+    return available[seed % len(available)]
 
 
 API_BASE = "https://alphapai-web.rabyte.cn/external/alpha/api"
@@ -486,6 +601,9 @@ def api_call(session: requests.Session, method: str, path: str,
                 )
                 if is_daily_quota:
                     _THROTTLE.on_warning()
+                    # token 池: 标当前账号今日额度耗尽 → watch loop 切到下个 token
+                    if _CURRENT_ACCOUNT_ID:
+                        mark_token_exhausted(_CURRENT_ACCOUNT_ID)
                 else:
                     mins = 30 if "quota" in reason else 60
                     SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=mins)
@@ -1030,6 +1148,91 @@ def enrich_report_doc(session, doc: dict, item: dict, pdf_dir: Path,
     doc["pdf_error_kind"] = "none"
 
 
+# -------------------- Truncated retry (每轮 watch 末尾, 跨天自动补齐) --------------------
+
+def retry_truncated_roadshows(session, db, max_retry: int = 100,
+                              consec_quota_break: int = 5,
+                              min_gain_chars: int = 200) -> dict:
+    """每轮 watch 末尾扫 content_truncated=True 的 roadshow doc, 调 detail 接口
+    尝试补全. 替代独立 bypass_backfill.py 进程.
+
+    - cur_len 大的优先(更可能藏 rich aiSummary, 命中价值高).
+    - 连续 N 个 400000 → 今日额度耗尽, 本轮提前 break.
+    - 500020 短期 throttle → cool 90s.
+    - 如果有多 token 池, api_call 自动切下一个 (mark_token_exhausted 触发).
+
+    Returns: {"scanned", "refilled", "quota_blocked", "throttled", "skipped"}
+    """
+    stats = {"scanned": 0, "refilled": 0, "quota_blocked": 0,
+             "throttled": 0, "skipped": 0}
+    if max_retry <= 0:
+        return stats
+    if "roadshows" not in db.list_collection_names():
+        return stats
+    col = db["roadshows"]
+    cands = list(col.aggregate([
+        {"$match": {"content_truncated": True,
+                    "raw_id": {"$exists": True, "$ne": None}}},
+        {"$addFields": {"_cur_len": {"$strLenCP": {"$ifNull": ["$content", ""]}}}},
+        {"$sort": {"_cur_len": -1, "crawled_at": -1}},
+        {"$limit": max_retry},
+        {"$project": {"_id": 1, "raw_id": 1, "title": 1, "_cur_len": 1}},
+    ]))
+    if not cands:
+        return stats
+    print(f"[retry-truncated] roadshow candidates: {len(cands)}")
+    consec_quota = 0
+    for d in cands:
+        rid = d.get("raw_id")
+        cur = d.get("_cur_len", 0)
+        try:
+            r = api_call(session, "GET",
+                         f"reading/roadshow/summary/detail?id={rid}") or {}
+        except SessionDead:
+            raise
+        except Exception:
+            stats["skipped"] += 1
+            continue
+        stats["scanned"] += 1
+        code = r.get("code")
+        if code == OK_CODE:
+            consec_quota = 0
+            detail = r.get("data") or {}
+            main_md, seg_md = _extract_roadshow_content(detail)
+            new_len = len(main_md or "")
+            if new_len > cur + min_gain_chars:
+                update = {
+                    "content": main_md,
+                    "content_truncated": False,
+                    "detail": detail,
+                    "_retry_truncated_at": datetime.now(timezone.utc),
+                }
+                if seg_md:
+                    update["segments_md"] = seg_md
+                col.update_one({"_id": d["_id"]}, {"$set": update})
+                stats["refilled"] += 1
+                if stats["refilled"] <= 3 or stats["refilled"] % 10 == 0:
+                    title = (d.get("title") or "")[:50]
+                    print(f"  ✓ +{new_len-cur:>5}  {title}")
+            else:
+                stats["skipped"] += 1
+        elif code == 400000:
+            stats["quota_blocked"] += 1
+            consec_quota += 1
+            if consec_quota >= consec_quota_break:
+                print(f"[retry-truncated] {consec_quota}× 连续 400000, "
+                      f"本轮提前结束 (refilled={stats['refilled']})")
+                break
+        elif code == 500020:
+            stats["throttled"] += 1
+            time.sleep(90)
+        else:
+            stats["skipped"] += 1
+    print(f"[retry-truncated] 扫 {stats['scanned']}, 补 {stats['refilled']}, "
+          f"额度阻塞 {stats['quota_blocked']}, throttled {stats['throttled']}")
+    return stats
+
+
 # -------------------- Mongo 存储 --------------------
 
 def dump_one(session, db, category_key: str, cfg: dict, item: dict,
@@ -1154,21 +1357,27 @@ def dump_one(session, db, category_key: str, cfg: dict, item: dict,
         if seg_md:
             doc["segments_md"] = seg_md
 
-    # Roadshow 额度截断标记. 平台对"查看纪要"有每日上限 (默认 100 条/天),
-    # 超过后返回 hasPermission=False + code=7 + content 降级为 ~220 字预览.
-    # 打 content_truncated=True, 第二天额度回来时 dedup check 会允许重拉.
+    # Roadshow 额度截断标记. 平台对"查看纪要"有两层每日上限:
+    #   (1) list 端 hasPermission=False + noPermissionReason.code=7 (~220 字预览)
+    #   (2) detail 端自身耗尽 → fetch_detail 包成 _err.code=400000 (~134 字 list content)
+    # 任一发生都标 content_truncated=True, dedup-skip 允许下次重抓,
+    # watch loop 末尾 retry_truncated_roadshows 跨天补齐.
     if category_key == "roadshow":
         cur_has_perm = doc.get("hasPermission")
         if cur_has_perm is None:
             cur_has_perm = item.get("hasPermission")
         if isinstance(detail, dict):
             no_perm = detail.get("noPermissionReason") or {}
+            err = detail.get("_err") or {}
             is_quota_blocked = (
-                cur_has_perm is False
-                and isinstance(no_perm, dict)
-                and no_perm.get("code") == 7
+                (cur_has_perm is False
+                 and isinstance(no_perm, dict)
+                 and no_perm.get("code") == 7)
+                or err.get("code") == 400000
             )
             doc["content_truncated"] = bool(is_quota_blocked)
+            if err.get("code") == 400000:
+                doc["quota_msg"] = err.get("message") or ""
         else:
             doc["content_truncated"] = bool(cur_has_perm is False)
 
@@ -1668,6 +1877,9 @@ def parse_args():
                    help="实时模式: 定时轮询. Ctrl+C 退出")
     p.add_argument("--interval", type=int, default=600,
                    help="实时模式轮询间隔秒数 (默认 600)")
+    p.add_argument("--retry-truncated-max", type=int, default=100,
+                   help="watch 每轮末尾尝试 retry 的 content_truncated=True roadshow "
+                        "上限 (跨天额度恢复后自动补齐). 0=禁用. 默认 100.")
     p.add_argument("--since-hours", type=float, default=None,
                    help="只抓取过去 N 小时内发布的内容 (按 time_field). "
                         "默认不限制.")
@@ -1748,24 +1960,41 @@ def show_state(db) -> None:
         print(f"  {c:>10s} ({cfg['collection']}): {n}")
 
 
-def main():
-    args = parse_args()
-    if not args.auth:
-        print("错误: 未提供 USER_AUTH_TOKEN. 用 --auth / env JM_AUTH 传入,"
-              "或编辑脚本顶部 USER_AUTH_TOKEN.")
-        sys.exit(1)
-
-    global _THROTTLE, _BUDGET
+def _setup_globals_for_token(args, token: str) -> str:
+    """重置 _THROTTLE / _BUDGET / _CURRENT_ACCOUNT_ID 给指定 token. 返回 account_id."""
+    global _THROTTLE, _BUDGET, _CURRENT_ACCOUNT_ID
     _THROTTLE = throttle_from_args(args, platform="alphapai")
-    _account_id_base = _account_id_from_token(args.auth or "")
-    # 按子模块独立 24h 预算 — roadshow/comment/report 每桶 3000. 预算 key
-    # 变成 crawl:budget:alphapai:<uid>:<category>, 被打满的模块不拖累其他模块.
-    # --category all 时统一挂 "all" 后缀 (极少用, 仅 backfill 一次性全扫).
-    cat_for_budget = args.category if args.category and args.category != "all" else "all"
+    _account_id_base = _account_id_from_token(token or "")
+    _CURRENT_ACCOUNT_ID = _account_id_base
+    cat_for_budget = (args.category if args.category and args.category != "all"
+                      else "all")
     _account_id = account_id_for_alphapai(_account_id_base, cat_for_budget)
     _BUDGET = budget_from_args(args, account_id=_account_id, platform="alphapai")
     log_config_stamp(_THROTTLE, cap=cap_from_args(args), budget=_BUDGET,
                      extra=f"acct={_account_id}")
+    return _account_id_base
+
+
+def main():
+    args = parse_args()
+
+    # 多账号 token 池 (默认行为):
+    #   - credentials.json 是新 schema {"tokens": [{...}, ...]} → 多账号
+    #   - 旧 schema {"token": "..."} → 池长度 1 (向后兼容)
+    #   - args.auth 显式传入 → 用显式 token, 不进 pool 切换
+    tokens_in_pool = _load_tokens_from_file()
+    explicit_auth = bool(args.auth) and (
+        not tokens_in_pool
+        or args.auth.strip() != tokens_in_pool[0]["token"].strip()
+    )
+    if not args.auth and not tokens_in_pool:
+        print("错误: credentials.json 无 token, --auth / JM_AUTH / "
+              "USER_AUTH_TOKEN 都没设. 退出.")
+        sys.exit(1)
+    pool_label_hint = " ".join(sys.argv[1:])[:80]
+    pool_size = max(1, len(tokens_in_pool))
+    if pool_size > 1 and not explicit_auth:
+        print(f"[token-pool] 检测到 {pool_size} 个 alphapai 账号, 启用轮换")
 
     db = connect_mongo(args.mongo_uri, args.mongo_db)
 
@@ -1830,62 +2059,115 @@ def main():
         print(f"\n[fix] 完成: 修复 {fixed} / 跳过 {skipped} / 失败 {failed}")
         return
 
-    info = parse_jwt(args.auth)
-    if info:
-        exp = info.get("exp")
-        exp_str = datetime.fromtimestamp(exp, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M") \
-            if exp else "?"
-        print(f"[认证] uid={info.get('uid')} 过期时间={exp_str}")
+    # ========= Token 池 outer loop =========
+    # 每次循环挑可用 token → 跑 watch / 一次性命令 → 命中 daily quota 时 break
+    # 内层 → outer 重选下一个可用 token. 全部耗尽时 sleep 到 BJ 第二天 0:02.
+    # 单 token 场景下 outer 也只走 1 次 (耗尽后 sleep).
+    while True:
+        # 1. 挑 token
+        if explicit_auth:
+            chosen_token = args.auth
+            chosen_label = "explicit"
+        else:
+            tokens_now = _load_tokens_from_file() or tokens_in_pool
+            picked = pick_available_token(tokens_now, label_hint=pool_label_hint)
+            if picked is None:
+                wait = _seconds_until_bj_midnight(extra_seconds=120)
+                print(f"\n[token-pool] {len(tokens_now)} 个 alphapai 账号"
+                      f"全部今日额度耗尽, sleep {wait}s 到 BJ 第二天 0:02 后重选 "
+                      f"(期间可在 credentials.json 追加新账号自动接管)")
+                try:
+                    time.sleep(wait)
+                except KeyboardInterrupt:
+                    print("\nCtrl+C 退出"); return
+                continue
+            chosen_token = picked["token"]
+            chosen_label = picked.get("label", "?")
 
-    session = create_session(args.auth)
+        _setup_globals_for_token(args, chosen_token)
+        info = parse_jwt(chosen_token)
+        if info:
+            exp = info.get("exp")
+            exp_str = datetime.fromtimestamp(
+                exp, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M") \
+                if exp else "?"
+            print(f"[认证] uid={info.get('uid')} 过期={exp_str} pool_label={chosen_label}")
 
-    if args.today:
-        count_today(session, db, args)
-        return
+        session = create_session(chosen_token)
 
-    # 首次抓元数据
-    if db[COL_ACCOUNT].estimated_document_count() == 0 or args.force:
-        dump_account(session, db)
+        if args.today:
+            count_today(session, db, args)
+            return
 
-    if args.watch:
-        print(f"\n[实时模式] 每 {args.interval}s 轮询. Ctrl+C 退出.")
-        round_num = 0
-        while True:
-            round_num += 1
-            print(f"\n{'═' * 60}\n[轮次 {round_num}] "
-                  f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'═' * 60}")
-            # --sweep-today + --date YYYY-MM-DD: 对 report 注入日期过滤 (其他 category
-            # API 不支持). 每轮重算保证跨天切到新日期.
+        if db[COL_ACCOUNT].estimated_document_count() == 0 or args.force:
+            dump_account(session, db)
+
+        if not args.watch:
             if args.sweep_today:
                 date_str = args.date or datetime.now(_BJ_TZ).strftime("%Y-%m-%d")
                 CATEGORIES["report"]["list_extra_body"] = {
                     "startDate": date_str, "endDate": date_str,
                 }
-                print(f"[sweep-today] report 使用 startDate={date_str} endDate={date_str}")
+                print(f"[sweep-today] report startDate={date_str} endDate={date_str}")
+            run_once(session, db, args)
+            return
+
+        # ===== watch loop =====
+        print(f"\n[实时模式] 每 {args.interval}s 轮询. Ctrl+C 退出.")
+        round_num = 0
+        rotate_needed = False
+        while True:
+            round_num += 1
+            print(f"\n{'═' * 60}\n[轮次 {round_num}] "
+                  f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'═' * 60}")
+            if args.sweep_today:
+                date_str = args.date or datetime.now(_BJ_TZ).strftime("%Y-%m-%d")
+                CATEGORIES["report"]["list_extra_body"] = {
+                    "startDate": date_str, "endDate": date_str,
+                }
+                print(f"[sweep-today] report startDate={date_str} endDate={date_str}")
             try:
                 run_once(session, db, args)
             except KeyboardInterrupt:
-                print("\n[实时模式] Ctrl+C 退出"); break
+                print("\n[实时模式] Ctrl+C 退出"); return
             except SessionDead as e:
-                # 401/403: token 已吊销. 继续轮询只会多打几十分钟 401 同时
-                # 把账号 AccountBudget 耗干. 退出进程让 credential manager /
-                # 运维重新登录.
                 print(f"\n[实时模式] 会话已吊销, 立即退出等重登: {e}")
-                break
+                return
             except Exception as e:
                 print(f"[轮次 {round_num}] 异常: {e}")
+
+            # token 池: 当前 token 当日 quota 耗尽 → break 内层让 outer 切下一个
+            if not explicit_auth and _CURRENT_ACCOUNT_ID and \
+                    is_token_exhausted(_CURRENT_ACCOUNT_ID):
+                pool_n = len(_load_tokens_from_file() or tokens_in_pool)
+                if pool_n > 1:
+                    print(f"\n[token-pool] 当前账号 {_CURRENT_ACCOUNT_ID} 今日额度"
+                          f"耗尽, outer 重选下一个 (池有 {pool_n} 个)")
+                else:
+                    print(f"\n[token-pool] 仅 1 个 alphapai 账号且今日耗尽, "
+                          f"outer sleep 到午夜后再试")
+                rotate_needed = True
+                break
+
+            # retry-truncated 末尾扫描 (跨天额度回来时自动补齐 + token 切换时也能及时清单)
+            if args.retry_truncated_max > 0:
+                try:
+                    retry_truncated_roadshows(
+                        session, db, max_retry=args.retry_truncated_max)
+                except SessionDead as e:
+                    print(f"\n[实时模式] retry-truncated 期间会话吊销: {e}")
+                    return
+                except Exception as e:
+                    print(f"[retry-truncated] 异常: {e}")
+
             try:
                 time.sleep(args.interval)
             except KeyboardInterrupt:
-                print("\n[实时模式] Ctrl+C 退出"); break
-    else:
-        if args.sweep_today:
-            date_str = args.date or datetime.now(_BJ_TZ).strftime("%Y-%m-%d")
-            CATEGORIES["report"]["list_extra_body"] = {
-                "startDate": date_str, "endDate": date_str,
-            }
-            print(f"[sweep-today] report 使用 startDate={date_str} endDate={date_str}")
-        run_once(session, db, args)
+                print("\n[实时模式] Ctrl+C 退出"); return
+
+        if rotate_needed:
+            continue  # outer-while: 重新挑 token (可能 sleep 到午夜)
+        return
 
 
 if __name__ == "__main__":
