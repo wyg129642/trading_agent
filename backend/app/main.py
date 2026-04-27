@@ -518,6 +518,24 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to start kb_vector_sync (non-fatal)")
 
+    # Realtime rule-based ticker enricher — replaces the 10-min cron with an
+    # in-process 30s loop so freshly crawled docs are tagged before the LLM
+    # fallback (below) sees them. Enabled by default; disable via
+    # RULE_TAG_REALTIME_ENABLED=false.
+    if getattr(settings, "rule_tag_realtime_enabled", True):
+        try:
+            import asyncio as _aio_ruletag
+            from backend.app.services.realtime_rule_tagger import (
+                realtime_rule_tagger_loop,
+            )
+            app.state.realtime_rule_tagger_task = _aio_ruletag.create_task(
+                realtime_rule_tagger_loop(settings),
+                name="realtime_rule_tagger",
+            )
+            logger.info("realtime_rule_tagger task scheduled")
+        except Exception:
+            logger.exception("Failed to start realtime_rule_tagger (non-fatal)")
+
     # Realtime LLM ticker tagger — fallback NER for docs whose rule path
     # landed empty. Off by default; enable via LLM_TAG_REALTIME_ENABLED=true.
     if getattr(settings, "llm_tag_realtime_enabled", False):
@@ -556,6 +574,9 @@ async def lifespan(app: FastAPI):
     if task:
         task.cancel()
     task = getattr(app.state, "staging_user_sync_task", None)
+    if task:
+        task.cancel()
+    task = getattr(app.state, "realtime_rule_tagger_task", None)
     if task:
         task.cancel()
     task = getattr(app.state, "realtime_llm_tagger_task", None)

@@ -308,6 +308,20 @@ class Settings(BaseSettings):
     llm_enrichment_model: str = "qwen-plus"
     realtime_llm_enrichment_enabled: bool = False
 
+    # Realtime rule-based ticker enricher — runs `enrich_tickers.py
+    # --incremental` in-process every `interval_sec` so freshly crawled
+    # docs reach `_canonical_tickers` within ~one cycle of being inserted
+    # (vs the 10-min cron lag). The LLM tagger below gates on the rule
+    # field, so this loop is the prerequisite that keeps real-time
+    # ingestion → real-time tagging tight. Service at
+    # `backend/app/services/realtime_rule_tagger.py`.
+    rule_tag_realtime_enabled: bool = True
+    rule_tag_realtime_interval_sec: int = 30
+    rule_tag_realtime_batch_size: int = 200
+    # Comma-separated `source.collection` strings to skip (e.g.
+    # "alphapai.wechat_articles,jinmen.oversea_reports"). Empty = enrich all.
+    rule_tag_realtime_exclude: str = ""
+
     # Realtime LLM ticker tagger — fallback NER for docs the rule path
     # leaves with `_canonical_tickers: []`. Polls fresh empty-canonical docs
     # (newer than `lookback_hours`) every `interval_sec`, calls a cheap chat
