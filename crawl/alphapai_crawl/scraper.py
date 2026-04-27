@@ -124,7 +124,7 @@ class TokenExhausted(Exception):
     """当前 token 当日额度耗尽; watch loop 应切换 token 或 sleep 到午夜."""
 
 
-_TOKEN_EXHAUSTED_KEY = "crawl:tokenpool:alphapai:exhausted_today:{account_id}"
+_TOKEN_EXHAUSTED_KEY = "crawl:tokenpool:alphapai:exhausted_today:{account_id}:{category}"
 
 
 def _redis_or_none():
@@ -154,34 +154,42 @@ def _seconds_until_bj_midnight(extra_seconds: int = 120) -> int:
     return max(60, int((tomorrow - now).total_seconds()) + extra_seconds)
 
 
-def is_token_exhausted(account_id: str) -> bool:
-    if not account_id:
+def is_token_exhausted(account_id: str, category: str = "") -> bool:
+    """exhaust flag 是 **per-category** 的: 只有 alphapai roadshow 详情端有
+    每日 400000 配额, comment / report 列表+详情都没限额. category 为空时
+    返 False (相当于"无限额"语义)."""
+    if not account_id or not category:
         return False
     r = _redis_or_none()
     if r is None:
         return False
     try:
-        return bool(r.exists(_TOKEN_EXHAUSTED_KEY.format(account_id=account_id)))
+        return bool(r.exists(
+            _TOKEN_EXHAUSTED_KEY.format(account_id=account_id, category=category)))
     except Exception:
         return False
 
 
-def mark_token_exhausted(account_id: str) -> None:
-    """标该账号今日额度耗尽; TTL 到 BJ 第二天 0:02."""
-    if not account_id:
+def mark_token_exhausted(account_id: str, category: str = "") -> None:
+    """标该 (账号, 类别) 今日额度耗尽; TTL 到 BJ 第二天 0:02. 不传 category
+    视为 noop — 防止误标 account-wide 把 comment / report watcher 也卡死."""
+    if not account_id or not category:
         return
     r = _redis_or_none()
     if r is None:
         return
     try:
-        r.set(_TOKEN_EXHAUSTED_KEY.format(account_id=account_id),
+        r.set(_TOKEN_EXHAUSTED_KEY.format(account_id=account_id, category=category),
               "1", ex=_seconds_until_bj_midnight(extra_seconds=120))
     except Exception:
         pass
 
 
-def pick_available_token(tokens: list, label_hint: str = "") -> dict:
+def pick_available_token(tokens: list, label_hint: str = "",
+                         category: str = "") -> dict:
     """从 token list 里挑一个未耗尽的; 用 label_hint hash 让多 watcher 分到不同 token.
+
+    `category` 为空 → 不按类别过滤 (向后兼容); 否则只过滤该类别已 exhaust 的 token.
 
     返回的 dict 含 token / label / account_id (后者 JWT 解出).
     全部耗尽返 None — 调用方决定 sleep-until-midnight 或退出.
@@ -197,7 +205,11 @@ def pick_available_token(tokens: list, label_hint: str = "") -> dict:
         enriched.append({**t, "token": tok, "account_id": acc_id})
     if not enriched:
         return None
-    available = [t for t in enriched if not is_token_exhausted(t["account_id"])]
+    if category:
+        available = [t for t in enriched
+                     if not is_token_exhausted(t["account_id"], category)]
+    else:
+        available = enriched
     if not available:
         return None
     seed = abs(hash(label_hint or "default"))
@@ -601,13 +613,16 @@ def api_call(session: requests.Session, method: str, path: str,
                 )
                 if is_daily_quota:
                     _THROTTLE.on_warning()
-                    # 撞到账号级日配额 (400000 / 今日查看上限 / 请明日再来 等):
-                    # 立即把账号标记为 today exhausted → outer loop 重选 token, 单
-                    # token 场景下 sleep 到 BJ 第二天 0:02 — 期间 watch loop 不再
-                    # fetch / 不写库, 避免在配额耗尽下继续打 list 端点 + 把残缺
-                    # 的 ~134 字 list summary 当 content 入库污染数据.
-                    if _CURRENT_ACCOUNT_ID:
-                        mark_token_exhausted(_CURRENT_ACCOUNT_ID)
+                    # 撞到日配额 (400000 / 今日查看上限). alphapai 实测**只有
+                    # roadshow detail** 会触发, comment / report 端点没有限额.
+                    # 所以 mark 是 **per-category** 的 — 用 path 判定:
+                    #   `reading/roadshow/...` → 标 roadshow flag → 仅停 7 个
+                    #   roadshow watcher; comment / report watcher 看不到这个
+                    #   flag, 继续正常运行.
+                    # 万一未来 report / comment 也出现 400000, 在这里加 elif
+                    # 标对应类别即可.
+                    if _CURRENT_ACCOUNT_ID and "roadshow" in (path or ""):
+                        mark_token_exhausted(_CURRENT_ACCOUNT_ID, "roadshow")
                 else:
                     SoftCooldown.trigger(_PLATFORM, reason=reason, minutes=10)
                     _THROTTLE.on_warning()
@@ -1154,7 +1169,7 @@ def enrich_report_doc(session, doc: dict, item: dict, pdf_dir: Path,
 # -------------------- Truncated retry (每轮 watch 末尾, 跨天自动补齐) --------------------
 
 def retry_truncated_roadshows(session, db, max_retry: int = 500,
-                              consec_quota_break: int = 20,
+                              consec_quota_break: int = 5,
                               min_gain_chars: int = 50,
                               tokens_in_pool: list = None,
                               pool_label_hint: str = "") -> dict:
@@ -1170,9 +1185,16 @@ def retry_truncated_roadshows(session, db, max_retry: int = 500,
     Returns: {"scanned","refilled","quota_blocked","throttled","skipped",
               "rotations"}
     """
+    global _CURRENT_ACCOUNT_ID
     stats = {"scanned": 0, "refilled": 0, "quota_blocked": 0,
              "throttled": 0, "skipped": 0, "rotations": 0}
     if max_retry <= 0:
+        return stats
+    # 撞过 400000 的账号别再进 retry-truncated — 否则单 token 场景下会再扫
+    # max_retry 个候选才靠 consec_quota_break 退出, 浪费请求 + 风控加深.
+    # retry_truncated_roadshows 永远是 roadshow 场景, 直接传 "roadshow".
+    if _CURRENT_ACCOUNT_ID and is_token_exhausted(_CURRENT_ACCOUNT_ID, "roadshow"):
+        print(f"[retry-truncated] 账号 {_CURRENT_ACCOUNT_ID} roadshow 配额已耗尽, 跳过本轮")
         return stats
     if "roadshows" not in db.list_collection_names():
         return stats
@@ -1189,15 +1211,15 @@ def retry_truncated_roadshows(session, db, max_retry: int = 500,
         return stats
     print(f"[retry-truncated] roadshow candidates: {len(cands)}")
     consec_quota = 0
-    global _CURRENT_ACCOUNT_ID
 
     def _try_rotate_token() -> bool:
         """池里挑下一个未耗尽的 token, 热替换 session.headers.
         成功返 True, 没下一个返 False."""
         if not tokens_in_pool:
             return False
-        # 排除当前已耗尽的
-        next_t = pick_available_token(tokens_in_pool, label_hint=pool_label_hint)
+        # 排除当前已耗尽的 (roadshow 类别)
+        next_t = pick_available_token(tokens_in_pool, label_hint=pool_label_hint,
+                                       category="roadshow")
         if next_t is None:
             return False
         if next_t["account_id"] == _CURRENT_ACCOUNT_ID:
@@ -1758,6 +1780,14 @@ def run_once(session, db, args) -> Dict[str, dict]:
     cats = CATEGORY_ORDER if args.category == "all" else [args.category]
     summary: Dict[str, dict] = {}
     for c in cats:
+        # 类别级日配额硬闸: 该 (账号, 类别) 已 exhausted_today → 直接跳过
+        # run_category 不打 list / 不打 detail / 不入库. 用 watch loop 顶部
+        # 检查作为兜底 — 这里再加一道, 避免单进程跑 `--category all` 时
+        # roadshow 撞上限了还继续打 comment/report (反过来也成立).
+        if _CURRENT_ACCOUNT_ID and is_token_exhausted(_CURRENT_ACCOUNT_ID, c):
+            print(f"\n[{c}] 账号 {_CURRENT_ACCOUNT_ID} 该类别今日额度耗尽, 跳过本轮")
+            summary[c] = {"added": 0, "skipped": 0, "failed": 0, "exhausted": True}
+            continue
         try:
             summary[c] = run_category(session, db, c, args)
         except (KeyboardInterrupt, SessionDead):
@@ -2105,12 +2135,17 @@ def main():
             chosen_label = "explicit"
         else:
             tokens_now = _load_tokens_from_file() or tokens_in_pool
-            picked = pick_available_token(tokens_now, label_hint=pool_label_hint)
+            # 按本进程的 args.category 过滤 — roadshow watcher 看 roadshow flag,
+            # comment / report watcher 不会被 roadshow 的耗尽 flag 卡住.
+            picked = pick_available_token(tokens_now, label_hint=pool_label_hint,
+                                           category=getattr(args, "category", "") or "")
             if picked is None:
                 wait = _seconds_until_bj_midnight(extra_seconds=120)
+                cat_lbl = getattr(args, "category", "") or "?"
                 print(f"\n[token-pool] {len(tokens_now)} 个 alphapai 账号"
-                      f"全部今日额度耗尽, sleep {wait}s 到 BJ 第二天 0:02 后重选 "
-                      f"(期间可在 credentials.json 追加新账号自动接管)")
+                      f"在 {cat_lbl} 类别下全部今日额度耗尽, sleep {wait}s 到 "
+                      f"BJ 第二天 0:02 后重选 (期间可在 credentials.json 追加"
+                      f"新账号自动接管)")
                 try:
                     time.sleep(wait)
                 except KeyboardInterrupt:
@@ -2155,6 +2190,22 @@ def main():
             round_num += 1
             print(f"\n{'═' * 60}\n[轮次 {round_num}] "
                   f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'═' * 60}")
+            # 顶部 short-circuit: 撞过限额的账号在下一轮 run_once 之前就 break,
+            # 否则会先打一轮 list 端点 (浪费 + 可能脏数据) 再检查 flag.
+            # 用本 watcher 的 args.category 查 — comment / report 看不到 roadshow flag.
+            _cat = getattr(args, "category", "") or ""
+            if not explicit_auth and _CURRENT_ACCOUNT_ID and _cat and \
+                    is_token_exhausted(_CURRENT_ACCOUNT_ID, _cat):
+                pool_n = len(_load_tokens_from_file() or tokens_in_pool)
+                if pool_n > 1:
+                    print(f"\n[token-pool] {_cat} 类别: 当前账号 {_CURRENT_ACCOUNT_ID} "
+                          f"已 exhausted, outer 重选 (池有 {pool_n} 个)")
+                else:
+                    print(f"\n[token-pool] {_cat} 类别: 仅 1 个 alphapai 账号且已 "
+                          f"exhausted, outer sleep 到午夜后再试 "
+                          f"(跳过 run_once / retry-truncated)")
+                rotate_needed = True
+                break
             if args.sweep_today:
                 date_str = args.date or datetime.now(_BJ_TZ).strftime("%Y-%m-%d")
                 CATEGORIES["report"]["list_extra_body"] = {
@@ -2171,16 +2222,18 @@ def main():
             except Exception as e:
                 print(f"[轮次 {round_num}] 异常: {e}")
 
-            # token 池: 当前 token 当日 quota 耗尽 → break 内层让 outer 切下一个
-            if not explicit_auth and _CURRENT_ACCOUNT_ID and \
-                    is_token_exhausted(_CURRENT_ACCOUNT_ID):
+            # token 池: 当前 token 当日 quota 耗尽 → break 内层让 outer 切下一个.
+            # 同样 per-category — roadshow 撞 quota 不会停 comment / report.
+            _cat = getattr(args, "category", "") or ""
+            if not explicit_auth and _CURRENT_ACCOUNT_ID and _cat and \
+                    is_token_exhausted(_CURRENT_ACCOUNT_ID, _cat):
                 pool_n = len(_load_tokens_from_file() or tokens_in_pool)
                 if pool_n > 1:
-                    print(f"\n[token-pool] 当前账号 {_CURRENT_ACCOUNT_ID} 今日额度"
-                          f"耗尽, outer 重选下一个 (池有 {pool_n} 个)")
+                    print(f"\n[token-pool] {_cat} 类别: 当前账号 {_CURRENT_ACCOUNT_ID} "
+                          f"今日额度耗尽, outer 重选 (池有 {pool_n} 个)")
                 else:
-                    print(f"\n[token-pool] 仅 1 个 alphapai 账号且今日耗尽, "
-                          f"outer sleep 到午夜后再试")
+                    print(f"\n[token-pool] {_cat} 类别: 仅 1 个 alphapai 账号且今日"
+                          f"耗尽, outer sleep 到午夜后再试")
                 rotate_needed = True
                 break
 
