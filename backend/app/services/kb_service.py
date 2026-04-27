@@ -402,9 +402,17 @@ def _coll(spec: CollectionSpec) -> AsyncIOMotorCollection:
 # oversea_reports go to different directories).
 def _pdf_root_for(spec: "CollectionSpec") -> list[str]:
     settings = get_settings()
+    # `getattr` for the optional jinmen_oversea_pdf_dir — older Settings
+    # snapshots predating the oversea_reports split don't define it, and an
+    # unconditional `settings.jinmen_oversea_pdf_dir` would AttributeError on
+    # *every* PDF cold-path lookup (the dict is built before the spec.db
+    # branch). Defensive lookup keeps non-jinmen platforms working even on
+    # legacy configs and silently degrades jinmen-oversea reads to None when
+    # the field is absent.
     table: dict[str, list[str]] = {
         "alphapai":    [settings.alphapai_pdf_dir],
-        "jinmen":      [settings.jinmen_pdf_dir, settings.jinmen_oversea_pdf_dir],
+        "jinmen":      [settings.jinmen_pdf_dir,
+                         getattr(settings, "jinmen_oversea_pdf_dir", "")],
         "meritco":     [settings.meritco_pdf_dir],
         "gangtise":    [settings.gangtise_pdf_dir],
         "alphaengine": [settings.alphaengine_pdf_dir],
