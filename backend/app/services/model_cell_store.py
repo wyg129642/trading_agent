@@ -39,6 +39,30 @@ def _default_periods(model: RevenueModel) -> list[str]:
     return list(model.fiscal_periods) if model.fiscal_periods else []
 
 
+# ModelCell short-string column widths (mirror of revenue_model.py). LLM-emitted
+# strings (period like "FY2025 full year", source_type / value_type tags) can
+# overshoot — clip at the boundary so a single bad LLM string can't poison the
+# whole transaction (which used to leave runs stuck at status='running').
+_CELL_STR_LIMITS: dict[str, int] = {
+    "label": 200,
+    "period": 20,
+    "unit": 40,
+    "value_type": 20,
+    "source_type": 20,
+    "confidence": 10,
+    "review_status": 20,
+}
+
+
+def _clip(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    s = str(value)
+    if len(s) <= limit:
+        return s
+    return s[: max(0, limit - 1)] + "…"
+
+
 async def upsert_cell(
     db: AsyncSession,
     model_id: uuid.UUID,
@@ -64,6 +88,13 @@ async def upsert_cell(
     respect_lock: bool = True,
 ) -> ModelCell:
     """Insert or update a cell by (model_id, path). Records a cell_version row."""
+    label = _clip(label, _CELL_STR_LIMITS["label"]) or ""
+    period = _clip(period, _CELL_STR_LIMITS["period"]) or ""
+    unit = _clip(unit, _CELL_STR_LIMITS["unit"]) or ""
+    value_type = _clip(value_type, _CELL_STR_LIMITS["value_type"]) or "number"
+    source_type = _clip(source_type, _CELL_STR_LIMITS["source_type"]) or "assumption"
+    confidence = _clip(confidence, _CELL_STR_LIMITS["confidence"]) or "MEDIUM"
+
     q = select(ModelCell).where(
         ModelCell.model_id == model_id, ModelCell.path == path
     )

@@ -190,9 +190,26 @@ async def run_recipe(
                 result = await cls().run(ctx)
             except Exception as e:
                 logger.exception("Step %s (%s) failed", step_id, step_type)
-                run.status = "failed"
-                run.error = f"{step_id}: {e}"
-                await db.commit()
+                # The step may have left the session in a failed-transaction
+                # state (e.g. SQL constraint violation). Without an explicit
+                # rollback the next commit silently fails and the run row
+                # stays "running" forever — UI spinner that never stops.
+                try:
+                    await db.rollback()
+                except Exception:
+                    logger.exception("rollback after step failure failed")
+                run = await db.get(RecipeRun, run_id)
+                model = await db.get(RevenueModel, run.model_id) if run else None
+                if run is not None:
+                    run.status = "failed"
+                    run.error = f"{step_id}: {e}"[:2000]
+                    run.completed_at = datetime.now(timezone.utc)
+                if model is not None:
+                    model.status = "draft"
+                try:
+                    await db.commit()
+                except Exception:
+                    logger.exception("commit of failed-status update failed")
                 await _broadcast(run_id, StepEvent(
                     type="step_failed",
                     step_id=step_id,

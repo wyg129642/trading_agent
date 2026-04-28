@@ -368,3 +368,167 @@ async def test_recipe_path_dependency_parsing():
     deps = parse_dependencies("=SUM(segment.module_800g.rev.FY26 + segment.chip_eml_cw.eml_200g.rev.FY26)")
     assert "segment.module_800g.rev.FY26" in deps
     assert "segment.chip_eml_cw.eml_200g.rev.FY26" in deps
+
+
+async def test_upsert_cell_clips_overlong_short_strings(db_session, test_user):
+    """Regression: LLM-emitted long `period` (>20 chars) used to overflow
+    VARCHAR(20) at gather_context.py and poison the run's transaction —
+    leaving the row stuck at status='running' forever.
+
+    upsert_cell must clip short-string columns at the boundary.
+    """
+    from backend.app.models.revenue_model import ModelCell, RevenueModel
+    from backend.app.services import model_cell_store as _store
+
+    await db_session.execute(
+        delete(RevenueModel).where(RevenueModel.ticker == "CLIP_TEST.US")
+    )
+    await db_session.commit()
+
+    m = RevenueModel(
+        ticker="CLIP_TEST.US", company_name="Clip",
+        industry="optical_modules",
+        fiscal_periods=["FY26E"],
+        owner_user_id=test_user.id, status="draft",
+    )
+    db_session.add(m)
+    await db_session.commit()
+    await db_session.refresh(m)
+
+    long_period = "FY2025 full year management guidance window"  # > 20 chars
+    long_unit = "亿美元 (consolidated, ex-FX, ex-restructuring charges)"  # > 40 chars
+    cell = await _store.upsert_cell(
+        db_session, m.id,
+        path="company.overview.guidance.revenue.long",
+        label="Guidance: revenue (long period)",
+        period=long_period,
+        unit=long_unit,
+        value=42.0,
+        value_type="number",
+        source_type="guidance",
+        confidence="MEDIUM",
+    )
+    await db_session.commit()
+    await db_session.refresh(cell)
+
+    # Clipped to schema limits with ellipsis; commit didn't blow up.
+    assert len(cell.period) <= 20
+    assert len(cell.unit) <= 40
+    assert cell.period.startswith("FY2025 full year")
+    assert cell.value == 42.0
+
+    await db_session.delete(m)
+    await db_session.commit()
+
+
+async def test_run_marks_failed_when_step_raises_sql_error(db_session, test_user, seed_recipe):
+    """Regression: when a step raises an exception that poisoned the
+    transaction (e.g. an SQL constraint violation), the engine used to
+    swallow the failed-status commit because it forgot to rollback first
+    — leaving recipe_runs.status = 'running' forever.
+
+    The fix: rollback before writing 'failed', and re-fetch the run row
+    so the next commit succeeds.
+    """
+    import uuid as _uuid
+    from backend.app.models.recipe import RecipeRun
+    from backend.app.models.revenue_model import RevenueModel
+    from backend.app.services import recipe_engine as _engine
+    from backend.app.services.step_executors import STEP_REGISTRY
+    from backend.app.services.step_executors.base import BaseStepExecutor
+
+    await db_session.execute(
+        delete(RevenueModel).where(RevenueModel.ticker == "FAIL_TEST.US")
+    )
+    await db_session.commit()
+
+    m = RevenueModel(
+        ticker="FAIL_TEST.US", company_name="Fail",
+        industry="optical_modules",
+        fiscal_periods=["FY26E"],
+        owner_user_id=test_user.id, status="draft",
+        recipe_id=seed_recipe.id, recipe_version=seed_recipe.version,
+    )
+    db_session.add(m)
+    await db_session.commit()
+    await db_session.refresh(m)
+    model_id = m.id  # capture before session boundary
+
+    # Patch a step type with one that simulates a poisoned-transaction failure.
+    class _PoisoningStep(BaseStepExecutor):
+        async def run(self, ctx):
+            from backend.app.services import model_cell_store as _store
+            # Try to write a value over the VARCHAR(20) limit through the
+            # raw SQLAlchemy ORM (bypassing our clip helper) so we recreate
+            # the original failure mode.
+            from backend.app.models.revenue_model import ModelCell
+            bad = ModelCell(
+                model_id=ctx.model.id,
+                path="bad.cell",
+                label="bad",
+                # value_type column is VARCHAR(20); overflow it directly.
+                value_type="x" * 64,
+                source_type="assumption",
+                confidence="MEDIUM",
+            )
+            ctx.db.add(bad)
+            await ctx.db.flush()  # raises StringDataRightTruncationError
+
+    # Use a unique step type so we don't clobber the registry permanently.
+    fake_type = "POISON_TEST_STEP"
+    STEP_REGISTRY[fake_type] = _PoisoningStep
+    try:
+        # Build a synthetic single-node recipe with our poisoning step.
+        from backend.app.models.recipe import Recipe
+        rec = Recipe(
+            name="poison-test",
+            slug=f"poison-test-{_uuid.uuid4().hex[:8]}",
+            version=1,
+            industry="optical_modules",
+            pack_ref="optical_modules",
+            graph={
+                "nodes": [{"id": "step_1", "type": fake_type, "label": "poison"}],
+                "edges": [],
+            },
+            is_public=False,
+            created_by=test_user.id,
+        )
+        db_session.add(rec)
+        await db_session.commit()
+        await db_session.refresh(rec)
+
+        run = RecipeRun(
+            recipe_id=rec.id, recipe_version=rec.version,
+            model_id=m.id, ticker=m.ticker,
+            started_by=test_user.id, status="pending",
+            settings={"dry_run": False},
+        )
+        db_session.add(run)
+        await db_session.commit()
+        run_id = run.id
+
+        result = await _engine.run_recipe(run_id, dry_run=False)
+        assert "error" in result
+
+        # The engine uses its own session; query through a fresh one to read
+        # what was actually committed.
+        from backend.app.core.database import async_session_factory
+        async with async_session_factory() as fresh:
+            run2 = await fresh.get(RecipeRun, run_id)
+            m2 = await fresh.get(RevenueModel, model_id)
+            assert run2.status == "failed", f"run still {run2.status}; must be 'failed'"
+            assert run2.error and "step_1" in run2.error
+            assert m2.status == "draft", f"model still {m2.status}; must be reset to 'draft'"
+
+        # Cleanup recipe through a fresh session (avoid stale identity map)
+        from backend.app.core.database import async_session_factory as _f
+        async with _f() as cleanup:
+            cleanup_rec = await cleanup.get(Recipe, rec.id)
+            cleanup_m = await cleanup.get(RevenueModel, model_id)
+            if cleanup_m:
+                await cleanup.delete(cleanup_m)
+            if cleanup_rec:
+                await cleanup.delete(cleanup_rec)
+            await cleanup.commit()
+    finally:
+        STEP_REGISTRY.pop(fake_type, None)
