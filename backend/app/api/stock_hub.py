@@ -472,44 +472,108 @@ def _pick_nested(doc: dict, path: str) -> Any:
 _TRANSCRIPT_LINE_RE = re.compile(r"^\s*\[\d{1,2}:\d{2}(?::\d{2})?\]")
 # AceCamp legacy bug: `transcribe` was a dict but got str()'d into Mongo.
 _DICT_REPR_HEAD_RE = re.compile(r"^\s*\{\s*['\"](id|asr|state|title)['\"]\s*:")
+# Block-level HTML tags that almost always indicate a raw-HTML leak — alphaengine
+# news_items has 4 docs with `<html><head>...` dumped into content_md.
+_BLOCK_HTML_RE = re.compile(
+    r"<\s*(?:html|head|body|meta|p|div|table|tbody|tr|td|ul|ol|li|h[1-6])[\s>]",
+    re.IGNORECASE,
+)
+# Invisible / zero-width chars that pad docs without rendering anything.
+# U+200B ZWSP, U+200C ZWNJ, U+200D ZWJ, U+2060 WORD JOINER, U+FEFF BOM.
+_INVISIBLE_CHARS_RE = re.compile(r"[​-‍⁠﻿]")
+
+
+def _strip_block_html(body: str) -> str:
+    """Convert a raw-HTML leak into clean markdown via bs4 + markdownify.
+
+    Triggered when *_md content has a block-level HTML tag (likely the entire
+    HTML page got dumped). Falls back to a regex tag strip if bs4/markdownify
+    aren't importable in this environment.
+    """
+    try:
+        from bs4 import BeautifulSoup
+        from markdownify import markdownify as _md
+        soup = BeautifulSoup(body, "html.parser")
+        for tag in soup.find_all(["script", "style", "head", "meta", "link"]):
+            tag.decompose()
+        out = _md(str(soup), heading_style="ATX", strip=["a", "img"])
+        out = re.sub(r"[ \t]+\n", "\n", out)
+        out = re.sub(r"\n{3,}", "\n\n", out).strip()
+        return out
+    except Exception:
+        # Conservative regex fallback — drop tags, collapse whitespace
+        out = re.sub(r"<[^>]+>", " ", body)
+        out = re.sub(r"\s+", " ", out).strip()
+        return out
 
 
 def _normalize_markdown(body: str) -> str:
     """Cleanup pass before handing markdown to the frontend.
 
-    Three things only:
-      1. Decode HTML entities (`&#160;` → ` `, `&#8220;` → `“`). Funda earnings
-         filings store iXBRL-stripped text without entity decoding; the LLM and
-         markdown renderer both treat the entities as literal.
-      2. Promote single-newline transcript-line streams to paragraph breaks.
-         Jinmen meetings / similar store one speaker turn per line with `\n`
-         separator; CommonMark soft-breaks render those as a single space, so
-         all turns visually merge.
-      3. Detect a Python dict repr that leaked into a `*_md` field (AceCamp
-         legacy bug) and downgrade to a friendly placeholder so the UI doesn't
-         show 130 KB of `{'asr': [...]}` slop.
+    Five things, in order:
+      1. Dict-repr fallback — AceCamp legacy bug stored Python `{'asr': [...]}`
+         repr in transcribe_md; show a placeholder instead of 130 KB of slop.
+      2. Strip zero-width / invisible chars (U+200B etc) that pad doc length
+         without rendering anything (Funda 8-K fragments).
+      3. Decode HTML entities (`&#160;`, `&nbsp;`, `&#8220;`, ...). Both
+         numeric and named — the markdown renderer treats them literally.
+      4. If the body still looks like raw HTML (block-level tag visible), run
+         it through bs4+markdownify. Catches alphaengine news_items where the
+         scraper dumped the entire HTML page.
+      5. Promote single-newline streams to `\n\n`. Two cases: timestamped
+         transcript turns (Jinmen meetings — `[hh:mm] name: text`), AND
+         general paragraphs without any `\n\n` at all (Gangtise English
+         research notes — long sentences separated by single `\n`).
+         Conservative: only triggers when the doc is structurally a stream
+         of newline-separated paragraphs, not a hard-wrapped block.
     """
     if not isinstance(body, str) or not body.strip():
         return body or ""
 
-    # (3) dict repr fallback — fail loud so users know something's off and
-    # backfill picks it up. Keeping the placeholder short keeps the section
-    # scrollable instead of dumping the raw dict.
+    # (1) dict repr — fail loud
     if _DICT_REPR_HEAD_RE.match(body):
         return "_（原始转录数据格式异常，待后台重新解析）_"
 
-    # (1) entity decode
-    if "&#" in body or "&amp;" in body or "&nbsp;" in body or "&quot;" in body:
+    # (2) strip invisible chars
+    if _INVISIBLE_CHARS_RE.search(body):
+        body = _INVISIBLE_CHARS_RE.sub("", body)
+
+    # (3) entity decode (named + numeric)
+    if "&#" in body or "&amp;" in body or "&nbsp;" in body or "&quot;" in body \
+       or "&ldquo;" in body or "&rdquo;" in body or "&mdash;" in body \
+       or "&hellip;" in body:
         body = html_lib.unescape(body)
 
-    # (2) transcript-line promotion: only when the body has single `\n`
-    # but no `\n\n`, AND most non-empty lines look like timestamped turns.
+    # (4) raw block HTML leak — run through bs4+markdownify
+    if _BLOCK_HTML_RE.search(body):
+        body = _strip_block_html(body)
+
+    # (5) single-newline → paragraph promotion. Two flavors:
+    #     (a) transcript-line dominated (Jinmen meetings, AceCamp transcribe)
+    #     (b) general paragraphs with NO \n\n at all and reasonably-long lines
+    #         (Gangtise long English research notes)
+    # Skip when the doc already has paragraph breaks or is mostly short lines
+    # (likely a hard-wrapped block where line breaks are layout artifacts).
     if "\n\n" not in body and body.count("\n") >= 2:
         lines = body.split("\n")
         non_empty = [ln for ln in lines if ln.strip()]
         if non_empty:
+            n = len(non_empty)
             timestamped = sum(1 for ln in non_empty if _TRANSCRIPT_LINE_RE.match(ln))
-            if timestamped / len(non_empty) >= 0.6:
+            max_len = max(len(ln) for ln in non_empty)
+            # Hard-wrapped text has uniform-ish line lengths. Paragraph
+            # streams (gangtise English research) have wildly varying lines
+            # — short headers ("NTT") next to 200-char paragraphs.
+            # If any line is >=120 chars, this is almost certainly meant
+            # as paragraphs that just lost their double-newline.
+            should_promote = (
+                # (a) transcript style — most lines start with [hh:mm]
+                timestamped / n >= 0.6
+                # (b) paragraph-stream — at least one long line implies
+                # the newlines are paragraph delimiters
+                or max_len >= 120
+            )
+            if should_promote:
                 body = "\n\n".join(ln.strip() for ln in non_empty)
 
     return body
