@@ -82,8 +82,8 @@ def _upsert_preserve_crawled_at(col, did: str, doc: dict) -> None:
 # AceCamp API 的 detail 端点有独立 quota (10003/10040), 模块级 fallback 用在
 # 任何没走 throttle_from_args 的路径; 默认 4s 间隔 + 20 burst 能保证即使脚本
 # 以老方式启动也不会一分钟烧掉当日全部 quota.
-_THROTTLE: AdaptiveThrottle = AdaptiveThrottle(base_delay=4.0, jitter=2.5,
-                                                burst_size=20,
+_THROTTLE: AdaptiveThrottle = AdaptiveThrottle(base_delay=4.5, jitter=3.0,
+                                                burst_size=15,
                                                 platform="acecamp")
 _BUDGET: AccountBudget = AccountBudget("acecamp", "default", 0)
 _PLATFORM = "acecamp"
@@ -447,13 +447,50 @@ def dedup_id_opinion(item: dict) -> str:
     return "o" + _hash_id(item.get("title"), item.get("release_time"))
 
 
+def _transcribe_to_md(transcribe: Any) -> str:
+    """AceCamp `transcribe` 是 dict (id/title/asr 数组) — 把 asr[] 拼成
+    `[hh:mm:ss] speaker_N: context` 一行一句的 markdown.
+
+    历史 bug: 之前 `str(detail.get('transcribe') or '').strip()` 把 dict 整个
+    repr 写进 Mongo (132 KB 的 `{'id': ..., 'asr': [...]}`), StockHub 渲染时一
+    片 Python 字面量. 这里改成结构化抽取, 同时容忍偶发的 string 输入.
+    """
+    if not transcribe:
+        return ""
+    if isinstance(transcribe, str):
+        return _strip_html(transcribe.strip())
+    if not isinstance(transcribe, dict):
+        return ""
+    asr = transcribe.get("asr")
+    if not isinstance(asr, list) or not asr:
+        return ""
+    lines: list[str] = []
+    for turn in asr:
+        if not isinstance(turn, dict):
+            continue
+        text = (turn.get("context") or "").strip()
+        if not text:
+            continue
+        ts = turn.get("start") or turn.get("start_ms_string") or ""
+        spk = turn.get("speaker")
+        spk_str = f"speaker_{spk}" if spk not in (None, "") else ""
+        prefix_bits = []
+        if ts:
+            prefix_bits.append(f"[{ts}]")
+        if spk_str:
+            prefix_bits.append(f"{spk_str}:")
+        prefix = " ".join(prefix_bits)
+        lines.append(f"{prefix} {text}".strip() if prefix else text)
+    return "\n\n".join(lines)
+
+
 def _pick_article_content(detail: dict, list_item: dict) -> tuple[str, str, str]:
     """从详情提取正文. 优先: content > transcribe > summary.
 
     返回 (content_md, transcribe_md, summary_md). transcribe 单独保留供 AI / debug.
     """
     content = _strip_html(str(detail.get("content") or "").strip())
-    transcribe = _strip_html(str(detail.get("transcribe") or "").strip())
+    transcribe = _transcribe_to_md(detail.get("transcribe"))
     summary = _strip_html(str(detail.get("summary") or list_item.get("summary") or "").strip())
 
     # article_speech 是语音转写, 作为 content 兜底
@@ -486,6 +523,18 @@ def dump_article(session, db, item: dict, force: bool = False,
     # list_item 自身有 summary 字段; 详情拉不到时兜底
     if not summary_md:
         summary_md = _strip_html(str(item.get("summary") or "").strip())
+
+    # Detail 真返回空 (paywall 锁住 / quota 10003-10040 / detail.get('content')
+    # 是 "" / null) 时不入库. 之前的 content_md or summary_md 兜底会写入 outline,
+    # 18375 篇 article + 7 篇 opinion 历史污染就来自这里 — list 只给一个 1-2-3
+    # 题纲, dashboard 看着每篇都"有内容"实际全是空壳, 删除时只能按
+    # content_md == summary_md 反推. 直接早返回, 让 dashboard 的 today 统计
+    # 也不再把 paywall 锁住的条目算进去. skip_detail 模式不在这条规则内 —
+    # 那是用户主动只要 list 元数据.
+    if not skip_detail and not content_md and not transcribe_md:
+        _tripwire_record_detail("article", resp=detail, content_len=0)
+        return "skipped_empty", {"content_chars": 0, "transcribe_chars": 0,
+                                  "summary_chars": len(summary_md)}
 
     release_sec = item.get("release_time") or detail.get("release_time") or 0
     release_time = _sec_to_str(release_sec)
@@ -593,6 +642,11 @@ def dump_opinion(session, db, item: dict, force: bool = False,
     detail = {} if skip_detail else fetch_opinion_detail(session, item.get("id"))
 
     content_md = _strip_html(str(detail.get("content") or item.get("content") or "").strip())
+    # 详情 + 列表都没正文 → 不入库 (paywall / quota 锁的空壳). 同 article,
+    # 跟 skip_detail 模式无冲突 — 后者已主动选不要 detail.
+    if not skip_detail and not content_md:
+        _tripwire_record_detail("opinion", resp=detail, content_len=0)
+        return "skipped_empty", {"content_chars": 0}
     title = (item.get("title") or detail.get("title") or "").strip()
     # title 经常为空 (短观点), 用正文前 60 字作为标题兜底
     if not title and content_md:

@@ -31,7 +31,9 @@ funda.ai 多分类爬虫 (MongoDB 存储).
 from __future__ import annotations
 
 import argparse
+import html as html_lib
 import json
+import logging
 import os
 import re
 import sys
@@ -500,6 +502,49 @@ def html_to_text(html: str, max_len: int = 2000) -> str:
     return text[:max_len]
 
 
+def html_to_md(raw_html: str, max_len: int = 200_000) -> str:
+    """SEC 8-K iXBRL → 干净的 markdown.
+
+    Funda 的 earnings_report `detail.content` 是 iXBRL 格式: 一堆 `<ix:hidden>`
+    隐藏 fact (true/false/NASDAQ 重复 N 次), `display:none` 的 XBRL 数据块, 还
+    有大量 `&#160;` `&#8220;` 实体. 之前用 `re.sub(r"<[^>]+>", " ", html)` 的
+    粗暴 strip 把所有这些都 inline 进 text, 导致 StockHub 显示一长条
+    `true true ... NASDAQ NASDAQ ... &#160;Highlights&#160;...`.
+
+    现在: bs4 先剥隐藏块, markdownify 保留段落 / 列表 / 标题, html.unescape 兜
+    底实体. 失败时回退到 html_to_text 保证不抛.
+    """
+    if not isinstance(raw_html, str) or not raw_html.strip():
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+        from markdownify import markdownify as _md
+
+        soup = BeautifulSoup(raw_html, "html.parser")
+        # 剥掉所有 XBRL 隐藏 fact + script/style + display:none 块
+        for tag in soup.find_all(["ix:hidden", "ix:header", "script", "style"]):
+            tag.decompose()
+        for tag in soup.find_all(True):
+            style = (tag.get("style") or "").lower().replace(" ", "")
+            if "display:none" in style or "visibility:hidden" in style:
+                tag.decompose()
+        # ix:nonNumeric / ix:nonFraction 是 inline XBRL 包装,保留 text、丢标签
+        for tag in soup.find_all(re.compile(r"^ix:")):
+            tag.unwrap()
+
+        md = _md(str(soup), heading_style="ATX", strip=["a", "img"])
+        md = html_lib.unescape(md)
+        # markdownify 给每行行尾留两个空格 (硬换行) + 多余空行,折叠一下
+        md = re.sub(r"[ \t]+\n", "\n", md)
+        md = re.sub(r"\n{3,}", "\n\n", md)
+        md = md.strip()
+        return md[:max_len]
+    except Exception as e:  # 兜底: 永远不让 markdownify 异常拖垮抓取
+        logging.getLogger(__name__).warning(f"html_to_md fallback to plain text: {e}")
+        text = html_lib.unescape(html_to_text(raw_html, max_len=max_len))
+        return text
+
+
 def build_doc(category_key: str, cfg: dict, item: dict,
               detail: dict) -> dict:
     """把 list_item + detail_result 拼成 MongoDB doc."""
@@ -556,9 +601,9 @@ def build_doc(category_key: str, cfg: dict, item: dict,
             # 用类型判断是 HTML 还是纯文本
             if detail.get("type") == "EIGHT_K" or c.lstrip().startswith("<"):
                 content_html = c
-                content = html_to_text(c, max_len=200_000)
+                content = html_to_md(c, max_len=200_000)
             else:
-                content = c
+                content = html_lib.unescape(c)
         # 其他可能有用的元数据
         for k in ("visibility", "previewBody", "totalComments", "likesCount",
                   "type", "createdAt", "updatedAt", "attachments"):

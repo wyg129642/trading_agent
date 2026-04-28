@@ -24,7 +24,9 @@ Endpoint
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import logging
+import re
 from functools import lru_cache
 from typing import Any
 
@@ -462,6 +464,55 @@ def _pick_nested(doc: dict, path: str) -> Any:
         else:
             return None
     return cur
+
+
+# Speaker-turn / transcript line: "[01:23] 名字: text" or "[hh:mm:ss] name: text".
+# Used to detect content that is structurally one-paragraph-per-line but stored
+# with single \n separators — promoted to \n\n so CommonMark renders breaks.
+_TRANSCRIPT_LINE_RE = re.compile(r"^\s*\[\d{1,2}:\d{2}(?::\d{2})?\]")
+# AceCamp legacy bug: `transcribe` was a dict but got str()'d into Mongo.
+_DICT_REPR_HEAD_RE = re.compile(r"^\s*\{\s*['\"](id|asr|state|title)['\"]\s*:")
+
+
+def _normalize_markdown(body: str) -> str:
+    """Cleanup pass before handing markdown to the frontend.
+
+    Three things only:
+      1. Decode HTML entities (`&#160;` → ` `, `&#8220;` → `“`). Funda earnings
+         filings store iXBRL-stripped text without entity decoding; the LLM and
+         markdown renderer both treat the entities as literal.
+      2. Promote single-newline transcript-line streams to paragraph breaks.
+         Jinmen meetings / similar store one speaker turn per line with `\n`
+         separator; CommonMark soft-breaks render those as a single space, so
+         all turns visually merge.
+      3. Detect a Python dict repr that leaked into a `*_md` field (AceCamp
+         legacy bug) and downgrade to a friendly placeholder so the UI doesn't
+         show 130 KB of `{'asr': [...]}` slop.
+    """
+    if not isinstance(body, str) or not body.strip():
+        return body or ""
+
+    # (3) dict repr fallback — fail loud so users know something's off and
+    # backfill picks it up. Keeping the placeholder short keeps the section
+    # scrollable instead of dumping the raw dict.
+    if _DICT_REPR_HEAD_RE.match(body):
+        return "_（原始转录数据格式异常，待后台重新解析）_"
+
+    # (1) entity decode
+    if "&#" in body or "&amp;" in body or "&nbsp;" in body or "&quot;" in body:
+        body = html_lib.unescape(body)
+
+    # (2) transcript-line promotion: only when the body has single `\n`
+    # but no `\n\n`, AND most non-empty lines look like timestamped turns.
+    if "\n\n" not in body and body.count("\n") >= 2:
+        lines = body.split("\n")
+        non_empty = [ln for ln in lines if ln.strip()]
+        if non_empty:
+            timestamped = sum(1 for ln in non_empty if _TRANSCRIPT_LINE_RE.match(ln))
+            if timestamped / len(non_empty) >= 0.6:
+                body = "\n\n".join(ln.strip() for ln in non_empty)
+
+    return body
 
 
 def _extract_org(spec: _Source, doc: dict) -> str:
@@ -1033,7 +1084,7 @@ async def stock_hub_doc(
         raw = _pick_nested(doc, field_path)
         if not isinstance(raw, str):
             continue
-        body = raw.strip()
+        body = _normalize_markdown(raw.strip())
         if not body or body in seen_bodies:
             continue
         seen_bodies.add(body)
