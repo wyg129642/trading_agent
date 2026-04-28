@@ -315,6 +315,91 @@ def _build_specs() -> list[CollectionSpec]:
             url_field="canonical_url", has_pdf=False,
             milvus_indexed=False,
         ),
+        # ─── IR Filings (US/HK/JP/KR exchange disclosures) ─────────
+        # New corpus added 2026-04-28 — pulled by crawl/{sec_edgar,hkex,
+        # edinet,tdnet,dart}/scraper.py from the official exchange systems.
+        # Stored in the dedicated `ir_filings` Mongo DB. Schema is the unified
+        # one defined in crawl/ir_filings/common.py — title/release_time_ms/
+        # pdf_text_md (filled by extract_pdf_texts.py)/_canonical_tickers
+        # already aligned with the existing crawler conventions, so kb_search
+        # /Phase B vector ingest pick them up uniformly.
+        CollectionSpec(
+            db="ir_filings", collection="sec_edgar",
+            doc_type="sec_filing", doc_type_cn="SEC 申报文件",
+            title_field="title",
+            text_fields=("pdf_text_md", "content_md", "doc_introduce"),
+            date_str_field=None, date_ms_field="release_time_ms",
+            ticker_field="_canonical_tickers", ticker_fallback_path=None,
+            institution_field="organization", institution_kind="str",
+            url_field="web_url", has_pdf=True,
+            milvus_indexed=False,
+        ),
+        CollectionSpec(
+            db="ir_filings", collection="hkex",
+            doc_type="hkex_filing", doc_type_cn="港交所披露",
+            title_field="title",
+            text_fields=("pdf_text_md", "content_md", "doc_introduce"),
+            date_str_field=None, date_ms_field="release_time_ms",
+            ticker_field="_canonical_tickers", ticker_fallback_path=None,
+            institution_field="organization", institution_kind="str",
+            url_field="web_url", has_pdf=True,
+            milvus_indexed=False,
+        ),
+        CollectionSpec(
+            db="ir_filings", collection="edinet",
+            doc_type="edinet_filing", doc_type_cn="EDINET 法定披露",
+            title_field="title",
+            text_fields=("pdf_text_md", "content_md", "doc_introduce"),
+            date_str_field=None, date_ms_field="release_time_ms",
+            ticker_field="_canonical_tickers", ticker_fallback_path=None,
+            institution_field="organization", institution_kind="str",
+            url_field="web_url", has_pdf=True,
+            milvus_indexed=False,
+        ),
+        CollectionSpec(
+            db="ir_filings", collection="tdnet",
+            doc_type="tdnet_disclosure", doc_type_cn="TDnet 适时披露",
+            title_field="title",
+            text_fields=("pdf_text_md", "content_md", "doc_introduce"),
+            date_str_field=None, date_ms_field="release_time_ms",
+            ticker_field="_canonical_tickers", ticker_fallback_path=None,
+            institution_field="organization", institution_kind="str",
+            url_field="web_url", has_pdf=True,
+            milvus_indexed=False,
+        ),
+        CollectionSpec(
+            db="ir_filings", collection="dart",
+            doc_type="dart_filing", doc_type_cn="DART 韩国披露",
+            title_field="title",
+            text_fields=("pdf_text_md", "content_md", "doc_introduce"),
+            date_str_field=None, date_ms_field="release_time_ms",
+            ticker_field="_canonical_tickers", ticker_fallback_path=None,
+            institution_field="organization", institution_kind="str",
+            url_field="web_url", has_pdf=True,
+            milvus_indexed=False,
+        ),
+        CollectionSpec(
+            db="ir_filings", collection="asx",
+            doc_type="asx_filing", doc_type_cn="ASX 澳交所披露",
+            title_field="title",
+            text_fields=("pdf_text_md", "content_md", "doc_introduce"),
+            date_str_field=None, date_ms_field="release_time_ms",
+            ticker_field="_canonical_tickers", ticker_fallback_path=None,
+            institution_field="organization", institution_kind="str",
+            url_field="web_url", has_pdf=True,
+            milvus_indexed=False,
+        ),
+        CollectionSpec(
+            db="ir_filings", collection="ir_pages",
+            doc_type="ir_page_doc", doc_type_cn="公司IR页面文档",
+            title_field="title",
+            text_fields=("pdf_text_md", "content_md", "doc_introduce"),
+            date_str_field=None, date_ms_field="release_time_ms",
+            ticker_field="_canonical_tickers", ticker_fallback_path=None,
+            institution_field="organization", institution_kind="str",
+            url_field="web_url", has_pdf=True,
+            milvus_indexed=False,
+        ),
     ]
 
 
@@ -1615,7 +1700,7 @@ async def _legacy_search(
 
 async def fetch_document(
     doc_id: str,
-    max_chars: int = 8000,
+    max_chars: int = 20000,
     *,
     highlight_snippet: str | None = None,
 ) -> dict:
@@ -1627,7 +1712,7 @@ async def fetch_document(
     offsets into the returned ``text`` so the frontend doc viewer can scroll
     and highlight.
     """
-    max_chars = max(1000, min(int(max_chars or 8000), 30000))
+    max_chars = max(1000, min(int(max_chars or 20000), 30000))
     try:
         source, collection, raw_id = doc_id.split(":", 2)
     except ValueError:
@@ -2283,7 +2368,7 @@ async def execute_tool(
 
         if name == "kb_fetch_document":
             doc_id = (arguments.get("doc_id") or "").strip()
-            max_chars = int(arguments.get("max_chars") or 8000)
+            max_chars = int(arguments.get("max_chars") or 20000)
             if not doc_id:
                 if trace and hasattr(trace, "log_kb_fetch"):
                     trace.log_kb_fetch(

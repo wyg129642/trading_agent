@@ -97,11 +97,13 @@ def _analysts(doc: dict) -> list[str]:
 
 def _brief(doc: dict) -> dict:
     """Uniform list-view item."""
-    content = doc.get("content_md") or ""
+    # `content_md` is excluded from the list cursor projection (it can be tens
+    # of KB per doc); the server-side aggregation injects `_content_length`
+    # via $strLenCP so we get the count without paying to ship the body.
+    content_length = int(doc.get("_content_length") or 0)
     brief = doc.get("brief_md") or doc.get("description_md") or ""
-    # chief/summary prefer content; research prefers brief (core view)
-    preview_src = content if len(content) > 40 else brief
-    preview = preview_src[:360] + ("…" if len(preview_src) > 360 else "")
+    # Preview: brief_md is always present and is a tight summary; use it.
+    preview = brief[:360] + ("…" if len(brief) > 360 else "")
     stats = doc.get("stats") or {}
     cat = doc.get("category") or ""
     return {
@@ -124,7 +126,7 @@ def _brief(doc: dict) -> dict:
         "has_audio": bool(doc.get("has_audio")),
         "web_url": doc.get("web_url"),
         "preview": preview,
-        "content_length": len(content),
+        "content_length": content_length,
         "brief_length": len(brief),
         "has_pdf": bool(doc.get("pdf_local_path") and doc.get("pdf_size_bytes", 0) > 0),
         "pdf_size_bytes": int(doc.get("pdf_size_bytes") or 0),
@@ -213,15 +215,22 @@ async def list_items(
         match["$or"] = ors
 
     total = await coll.count_documents(match)
-    cursor = (
-        coll.find(match, projection={
+    pipeline = [
+        {"$match": match},
+        {"$sort": {"release_time_ms": -1}},
+        {"$skip": (page - 1) * page_size},
+        {"$limit": page_size},
+        # Compute content length server-side so the heavy `content_md` body
+        # never has to come back over the wire — fixes the "0 字" display.
+        {"$addFields": {
+            "_content_length": {"$strLenCP": {"$ifNull": ["$content_md", ""]}},
+        }},
+        {"$project": {
             "list_item": 0, "detail_result": 0, "parsed_msg": 0,
             "msg_text": 0, "content_md": 0,
-        })
-        .sort("release_time_ms", -1)
-        .skip((page - 1) * page_size)
-        .limit(page_size)
-    )
+        }},
+    ]
+    cursor = coll.aggregate(pipeline)
     items = [_brief(d) async for d in cursor]
     return ItemListResponse(
         items=items,
@@ -248,6 +257,7 @@ async def get_item(
         "content_md": doc.get("content_md") or "",
         "brief_md": doc.get("brief_md") or "",
         "description_md": doc.get("description_md") or "",
+        "pdf_text_md": doc.get("pdf_text_md") or "",
         "msg_text": doc.get("msg_text") or [],
         "pdf_rel_path": doc.get("pdf_rel_path"),
         "source_name": doc.get("source_name") or "",

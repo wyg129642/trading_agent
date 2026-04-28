@@ -150,6 +150,7 @@ interface DetailResponse extends Item {
   transcribe_md: string
   brief_md: string
   description_md: string
+  pdf_text_md: string
   source_url: string | null
   download_url: string | null
   addresses: string[]
@@ -194,7 +195,7 @@ export default function AceCampDB() {
   const [detailOpen, setDetailOpen] = useState(false)
   const [detail, setDetail] = useState<DetailResponse | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
-  const [detailBodyTab, setDetailBodyTab] = useState<'content' | 'transcribe' | 'summary'>(
+  const [detailBodyTab, setDetailBodyTab] = useState<'content' | 'transcribe' | 'summary' | 'pdf_text'>(
     'content',
   )
 
@@ -691,7 +692,7 @@ export default function AceCampDB() {
 
               {(() => {
                 const tabItems: {
-                  key: 'content' | 'transcribe' | 'summary'
+                  key: 'content' | 'transcribe' | 'summary' | 'pdf_text'
                   label: React.ReactNode
                   body: string
                 }[] = []
@@ -714,6 +715,13 @@ export default function AceCampDB() {
                     key: 'summary',
                     label: `说明 (${detail.description_md.length.toLocaleString()} 字)`,
                     body: detail.description_md,
+                  })
+                }
+                if (detail.pdf_text_md) {
+                  tabItems.push({
+                    key: 'pdf_text',
+                    label: `PDF 全文 (${detail.pdf_text_md.length.toLocaleString()} 字)`,
+                    body: detail.pdf_text_md,
                   })
                 }
                 if (tabItems.length === 0) {

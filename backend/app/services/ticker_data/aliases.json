@@ -622,5 +622,50 @@
   "SpaceX": null,
   "蚂蚁": null,
   "蚂蚁集团": null,
-  "Ant Group": null
+  "Ant Group": null,
+
+  "_section_ir_filings_jp": "JP holdings (added 2026-04-28 with IR filings corpus). Bare 4-digit numerics deliberately mapped to JP — bulk loader otherwise auto-pads to .HK (5-digit zero-pad heuristic).",
+  "5801": "5801.JP",
+  "5801.JP": "5801.JP",
+  "58010": "5801.JP",
+  "Furukawa": "5801.JP",
+  "Furukawa Electric": "5801.JP",
+  "古河": "5801.JP",
+  "古河电工": "5801.JP",
+  "古河电气": "5801.JP",
+  "古河電工": "5801.JP",
+  "古河電気工業": "5801.JP",
+
+  "285A": "285A.JP",
+  "285A.JP": "285A.JP",
+  "285A0": "285A.JP",
+  "Kioxia": "285A.JP",
+  "Kioxia Holdings": "285A.JP",
+  "キオクシア": "285A.JP",
+  "キオクシアホールディングス": "285A.JP",
+  "铠侠": "285A.JP",
+
+  "_section_ir_filings_kr": "KR holdings (added 2026-04-28). Use .KS (KOSPI) and .KQ (KOSDAQ), matching tushare conventions and the existing Samsung entry.",
+  "005930.KS": "005930.KS",
+  "삼성전자": "005930.KS",
+
+  "000660": "000660.KS",
+  "000660.KS": "000660.KS",
+  "SK Hynix": "000660.KS",
+  "SK海力士": "000660.KS",
+  "海力士": "000660.KS",
+  "SK하이닉스": "000660.KS",
+
+  "011930": "011930.KQ",
+  "011930.KQ": "011930.KQ",
+  "SHINSUNG E&G": "011930.KQ",
+  "Shinsung E&G": "011930.KQ",
+  "Shinsung": "011930.KQ",
+  "신성이엔지": "011930.KQ",
+
+  "_section_ir_filings_au": "AU holdings (added 2026-04-28). ASX uses bare 3-letter tickers; canonical form is <CODE>.AU.",
+  "SGQ": "SGQ.AU",
+  "SGQ.AU": "SGQ.AU",
+  "ST George Mining": "SGQ.AU",
+  "St George Mining": "SGQ.AU"
 }

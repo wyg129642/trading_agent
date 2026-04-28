@@ -50,9 +50,13 @@ from antibot import (  # noqa: E402
 )
 
 # 模块级 throttle, main() 用 CLI 覆盖. jinmen 之前是 0.3s 硬节流, 改成 3s 基线
-_THROTTLE: AdaptiveThrottle = AdaptiveThrottle(base_delay=3.0, jitter=2.0,
-                                                burst_size=40,
+_THROTTLE: AdaptiveThrottle = AdaptiveThrottle(base_delay=3.5, jitter=2.0,
+                                                burst_size=25,
                                                 platform="jinmen")
+# 默认值 2026-04-28 从 (3.0, 2.0, 40) 收紧到 (3.5, 2.0, 25) — 历史封控事故后
+# 的新基线, 跟 AceCamp 的 (4.0, 2.5, 20) 一同变成"封控过的两个平台"档位.
+# 实时档 CLI 覆盖在 crawler_manager.SPECS["jinmen"] (2.5/1.5/30, interval 120s),
+# 这里只是非 CLI 路径 (如手动 backfill 不传 antibot 参数时) 的保护性兜底.
 _BUDGET: AccountBudget = AccountBudget("jinmen", "default", 0)
 _PLATFORM = "jinmen"
 

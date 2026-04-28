@@ -148,10 +148,11 @@ async def main(args):
             {"pdf_size_bytes": {"$exists": False}},
         ],
     }
+    count_query = dict(query)
     if args.start_id is not None:
-        query["_id"] = {"$gte": args.start_id}
+        count_query["_id"] = {"$gte": args.start_id}
 
-    total_remaining = coll.count_documents(query) if args.limit == 0 else min(args.limit, coll.count_documents(query))
+    total_remaining = coll.count_documents(count_query) if args.limit == 0 else min(args.limit, coll.count_documents(count_query))
     log.info(f"=== Phase 2 START  pid={pid_str()} ===")
     log.info(f"mongo={args.mongo_uri} db={args.mongo_db} coll={args.coll}")
     log.info(f"dest_root={dest_root}  concurrency={args.concurrency}  batch={args.batch}")
@@ -175,37 +176,42 @@ async def main(args):
         timeout=timeout_cfg, limits=limits,
         headers={"User-Agent": "Mozilla/5.0"},
     ) as client:
-        batch_docs: list[dict] = []
         n_processed = 0
-        cursor = coll.find(
-            query,
-            {"_id": 1, "original_url": 1, "pdf_local_path": 1,
-             "release_time_ms": 1, "report_id": 1},
-            no_cursor_timeout=True,
-        ).batch_size(args.batch)
-        try:
-            for doc in cursor:
-                if stop_flag:
+        last_id = (args.start_id - 1) if args.start_id is not None else None
+        projection = {"_id": 1, "original_url": 1, "pdf_local_path": 1,
+                      "release_time_ms": 1, "report_id": 1}
+        while True:
+            if stop_flag:
+                break
+            page_query = dict(query)
+            if last_id is not None:
+                page_query["_id"] = {"$gt": last_id}
+            remaining = args.batch
+            if args.limit:
+                remaining = min(remaining, args.limit - n_processed)
+                if remaining <= 0:
                     break
-                batch_docs.append(doc)
-                if args.limit and (len(batch_docs) + n_processed) >= args.limit:
-                    break
-                if len(batch_docs) >= args.batch:
-                    n_processed += await flush_batch(
-                        client, sem, batch_docs, dest_root, coll,
-                        stats, log, started)
-                    bytes_done = stats.get("_bytes_done", bytes_done)
-                    batch_docs = []
-                    now = time.time()
-                    if now - last_progress_log > 10:
-                        log_progress(log, stats, n_processed, total_remaining, started)
-                        last_progress_log = now
-            if batch_docs:
-                n_processed += await flush_batch(
-                    client, sem, batch_docs, dest_root, coll,
-                    stats, log, started)
-        finally:
-            cursor.close()
+            try:
+                batch_docs = await asyncio.to_thread(
+                    lambda q=page_query, lim=remaining: list(
+                        coll.find(q, projection).sort("_id", 1).limit(lim)
+                    )
+                )
+            except Exception as exc:
+                log.warning(f"page query failed (last_id={last_id}): {exc}; retrying in 5s")
+                await asyncio.sleep(5)
+                continue
+            if not batch_docs:
+                break
+            last_id = max(d["_id"] for d in batch_docs)
+            n_processed += await flush_batch(
+                client, sem, batch_docs, dest_root, coll,
+                stats, log, started)
+            bytes_done = stats.get("_bytes_done", bytes_done)
+            now = time.time()
+            if now - last_progress_log > 10:
+                log_progress(log, stats, n_processed, total_remaining, started)
+                last_progress_log = now
 
     elapsed = time.time() - started
     log_progress(log, stats,

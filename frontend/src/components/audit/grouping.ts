@@ -188,16 +188,25 @@ function buildRoundData(roundNum: number, events: AuditEvent[]): RoundData {
 }
 
 function recoverToolPairs(events: AuditEvent[]): ToolPair[] {
-  // Maintain open pairs keyed by tool_name; a START stacks on the name's stack,
-  // a DONE/TIMEOUT pops the most recent open pair for that name. Sub-events
-  // route to the topmost open pair whose name matches their preferred tool.
-  const openByName = new Map<string, ToolPair[]>()
+  // Pair START with DONE/TIMEOUT by `tool_call_id` when available. The id
+  // comes from the LLM's native tool_call.id (OpenAI/Claude) or a synthesized
+  // `gemini-r{round}-{i}-{rand}` id we attach in the backend dispatch path.
+  //
+  // Legacy events (pre-2026-04-28) lack tool_call_id; fall back to FIFO-by-
+  // tool-name. FIFO is still wrong for parallel async calls in general, but
+  // any new event has the id so the fallback only matters for old runs.
+  // Sub-events (KB_REQUEST, SEARCH_*, …) route to the most-recent open pair
+  // of a candidate tool, same as before.
+  const byId = new Map<string, ToolPair>()
+  const fifoByName = new Map<string, ToolPair[]>()
+  const recentOpenByName = new Map<string, ToolPair[]>()
   const all: ToolPair[] = []
 
   for (const e of events) {
     if (e.event_type === 'TOOL_EXEC_START') {
       const name = e.tool_name || e.payload?.tool_name || '?'
       const args = e.payload?.arguments || {}
+      const tcid: string | null = e.payload?.tool_call_id ?? null
       const pair: ToolPair = {
         start: e,
         done: null,
@@ -209,30 +218,52 @@ function recoverToolPairs(events: AuditEvent[]): ToolPair[] {
         error: false,
       }
       all.push(pair)
-      const stack = openByName.get(name) || []
+      if (tcid) byId.set(tcid, pair)
+      else {
+        const q = fifoByName.get(name) || []
+        q.push(pair)
+        fifoByName.set(name, q)
+      }
+      const stack = recentOpenByName.get(name) || []
       stack.push(pair)
-      openByName.set(name, stack)
+      recentOpenByName.set(name, stack)
       continue
     }
     if (e.event_type === 'TOOL_EXEC_DONE' || e.event_type === 'TOOL_TIMEOUT') {
       const name = e.tool_name || e.payload?.tool_name || '?'
-      const stack = openByName.get(name) || []
-      const pair = stack.pop()
+      const tcid: string | null = e.payload?.tool_call_id ?? null
+      let pair: ToolPair | undefined
+      if (tcid) {
+        pair = byId.get(tcid)
+        if (pair) byId.delete(tcid)
+      }
+      if (!pair) {
+        // Fallback for legacy events without a tool_call_id: FIFO by name.
+        const q = fifoByName.get(name) || []
+        pair = q.shift()
+        if (pair) fifoByName.set(name, q)
+      }
       if (pair) {
         pair.done = e
         pair.latencyMs = e.latency_ms ?? null
         pair.result = e.payload?.result ?? ''
         pair.error =
           e.event_type === 'TOOL_TIMEOUT' || Boolean(e.payload?.error)
+        // Remove from recentOpenByName so sub-event routing only sees still-open pairs.
+        const stack = recentOpenByName.get(name)
+        if (stack) {
+          const idx = stack.indexOf(pair)
+          if (idx >= 0) stack.splice(idx, 1)
+        }
       }
       continue
     }
-    // Sub-event candidate: route to the topmost open pair whose name is in
-    // the candidate-tool list for this event type.
+    // Sub-event candidate: route to the most recent still-open pair whose
+    // name is in the candidate-tool list for this event type.
     const candidates = SUB_EVENT_TO_TOOL[e.event_type]
     if (!candidates) continue
     for (let i = candidates.length - 1; i >= 0; i--) {
-      const stack = openByName.get(candidates[i])
+      const stack = recentOpenByName.get(candidates[i])
       if (stack && stack.length) {
         stack[stack.length - 1].subEvents.push(e)
         break

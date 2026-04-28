@@ -298,6 +298,18 @@ CATEGORIES: list[dict] = [
 CATEGORY_KEYS = [c["key"] for c in CATEGORIES]
 _CAT_BY_KEY = {c["key"]: c for c in CATEGORIES}
 
+# 永久停用列表 (2026-04-28). news (资讯) 共享 streamSearch REFRESH_LIMIT 配额池,
+# 资讯每日 ~500 条会挤掉纪要/研报当天的额度. CATEGORIES 仍保留 news 条目供
+# 已入库 news_items collection 的查询路径使用, 但所有 list/enrich/backfill
+# 迭代 CATEGORIES 时都通过 _active_categories() 过滤掉它. 显式 --category news
+# 仍可手工跑 (留 escape hatch), 但默认 --category all 不再触及.
+_DISABLED_CATEGORIES: set[str] = {"news"}
+
+
+def _active_categories(cats: list[dict]) -> list[dict]:
+    """Filter out CATEGORIES entries that are in _DISABLED_CATEGORIES."""
+    return [c for c in cats if c["key"] not in _DISABLED_CATEGORIES]
+
 
 # ==================== 网络 / 会话 ====================
 
@@ -1210,7 +1222,7 @@ def run_once(session, db, args) -> dict:
     per-account quota blocked the run. Caller (watch loop) uses this to decide
     how long to sleep before the next round.
     """
-    cats = [_CAT_BY_KEY[args.category]] if args.category != "all" else CATEGORIES
+    cats = [_CAT_BY_KEY[args.category]] if args.category != "all" else _active_categories(CATEGORIES)
     summary: dict = {}
     for cat in cats:
         try:
@@ -1451,7 +1463,7 @@ def enrich_via_detail(session, db, args) -> dict:
     """
     pdf_dir = Path(args.pdf_dir) if args.pdf_dir else None
 
-    cats = [_CAT_BY_KEY[args.category]] if args.category != "all" else CATEGORIES
+    cats = [_CAT_BY_KEY[args.category]] if args.category != "all" else _active_categories(CATEGORIES)
     overall = {}
     cap = cap_from_args(args)
 
@@ -1640,7 +1652,7 @@ def count_today(session, db, args) -> dict:
     end_ms = int(day_end.timestamp() * 1000)
 
     print(f"[统计] 扫 AlphaEngine {target} 各分类平台条数...")
-    cats = [_CAT_BY_KEY[args.category]] if args.category != "all" else CATEGORIES
+    cats = [_CAT_BY_KEY[args.category]] if args.category != "all" else _active_categories(CATEGORIES)
     overall: dict = {"date": target}
     for cat in cats:
         items_today: list[dict] = []

@@ -9,6 +9,7 @@ import base64
 import json
 import logging
 import time
+import uuid
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -959,13 +960,18 @@ async def call_model_stream_with_tools(
         "rounds_used": 0,
     }
 
-    async def dispatch_tool(name: str, arguments: dict, round_num: int = 0) -> str:
+    async def dispatch_tool(
+        name: str,
+        arguments: dict,
+        round_num: int = 0,
+        tool_call_id: str | None = None,
+    ) -> str:
         """Execute a single tool with timeout protection."""
         # Set the round_num contextvar so KB / user_kb tools — which call
         # chat_trace() lazily — emit events tagged with the correct round.
         from backend.app.services.chat_debug import set_current_round_num
         set_current_round_num(round_num)
-        trace.log_tool_exec_start(name, arguments, round_num=round_num)
+        trace.log_tool_exec_start(name, arguments, round_num=round_num, tool_call_id=tool_call_id)
         activity["tool_call_names"].append(name)
         if name == "web_search":
             q = arguments.get("query_cn", "")
@@ -1005,17 +1011,17 @@ async def call_model_stream_with_tools(
             result = await asyncio.wait_for(coro, timeout=_TOOL_EXEC_TIMEOUT)
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
             if name in ("web_search", "read_webpage"):
-                trace.log_tool_exec_done(name, result[0], elapsed_ms, round_num=round_num)
+                trace.log_tool_exec_done(name, result[0], elapsed_ms, round_num=round_num, tool_call_id=tool_call_id)
                 return result[0]
-            trace.log_tool_exec_done(name, result, elapsed_ms, round_num=round_num)
+            trace.log_tool_exec_done(name, result, elapsed_ms, round_num=round_num, tool_call_id=tool_call_id)
             return result
         except asyncio.TimeoutError:
-            trace.log_tool_timeout(name, _TOOL_EXEC_TIMEOUT, round_num=round_num)
+            trace.log_tool_timeout(name, _TOOL_EXEC_TIMEOUT, round_num=round_num, tool_call_id=tool_call_id)
             logger.warning("Tool %s timed out after %.0fs", name, _TOOL_EXEC_TIMEOUT)
             return f"Tool {name} timed out after {int(_TOOL_EXEC_TIMEOUT)} seconds."
         except Exception as e:
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
-            trace.log_tool_exec_done(name, f"ERROR: {e}", elapsed_ms, error=True, round_num=round_num)
+            trace.log_tool_exec_done(name, f"ERROR: {e}", elapsed_ms, error=True, round_num=round_num, tool_call_id=tool_call_id)
             raise
 
     start = time.monotonic()
@@ -1242,7 +1248,10 @@ async def call_model_stream_with_tools(
 
         # Execute all tool calls in parallel with heartbeat to keep SSE alive
         tool_futures = asyncio.gather(
-            *[dispatch_tool(name, args, round_num=tool_round) for _, name, args in tool_tasks],
+            *[
+                dispatch_tool(name, args, round_num=tool_round, tool_call_id=tc_data["id"])
+                for tc_data, name, args in tool_tasks
+            ],
             return_exceptions=True,
         )
         # Yield heartbeat every 15s while tools execute (keeps nginx/browser alive)
@@ -1434,13 +1443,18 @@ async def _gemini_stream_with_tools(
         "rounds_used": 0,
     }
 
-    async def dispatch_tool(name: str, arguments: dict, round_num: int = 0) -> str:
+    async def dispatch_tool(
+        name: str,
+        arguments: dict,
+        round_num: int = 0,
+        tool_call_id: str | None = None,
+    ) -> str:
         """Execute a single tool with timeout protection."""
         # Set the round_num contextvar so KB / user_kb tools — which call
         # chat_trace() lazily — emit events tagged with the correct round.
         from backend.app.services.chat_debug import set_current_round_num
         set_current_round_num(round_num)
-        trace.log_tool_exec_start(name, arguments, round_num=round_num)
+        trace.log_tool_exec_start(name, arguments, round_num=round_num, tool_call_id=tool_call_id)
         activity["tool_call_names"].append(name)
         if name == "web_search":
             q = arguments.get("query_cn", "")
@@ -1480,17 +1494,17 @@ async def _gemini_stream_with_tools(
             result = await asyncio.wait_for(coro, timeout=_TOOL_EXEC_TIMEOUT)
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
             if name in ("web_search", "read_webpage"):
-                trace.log_tool_exec_done(name, result[0], elapsed_ms, round_num=round_num)
+                trace.log_tool_exec_done(name, result[0], elapsed_ms, round_num=round_num, tool_call_id=tool_call_id)
                 return result[0]
-            trace.log_tool_exec_done(name, result, elapsed_ms, round_num=round_num)
+            trace.log_tool_exec_done(name, result, elapsed_ms, round_num=round_num, tool_call_id=tool_call_id)
             return result
         except asyncio.TimeoutError:
-            trace.log_tool_timeout(name, _TOOL_EXEC_TIMEOUT, round_num=round_num)
+            trace.log_tool_timeout(name, _TOOL_EXEC_TIMEOUT, round_num=round_num, tool_call_id=tool_call_id)
             logger.warning("Tool %s timed out after %.0fs", name, _TOOL_EXEC_TIMEOUT)
             return f"Tool {name} timed out after {int(_TOOL_EXEC_TIMEOUT)} seconds."
         except Exception as e:
             elapsed_ms = int((time.monotonic() - tool_start) * 1000)
-            trace.log_tool_exec_done(name, f"ERROR: {e}", elapsed_ms, error=True, round_num=round_num)
+            trace.log_tool_exec_done(name, f"ERROR: {e}", elapsed_ms, error=True, round_num=round_num, tool_call_id=tool_call_id)
             raise
 
     _TRANSIENT_KEYWORDS = ("500", "503", "overloaded", "unavailable", "deadline", "timeout", "reset", "rate")
@@ -1620,7 +1634,10 @@ async def _gemini_stream_with_tools(
                             fc_name = fc.name
                             if ":" in fc_name:
                                 fc_name = fc_name.split(":", 1)[1]
-                            function_calls.append({"name": fc_name, "args": fc_args})
+                            # Gemini function_call parts have no native id —
+                            # synthesize one so audit pairing works for parallel calls.
+                            fc_id = f"gemini-r{tool_round}-{len(function_calls)}-{uuid.uuid4().hex[:8]}"
+                            function_calls.append({"id": fc_id, "name": fc_name, "args": fc_args})
 
             if round_text_emitted and function_calls:
                 # Text preceded the function calls — log it as model reasoning
@@ -1718,7 +1735,10 @@ async def _gemini_stream_with_tools(
 
         # Execute all tools in parallel with heartbeat to keep SSE alive
         tool_futures = asyncio.gather(
-            *[dispatch_tool(fc["name"], fc["args"], round_num=tool_round) for fc in function_calls],
+            *[
+                dispatch_tool(fc["name"], fc["args"], round_num=tool_round, tool_call_id=fc.get("id"))
+                for fc in function_calls
+            ],
             return_exceptions=True,
         )
         results = None

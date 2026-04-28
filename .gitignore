@@ -132,3 +132,6 @@ twitter_playwright.py
 #   git update-index --no-skip-worktree frontend/src/App.tsx
 # frontend/src/components/AppLayout.tsx
 # frontend/src/App.tsx
+crawl/edinet/credentials.json
+crawl/dart/credentials.json
+crawl/*/cache/

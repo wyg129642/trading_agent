@@ -1474,9 +1474,26 @@ ALL_SCRAPERS: list[tuple] = [
                      "--since-hours", "48"],                "watch_type3.log"),
 
     # jinmen: meetings (默认) + reports (--reports) + 外资研报 (--oversea-reports) 拆三进程
-    ("jinmen",      [],                                    "watch_meetings.log"),
-    ("jinmen",      ["--reports"],                         "watch_reports.log"),
-    ("jinmen",      ["--oversea-reports"],                 "watch_oversea_reports.log"),
+    # 2026-04-28: jinmen 三个 watcher 显式写死保守档, 跟 crawler_manager.SPECS
+    # 对齐. 此前 [] 让 _mode_args(realtime) 把 base 1.5 / burst 80 灌过来,
+    # 跟历史封控事故的诱因 (单 token 高 burst 高频) 一致, 风险高.
+    # interval 120/120/180 (oversea 最低频), base 2.5/jitter 1.5, burst 30,
+    # 跟 AceCamp (3.0/2.0/burst 20) 同档但 jinmen 账号活, 留少许速度.
+    ("jinmen",      ["--interval", "120",
+                     "--throttle-base", "2.5", "--throttle-jitter", "1.5",
+                     "--burst-size", "30",
+                     "--burst-cooldown-min", "15", "--burst-cooldown-max", "40"],
+                                                           "watch_meetings.log"),
+    ("jinmen",      ["--reports", "--interval", "120",
+                     "--throttle-base", "2.5", "--throttle-jitter", "1.5",
+                     "--burst-size", "30",
+                     "--burst-cooldown-min", "15", "--burst-cooldown-max", "40"],
+                                                           "watch_reports.log"),
+    ("jinmen",      ["--oversea-reports", "--interval", "180",
+                     "--throttle-base", "2.5", "--throttle-jitter", "1.5",
+                     "--burst-size", "25",
+                     "--burst-cooldown-min", "20", "--burst-cooldown-max", "50"],
+                                                           "watch_oversea_reports.log"),
 
     # alphapai: 4 主分类 + 11 个子类 watcher 并行. 子类 watcher 用 --market-type 访问
     # SPA 上每个 tab 对应的过滤视图 (CDP 反解, 2026-04-23):
@@ -1567,17 +1584,19 @@ ALL_SCRAPERS: list[tuple] = [
     #     crawler_manager SPECS 对齐). 默认 _mode_args 的 realtime 档 (base 1.5,
     #     burst 80) 对 AceCamp 过激, 这里显式写死走保守值.
     #   - opinions 保留 detail (用独立 opinion_info 端点, 不吃 article quota 池).
+    # 2026-04-28: 跟 SPECS 同步又紧一档 — base 3.0→3.5, jitter 2.0→2.5,
+    # burst 20→15, 冷却 15-40s→25-60s, interval 120/180→180/240. 历史封控过.
     ("acecamp",     ["--type", "articles", "--skip-detail",
-                     "--interval", "120",
-                     "--throttle-base", "3.0", "--throttle-jitter", "2.0",
-                     "--burst-size", "20",
-                     "--burst-cooldown-min", "15", "--burst-cooldown-max", "40"],
+                     "--interval", "180",
+                     "--throttle-base", "3.5", "--throttle-jitter", "2.5",
+                     "--burst-size", "15",
+                     "--burst-cooldown-min", "25", "--burst-cooldown-max", "60"],
                                                            "watch_articles.log"),
     ("acecamp",     ["--type", "opinions",
-                     "--interval", "180",
-                     "--throttle-base", "3.0", "--throttle-jitter", "2.0",
-                     "--burst-size", "20",
-                     "--burst-cooldown-min", "15", "--burst-cooldown-max", "40"],
+                     "--interval", "240",
+                     "--throttle-base", "3.5", "--throttle-jitter", "2.5",
+                     "--burst-size", "15",
+                     "--burst-cooldown-min", "25", "--burst-cooldown-max", "60"],
                                                            "watch_opinions.log"),
 
     # alphaengine: 4 分类并行 + 1 独立 PDF 回填 worker.
@@ -1590,8 +1609,11 @@ ALL_SCRAPERS: list[tuple] = [
                      "--interval", "1200"],                         "watch_china_report.log"),
     ("alphaengine", ["--category", "foreignReport",  "--skip-pdf",
                      "--interval", "1200"],                         "watch_foreign_report.log"),
-    ("alphaengine", ["--category", "news",           "--skip-pdf",
-                     "--interval", "1200"],                         "watch_news.log"),
+    # news (资讯) 永久停用 (2026-04-28) — 共享 streamSearch REFRESH_LIMIT
+    # 配额池, 资讯每日 ~500 条会挤掉纪要+研报的额度. 见
+    # backend/app/services/crawler_manager.py SPECS["alphaengine"] 同步注释.
+    # ("alphaengine", ["--category", "news",           "--skip-pdf",
+    #                  "--interval", "1200"],                         "watch_news.log"),
     # 配额绕过 enrich worker — 用 detail 端点 + 签名 COS URL 绕开 REFRESH_LIMIT
     # 和 PDF 下载双重配额. 每小时补 100/category 正文+PDF. 即使 list 被锁也能跑.
     # (CRAWLERS.md §9.5.8 list-vs-detail 配额不对称, 2026-04-22 AlphaEngine 验证)
@@ -1611,6 +1633,28 @@ ALL_SCRAPERS: list[tuple] = [
                          "--start-page", "1", "--max-page", "700"], "watch.log"),
 
     # ("thirdbridge", [],                None),  # token expired, 先不拉
+
+    # ─── IR Filings (US/HK/AU exchange disclosures, added 2026-04-28) ────
+    # 5 数据源, 全部目标 Mongo `ir_filings` DB. JP/KR (edinet/tdnet/dart) 的
+    # watcher 也注册以便 admin UI 显示, 但 EDINET/DART 缺密钥时 scraper 自身
+    # 退出非 0 (logs/scraper.log 会有 "ERROR: no XXX key"). TDnet 无密钥可跑.
+    #
+    # 节流策略 (per-source):
+    #   - sec_edgar: 10 req/s 硬上限, 22 ticker, 内置 0.15s 间隔. 30min 一轮.
+    #   - hkex: Akamai 紧, 14 ticker, 2.8s+jitter, 30s 冷却 / 20 reqs.
+    #     30min 一轮 (单 ticker 全 365 天 ~12 min).
+    #   - asx: 1 ticker, Markit tarpit, 4-6s/req. 30min 一轮.
+    #   - tdnet: Yanoshin 镜像, 1 req/s, 10min 一轮 (JST 盘后 13:30/15:00 集中发布).
+    #   - edinet/dart: 缺密钥时 scraper 立即退出, 留行用于 UI 可见性.
+    ("sec_edgar",  ["--watch", "--interval", "1800"],  "watch.log"),
+    ("hkex",       ["--watch", "--interval", "1800",
+                    "--days", "30"],                    "watch.log"),
+    ("asx",        ["--watch", "--interval", "1800"],  "watch.log"),
+    ("tdnet",      ["--watch", "--interval", "600"],   "watch.log"),
+    ("edinet",     ["--watch", "--interval", "7200",
+                    "--days", "14"],                    "watch.log"),
+    ("dart",       ["--watch", "--interval", "7200",
+                    "--days", "30"],                    "watch.log"),
 ]
 
 

@@ -143,6 +143,7 @@ interface DetailResponse extends Item {
   content_md: string
   brief_md: string
   description_md: string
+  pdf_text_md: string
   msg_text: string[]
   pdf_rel_path: string | null
   source_name: string
@@ -872,10 +873,32 @@ export default function GangtiseDB() {
                   >
                     {detail.msg_text.join('\n\n')}
                   </pre>
-                ) : (
+                ) : detail.pdf_text_md ? null : (
                   <Empty description="无正文" />
                 )}
               </Card>
+
+              {detail.pdf_text_md && (
+                <Card
+                  size="small"
+                  title={`PDF 全文 (${detail.pdf_text_md.length.toLocaleString()} 字)`}
+                  style={{ marginTop: 8 }}
+                  bodyStyle={{
+                    maxHeight: '50vh',
+                    overflowY: 'auto',
+                    fontSize: 13,
+                    lineHeight: 1.75,
+                    background: '#fff',
+                    whiteSpace: 'pre-wrap',
+                  }}
+                >
+                  <div className="gangtise-md">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {detail.pdf_text_md}
+                    </ReactMarkdown>
+                  </div>
+                </Card>
+              )}
 
               <Text
                 type="secondary"

@@ -87,8 +87,14 @@ def _base_filter(category: str) -> dict[str, Any]:
 # Normalizers
 # --------------------------------------------------------------------------- #
 def _brief(doc: dict) -> dict:
-    content = doc.get("content_md") or doc.get("doc_introduce") or ""
-    preview = content[:360] + ("…" if len(content) > 360 else "")
+    # `content_md` is projected out by the list cursor; aggregation injects
+    # `_content_length`. `doc_introduce` is short and stays in the response,
+    # so we use it for both the preview and the fallback length.
+    content_length = int(doc.get("_content_length") or 0)
+    intro = doc.get("doc_introduce") or ""
+    if content_length == 0 and intro:
+        content_length = len(intro)
+    preview = intro[:360] + ("…" if len(intro) > 360 else "")
     category = doc.get("category") or ""
     return {
         "id": str(doc.get("_id")),
@@ -122,7 +128,7 @@ def _brief(doc: dict) -> dict:
         "pdf_size_bytes": doc.get("pdf_size_bytes") or 0,
         "pdf_unavailable": bool(doc.get("pdf_unavailable")),
         "preview": preview,
-        "content_length": len(content),
+        "content_length": content_length,
         "crawled_at": doc.get("crawled_at"),
         "_canonical_tickers": doc.get("_canonical_tickers") or [],
     }
@@ -223,15 +229,20 @@ async def list_items(
         ]
 
     total = await coll.count_documents(match)
-    cursor = (
-        coll.find(match, projection={
+    pipeline = [
+        {"$match": match},
+        {"$sort": dict(sort_fields)},
+        {"$skip": (page - 1) * page_size},
+        {"$limit": page_size},
+        {"$addFields": {
+            "_content_length": {"$strLenCP": {"$ifNull": ["$content_md", ""]}},
+        }},
+        {"$project": {
             "list_item": 0,
             "content_md": 0,
-        })
-        .sort(sort_fields)
-        .skip((page - 1) * page_size)
-        .limit(page_size)
-    )
+        }},
+    ]
+    cursor = coll.aggregate(pipeline)
     items = [_brief(d) async for d in cursor]
     return ItemListResponse(
         items=items,
@@ -257,6 +268,7 @@ async def get_item(
     return {
         **_brief(doc),
         "content_md": doc.get("content_md") or "",
+        "pdf_text_md": doc.get("pdf_text_md") or "",
         "doc_introduce": doc.get("doc_introduce") or "",
         "type_full_id": doc.get("type_full_id"),
         "document_type_id": doc.get("document_type_id"),

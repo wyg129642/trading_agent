@@ -106,6 +106,7 @@ interface ListResponse {
 
 interface DetailResponse extends Item {
   content_md: string
+  pdf_text_md: string
   doc_introduce: string
   pdf_rel_path: string | null
   company_multi_map: Record<string, string[]>
@@ -731,12 +732,28 @@ export default function AlphaEngineDB() {
                   <Spin tip="加载 PDF..." />
                 </Card>
               )
-            ) : detail.content_md || detail.doc_introduce ? (
-              <Card size="small" type="inner" title={<><ReadOutlined /> 摘要 / 预览</>}>
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                  {detail.content_md || detail.doc_introduce}
-                </ReactMarkdown>
-              </Card>
+            ) : detail.content_md || detail.doc_introduce || detail.pdf_text_md ? (
+              <>
+                {(detail.content_md || detail.doc_introduce) && (
+                  <Card size="small" type="inner" title={<><ReadOutlined /> 摘要 / 预览</>}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {detail.content_md || detail.doc_introduce}
+                    </ReactMarkdown>
+                  </Card>
+                )}
+                {detail.pdf_text_md && (
+                  <Card
+                    size="small"
+                    type="inner"
+                    title={<><ReadOutlined /> PDF 全文 ({detail.pdf_text_md.length.toLocaleString()} 字)</>}
+                    bodyStyle={{ maxHeight: 480, overflowY: 'auto' }}
+                  >
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {detail.pdf_text_md}
+                    </ReactMarkdown>
+                  </Card>
+                )}
+              </>
             ) : (
               <Empty
                 description="本条目无可预览内容 (可能需在源页阅读)"

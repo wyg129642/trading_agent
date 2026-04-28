@@ -209,6 +209,44 @@ era. See `crawler_data_local_mongo` memory for the mapping.
 | AlphaEngine | `crawl/alphaengine/` | `alphaengine` | `summaries`, `china_reports`, `foreign_reports`, `news_items` | localStorage `token` JWT + `refresh_token` rotation |
 | SentimenTrader | `crawl/sentimentrader/` | `funda.sentimentrader_indicators` | (merged into funda DB) | email + password (Playwright daily) |
 
+**IR Filings corpus** (added 2026-04-28; 41 portfolio holdings × US/HK/JP/KR exchanges, primary
+source for revenue-segment modeling). Stored in dedicated **`ir_filings`** Mongo DB on the same
+`:27018` instance. Per-source PDFs at `/home/ygwang/crawl_data/ir_pdfs/<source>/`. Shared registry +
+schema helpers at `crawl/ir_filings/{tickers,common}.py`; per-source scraper as a sibling top-level
+crawler dir (so `crawler_monitor.py` + admin UI find them with the standard convention).
+
+| Source | Dir | Mongo coll | In-scope tickers | Auth | Endpoints |
+|---|---|---|---|---|---|
+| **SEC EDGAR** | `crawl/sec_edgar/` | `ir_filings.sec_edgar` (+ `sec_xbrl_facts`) | 22 US | Declared User-Agent only | `data.sec.gov/submissions`, `/api/xbrl/companyfacts`, Archives PDFs |
+| **HKEXnews** | `crawl/hkex/` | `ir_filings.hkex` | 14 HK | Cookie+Referer | `www1.hkexnews.hk/search/titleSearchServlet.do` |
+| **ASX** | `crawl/asx/` | `ir_filings.asx` (+ `asx_key_statistics`) | 1 AU (SGQ) | None | Markit Digital JSON (`asx.api.markitdigital.com`) → `displayAnnouncement.do` interstitial → `announcements.asx.com.au` PDF |
+| **EDINET v2** | `crawl/edinet/` | `ir_filings.edinet` | 2 JP (deferred; awaiting key) | `Subscription-Key` query param (free, MFA registration) | `api.edinet-fsa.go.jp/api/v2/documents.json` + `/documents/{id}?type={1=zip,2=pdf,5=csv}` |
+| **TDnet** | `crawl/tdnet/` | `ir_filings.tdnet` | 2 JP (deferred) | None | `webapi.yanoshin.jp/webapi/tdnet/list/{ticker}.json` (mirror; bypasses TDnet 31-day retention + UA gate) |
+| **DART** | `crawl/dart/` | `ir_filings.dart` (+ `dart_fnltt`) | 3 KR (deferred) | `crtfc_key` (free, single key per member) | `opendart.fss.or.kr/api/list.json`, `/document.xml`, `/fnlttSinglAcntAll.json` |
+| **IR Pages** | `crawl/ir_pages/` | `ir_filings.ir_pages` | 9 US + 1 HK + 3 INTL (Phase 2 — investor decks/presentations/fact sheets from per-company IR sites curated in `config/portfolio_sources.yaml`) | Browser-class UA + Playwright for JS-heavy SPAs | `urls from portfolio_sources.yaml ... [tags: IR]` |
+
+Schema is the unified shape from `crawl/ir_filings/common.py::make_filing_doc` — `release_time_ms`,
+`pdf_local_path`, `_canonical_tickers`, etc. are aligned with the existing 8-platform conventions, so
+`extract_pdf_texts.py` (writes `pdf_text_md`), `kb_search` Phase A (registered via `kb_service.py`
+SPECS_LIST as `sec_filing` / `hkex_filing` / `edinet_filing` / `tdnet_disclosure` / `dart_filing` doc
+types), and Milvus ingest pick them up uniformly. New ticker aliases for JP (5801, 285A, 古河,
+キオクシア, Kioxia, Furukawa) + KR (Samsung, SK Hynix, 신성이엔지) + AU (SGQ) added to `aliases.json`.
+`005930.KS` / `000660.KS` / `011930.KQ` are the canonical KR forms (matches existing tushare
+conventions); `SGQ.AU` for AU.
+
+**Mirror API endpoint**: `/api/ir-filings-db/*` — single FastAPI router (`backend/app/api/ir_filings_db.py`)
+covers all 7 sources because the schema is unified. Routes: `/sources`, `/stats`, `/sources/{src}`,
+`/sources/{src}/{id}`, `/sources/{src}/{id}/pdf`, plus `/xbrl/{ticker}` (SEC companyfacts time series),
+`/fnltt/{ticker}` (DART line items), `/key-statistics/{ticker}` (ASX 3-yr revenue panel).
+
+**crawler_monitor / admin UI**: 6 IR sources registered in `crawler_monitor.ALL_SCRAPERS` and
+`crawler_manager.SPECS` for spawn/stop tracking + the `/data-sources` admin tab. EDINET/DART surface
+"missing key" errors in their watch.log when scraper exits non-zero.
+
+Credentials: drop `{"subscription_key": "..."}` into `crawl/edinet/credentials.json` and
+`{"crtfc_key": "..."}` into `crawl/dart/credentials.json` (both gitignored). SEC EDGAR / HKEX / ASX /
+TDnet / IR Pages need no auth.
+
 **Shared CLI** — every `scraper.py` supports `--max N`, `--resume`, `--watch --interval N`, `--force`,
 `--today [--date]`, `--show-state`, `--auth TOKEN`, `--since-hours N`, `--pdf-dir/--skip-pdf`.
 

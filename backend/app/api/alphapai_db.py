@@ -478,6 +478,7 @@ async def get_item(
     return {
         **_normalize_item(doc),
         "content": doc.get("content") or "",
+        "pdf_text_md": doc.get("pdf_text_md") or "",
         "title_cn": title_cn or None,
         "content_cn": content_cn or None,
         "pdf_local_path": doc.get("pdf_local_path"),

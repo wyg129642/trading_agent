@@ -102,6 +102,7 @@ interface ItemBrief {
 
 interface ItemDetail extends ItemBrief {
   content: string
+  pdf_text_md: string
   pdf_local_path: string | null
   pdf_size: number | null
   raw_id: string | null
@@ -636,6 +637,20 @@ export default function AlphaPaiDB() {
                   <Text type="secondary">（无正文）</Text>
                 )}
               </div>
+              {detail.pdf_text_md && (
+                <details style={{ marginTop: 10 }} open>
+                  <summary style={{ cursor: 'pointer', fontWeight: 600, fontSize: 13 }}>
+                    PDF 全文 ({detail.pdf_text_md.length.toLocaleString()} 字)
+                  </summary>
+                  <div style={{
+                    background: '#fff', padding: 12, borderRadius: 4, marginTop: 8,
+                    fontSize: 13, lineHeight: 1.7, maxHeight: '50vh', overflowY: 'auto',
+                    border: '1px solid #e5e7eb', whiteSpace: 'pre-wrap',
+                  }}>
+                    <MarkdownRenderer content={detail.pdf_text_md} />
+                  </div>
+                </details>
+              )}
               <Text type="secondary" style={{ fontSize: 11 }}>
                 <FileSearchOutlined /> ID: {detail.id}
                 {detail.crawled_at && ` · 抓取于 ${dayjs(detail.crawled_at).format('YYYY-MM-DD HH:mm')}`}

@@ -190,6 +190,20 @@ class Settings(BaseSettings):
     # 仅 can_download 的少数文章会写入此目录 (/articles/download_url 返回 S3 URL)
     acecamp_pdf_dir: str = "/home/ygwang/crawl_data/acecamp_pdfs"
 
+    # IR Filings — US/HK/JP/KR exchange disclosures (added 2026-04-28).
+    # Single dedicated DB on local Mongo with one collection per source. Each
+    # source has its own PDF root under /home/ygwang/crawl_data/ir_pdfs/<src>/
+    # so extract_pdf_texts.py can map pdf_local_path → pdf_text_md uniformly.
+    ir_filings_mongo_uri: str = REMOTE_CRAWL_MONGO_URI
+    ir_filings_mongo_db: str = "ir_filings"
+    sec_edgar_pdf_dir: str = "/home/ygwang/crawl_data/ir_pdfs/sec_edgar"
+    hkex_pdf_dir:      str = "/home/ygwang/crawl_data/ir_pdfs/hkex"
+    edinet_pdf_dir:    str = "/home/ygwang/crawl_data/ir_pdfs/edinet"
+    tdnet_pdf_dir:     str = "/home/ygwang/crawl_data/ir_pdfs/tdnet"
+    dart_pdf_dir:      str = "/home/ygwang/crawl_data/ir_pdfs/dart"
+    asx_pdf_dir:       str = "/home/ygwang/crawl_data/ir_pdfs/asx"
+    ir_pages_pdf_dir:  str = "/home/ygwang/crawl_data/ir_pdfs/ir_pages"
+
     # Personal Knowledge Base (per-user uploaded documents)
     # Users upload markdown / text / PDF / audio / docx / xlsx files; the
     # service parses them into searchable chunks and exposes `user_kb_search`
@@ -335,6 +349,17 @@ class Settings(BaseSettings):
     llm_tag_realtime_interval_sec: int = 60
     llm_tag_realtime_lookback_hours: int = 2
     llm_tag_realtime_batch_size: int = 50
+
+    # PDF text extraction loop — drives `scripts/extract_pdf_texts.py` as a
+    # subprocess every interval_sec so freshly crawled PDFs reach
+    # `pdf_text_md` within minutes of ingestion. flock-guarded against the
+    # legacy 30-min cron; rc=1 means cron held the lock (fine, retry next cycle).
+    # Service: `backend/app/services/pdf_text_extract_loop.py`.
+    pdf_text_extract_enabled: bool = True
+    pdf_text_extract_interval_sec: int = 300
+    pdf_text_extract_limit_per_cycle: int = 100
+    pdf_text_extract_workers: int = 2
+    pdf_text_extract_batch_size: int = 8
 
     # OpenRouter (for AI Chat multi-model)
     openrouter_api_key: str = ""

@@ -145,6 +145,16 @@ TARGETS: list[PdfTarget] = [
     PdfTarget("alphaengine", "china_reports",   "alphaengine_mongo_uri", "alphaengine_mongo_db", "alphaengine_pdf_dir"),
     PdfTarget("alphaengine", "foreign_reports", "alphaengine_mongo_uri", "alphaengine_mongo_db", "alphaengine_pdf_dir"),
     PdfTarget("acecamp",     "articles",        "acecamp_mongo_uri",     "acecamp_mongo_db",     "acecamp_pdf_dir"),
+    # IR Filings (added 2026-04-28). All five share the `ir_filings` Mongo DB
+    # but have per-source PDF roots so the gridfs filename mapping (root
+    # basename + relative path) keeps working unchanged.
+    PdfTarget("ir_filings",  "sec_edgar",       "ir_filings_mongo_uri",  "ir_filings_mongo_db",  "sec_edgar_pdf_dir"),
+    PdfTarget("ir_filings",  "hkex",            "ir_filings_mongo_uri",  "ir_filings_mongo_db",  "hkex_pdf_dir"),
+    PdfTarget("ir_filings",  "edinet",          "ir_filings_mongo_uri",  "ir_filings_mongo_db",  "edinet_pdf_dir"),
+    PdfTarget("ir_filings",  "tdnet",           "ir_filings_mongo_uri",  "ir_filings_mongo_db",  "tdnet_pdf_dir"),
+    PdfTarget("ir_filings",  "dart",            "ir_filings_mongo_uri",  "ir_filings_mongo_db",  "dart_pdf_dir"),
+    PdfTarget("ir_filings",  "asx",             "ir_filings_mongo_uri",  "ir_filings_mongo_db",  "asx_pdf_dir"),
+    PdfTarget("ir_filings",  "ir_pages",        "ir_filings_mongo_uri",  "ir_filings_mongo_db",  "ir_pages_pdf_dir"),
 ]
 
 

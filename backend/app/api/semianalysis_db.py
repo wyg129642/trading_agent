@@ -56,9 +56,10 @@ def _state_coll():
 # --------------------------------------------------------------------------- #
 def _brief(doc: dict) -> dict:
     """Uniform list-view item — no heavy content_md / content_html / list_item."""
-    content = doc.get("content_md") or ""
-    preview_src = doc.get("subtitle") or doc.get("description") or \
-                  doc.get("truncated_body_text") or content
+    # `content_md` and `truncated_body_text` are projected out by the list
+    # cursor; aggregation injects `_content_length` so the count is correct.
+    content_length = int(doc.get("_content_length") or 0)
+    preview_src = doc.get("subtitle") or doc.get("description") or ""
     preview = preview_src[:360] + ("…" if len(preview_src) > 360 else "")
     return {
         "id": str(doc.get("_id") or ""),
@@ -79,7 +80,7 @@ def _brief(doc: dict) -> dict:
         "organization": doc.get("organization") or "SemiAnalysis",
         "authors": doc.get("authors") or [],
         "preview": preview,
-        "content_length": len(content),
+        "content_length": content_length,
         "word_count": int((doc.get("stats") or {}).get("wordcount") or 0),
         "reaction_count": int((doc.get("stats") or {}).get("reaction_count") or 0),
         "canonical_tickers": doc.get("_canonical_tickers") or [],
@@ -151,16 +152,21 @@ async def list_posts(
         match["$or"] = ors
 
     total = await coll.count_documents(match)
-    cursor = (
-        coll.find(match, projection={
+    pipeline = [
+        {"$match": match},
+        {"$sort": {"release_time_ms": -1, "post_id": -1}},
+        {"$skip": (page - 1) * page_size},
+        {"$limit": page_size},
+        {"$addFields": {
+            "_content_length": {"$strLenCP": {"$ifNull": ["$content_md", ""]}},
+        }},
+        {"$project": {
             "list_item": 0, "detail_result": 0,
             "content_md": 0, "content_html": 0,
             "truncated_body_text": 0,
-        })
-        .sort([("release_time_ms", -1), ("post_id", -1)])
-        .skip((page - 1) * page_size)
-        .limit(page_size)
-    )
+        }},
+    ]
+    cursor = coll.aggregate(pipeline)
     items = [_brief(d) async for d in cursor]
     return ItemListResponse(
         items=items,

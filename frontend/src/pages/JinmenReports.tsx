@@ -58,6 +58,7 @@ interface ReportItem {
 interface ReportDetail extends ReportItem {
   summary_md: string
   summary_point_md: string
+  pdf_text_md: string
   original_url: string
   link_url: string
   pdf_local_path: string
@@ -587,10 +588,10 @@ export default function JinmenReports() {
                        closable onClose={() => setPdfError(null)} />
               )}
 
-              <Card size="small" title="核心观点"
+              <Card size="small" title="核心观点 (平台摘要)"
                     style={{ marginTop: 8 }}
                     bodyStyle={{
-                      maxHeight: pdfVisible ? '32vh' : '62vh',
+                      maxHeight: pdfVisible ? '24vh' : '32vh',
                       overflowY: 'auto',
                       padding: '14px 18px',
                       background: '#fff',
@@ -600,9 +601,28 @@ export default function JinmenReports() {
                     <MarkdownRenderer content={detail.summary_md} />
                   </div>
                 ) : (
-                  <Empty description="无摘要 (PDF 里有完整正文)" />
+                  <Empty description="无摘要 (见下方 PDF 全文)" />
                 )}
               </Card>
+
+              {detail.pdf_text_md && (
+                <Card size="small"
+                      title={`PDF 全文 (${detail.pdf_text_md.length.toLocaleString()} 字)`}
+                      style={{ marginTop: 8 }}
+                      bodyStyle={{
+                        maxHeight: pdfVisible ? '28vh' : '40vh',
+                        overflowY: 'auto',
+                        padding: '14px 18px',
+                        background: '#fff',
+                        whiteSpace: 'pre-wrap',
+                        fontSize: 13,
+                        lineHeight: 1.7,
+                      }}>
+                  <div className="jinmen-report-md">
+                    <MarkdownRenderer content={detail.pdf_text_md} />
+                  </div>
+                </Card>
+              )}
 
               <Paragraph type="secondary" style={{ fontSize: 11, marginTop: 12 }}>
                 ID: {detail.id} · reportId: {detail.report_id}

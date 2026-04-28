@@ -266,10 +266,12 @@ TARGETS: list[Target] = [
            ["--category", "summary", "--page-size", "50"],
            "alphaengine", "summaries",
            date_fields=["release_time_ms", "publish_time_ms"]),
-    Target("alphaengine", "news", "crawl/alphaengine",
-           ["--category", "news", "--page-size", "50"],
-           "alphaengine", "news_items",
-           date_fields=["release_time_ms", "publish_time_ms"]),
+    # news (资讯) 永久停用 (2026-04-28) — 与 streamSearch REFRESH_LIMIT 配额池
+    # 共享, 占满会让纪要/研报当天抓不到. backfill 也跳过, 不再历史补.
+    # Target("alphaengine", "news", "crawl/alphaengine",
+    #        ["--category", "news", "--page-size", "50"],
+    #        "alphaengine", "news_items",
+    #        date_fields=["release_time_ms", "publish_time_ms"]),
     Target("alphaengine", "foreignReport", "crawl/alphaengine",
            ["--category", "foreignReport", "--page-size", "50"],
            "alphaengine", "foreign_reports",

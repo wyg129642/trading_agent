@@ -1942,9 +1942,11 @@ def parse_args():
                    help="实时模式: 定时轮询. Ctrl+C 退出")
     p.add_argument("--interval", type=int, default=600,
                    help="实时模式轮询间隔秒数 (默认 600)")
-    p.add_argument("--retry-truncated-max", type=int, default=100,
+    p.add_argument("--retry-truncated-max", type=int, default=0,
                    help="watch 每轮末尾尝试 retry 的 content_truncated=True roadshow "
-                        "上限 (跨天额度恢复后自动补齐). 0=禁用. 默认 100.")
+                        "上限. 0=禁用 (默认, 2026-04-28 后改). 之前每日 100-150 次配额"
+                        "几乎全花在补老 truncated, 新发反而拿不到 detail; 现在配额"
+                        "完全留给当日 list-incremental.")
     p.add_argument("--since-hours", type=float, default=None,
                    help="只抓取过去 N 小时内发布的内容 (按 time_field). "
                         "默认不限制.")

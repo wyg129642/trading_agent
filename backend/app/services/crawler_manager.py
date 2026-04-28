@@ -97,8 +97,22 @@ SPECS: dict[str, CrawlerSpec] = {
                            "--burst-size", "200", "--daily-cap", "0"),
     }),
     "jinmen":      CrawlerSpec("jinmen", "jinmen", {
-        "meetings": _RT,              # 默认跑 meetings
-        "reports":  _RT + ("--reports",),
+        # 2026-04-28: 从 _RT (1.5/1.0/burst 80, interval 60) 切到保守档位.
+        # jinmen 历史被封控过 (账号锁 + 长冷却), 跟 AceCamp 一档对齐:
+        #   interval 120s (实时档下限, 高于 60s 减一半 burst), base 2.5s/jitter 1.5s,
+        #   burst 30 (40→25 收紧再放宽一点保留少量并发), 冷却 15-40s.
+        # _RT 留给 alphapai/funda 等"压力大的高频源".
+        "meetings": ("--watch", "--resume", "--since-hours", "24",
+                     "--interval", "120",
+                     "--throttle-base", "2.5", "--throttle-jitter", "1.5",
+                     "--burst-size", "30",
+                     "--burst-cooldown-min", "15", "--burst-cooldown-max", "40"),
+        "reports":  ("--watch", "--resume", "--since-hours", "24",
+                     "--interval", "120",
+                     "--throttle-base", "2.5", "--throttle-jitter", "1.5",
+                     "--burst-size", "30",
+                     "--burst-cooldown-min", "15", "--burst-cooldown-max", "40",
+                     "--reports"),
     }),
     "meritco":     CrawlerSpec("meritco", "meritco_crawl", {
         # type 2 (纪要 / 专业内容) + type 3 (久谦自研) 各起一条, 并行跑
@@ -144,20 +158,22 @@ SPECS: dict[str, CrawlerSpec] = {
     "acecamp":     CrawlerSpec("acecamp", "AceCamp", {
         # 2026-04-25 (v2.2): --daily-cap 移除 — 实时档不靠数量闸, 靠
         # SoftCooldown (10003/10040 自动触发) + --skip-detail (detail 不触 quota).
+        # 2026-04-28: 又紧一档 (3.0→3.5 base, 2.0→2.5 jitter, burst 20→15,
+        # 冷却 15-40→25-60s). AceCamp 团队金卡封过一次, 用户明确要求"再小心一些".
         "articles": ("--watch", "--resume", "--since-hours", "24",
-                     "--interval", "120",
-                     "--throttle-base", "3.0", "--throttle-jitter", "2.0",
-                     "--burst-size", "20",
-                     "--burst-cooldown-min", "15",
-                     "--burst-cooldown-max", "40",
+                     "--interval", "180",
+                     "--throttle-base", "3.5", "--throttle-jitter", "2.5",
+                     "--burst-size", "15",
+                     "--burst-cooldown-min", "25",
+                     "--burst-cooldown-max", "60",
                      "--type", "articles",
                      "--skip-detail"),
         "opinions": ("--watch", "--resume", "--since-hours", "24",
-                     "--interval", "180",
-                     "--throttle-base", "3.0", "--throttle-jitter", "2.0",
-                     "--burst-size", "20",
-                     "--burst-cooldown-min", "15",
-                     "--burst-cooldown-max", "40",
+                     "--interval", "240",
+                     "--throttle-base", "3.5", "--throttle-jitter", "2.5",
+                     "--burst-size", "15",
+                     "--burst-cooldown-min", "25",
+                     "--burst-cooldown-max", "60",
                      "--type", "opinions"),
     }),
     "alphaengine": CrawlerSpec("alphaengine", "alphaengine", {
@@ -185,10 +201,14 @@ SPECS: dict[str, CrawlerSpec] = {
                           "--interval", "1200",
                           "--throttle-base", "3", "--throttle-jitter", "2",
                           "--category", "foreignReport", "--skip-pdf"),
-        "news":          ("--watch", "--resume", "--since-hours", "24",
-                          "--interval", "1200",
-                          "--throttle-base", "3", "--throttle-jitter", "2",
-                          "--category", "news", "--skip-pdf"),
+        # news (资讯) 永久停用 (2026-04-28). 4 watcher 共享同一 streamSearch
+        # REFRESH_LIMIT 配额池 (~500/天, Pro tier), 资讯端密度极高 (24h 525 条)
+        # 会把 summary/chinaReport/foreignReport 的额度挤掉. 用户判定: 占用就停.
+        # 已入库 news_items collection 仅供查询, 不再增量抓取也不再 enrich.
+        # "news":          ("--watch", "--resume", "--since-hours", "24",
+        #                   "--interval", "1200",
+        #                   "--throttle-base", "3", "--throttle-jitter", "2",
+        #                   "--category", "news", "--skip-pdf"),
         # 配额绕过 worker — 使用 detail 端点 + 签名 COS URL, 完全绕过
         # list REFRESH_LIMIT 和 PDF 下载配额 (CRAWLERS.md §9.5.8 通用模式).
         # 每小时扫一轮, 把所有已入库但缺正文 / 缺 PDF 的条目补全. 即使 list
@@ -211,6 +231,32 @@ SPECS: dict[str, CrawlerSpec] = {
                     "--interval", "1800",
                     "--throttle-base", "3.0", "--throttle-jitter", "2.0",
                     "--burst-size", "30"),
+    }),
+
+    # ─── IR Filings (2026-04-28) ────────────────────────────────────────
+    # Each source = single variant `default`. Args don't use the `_RT` template
+    # because IR scrapers don't speak the antibot v2 CLI; their throttling is
+    # internal (env vars XXX_THROTTLE).
+    "sec_edgar":  CrawlerSpec("sec_edgar", "sec_edgar", {
+        "default": ("--watch", "--interval", "1800"),
+    }),
+    "hkex":       CrawlerSpec("hkex", "hkex", {
+        "default": ("--watch", "--interval", "1800", "--days", "30"),
+    }),
+    "asx":        CrawlerSpec("asx", "asx", {
+        "default": ("--watch", "--interval", "1800"),
+    }),
+    "tdnet":      CrawlerSpec("tdnet", "tdnet", {
+        "default": ("--watch", "--interval", "600"),
+    }),
+    "edinet":     CrawlerSpec("edinet", "edinet", {
+        # Requires Subscription-Key in crawl/edinet/credentials.json — scraper
+        # exits with non-zero if missing; admin UI surfaces the error.
+        "default": ("--watch", "--interval", "7200", "--days", "14"),
+    }),
+    "dart":       CrawlerSpec("dart", "dart", {
+        # Requires crtfc_key in crawl/dart/credentials.json.
+        "default": ("--watch", "--interval", "7200", "--days", "30"),
     }),
 }
 

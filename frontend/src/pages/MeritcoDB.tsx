@@ -163,6 +163,7 @@ interface ForumDetail extends ForumBrief {
   topic_md: string
   background_md: string
   expert_content_md: string
+  pdf_text_md: string
   ticker_tags?: TickerTags
 }
 
@@ -1145,6 +1146,21 @@ export default function MeritcoDB() {
                     children: (
                       <MarkdownContent md={detail.expert_content_md} empty="无专家内容" />
                     ),
+                  },
+                  {
+                    key: 'pdf_text',
+                    disabled: !detail.pdf_text_md,
+                    label: (
+                      <span>
+                        <FileTextOutlined /> PDF 全文
+                        {detail.pdf_text_md && (
+                          <span style={{ color: '#94a3b8', marginLeft: 4 }}>
+                            ({detail.pdf_text_md.length.toLocaleString()})
+                          </span>
+                        )}
+                      </span>
+                    ),
+                    children: <MarkdownContent md={detail.pdf_text_md} empty="无 PDF 全文" />,
                   },
                 ]}
               />
