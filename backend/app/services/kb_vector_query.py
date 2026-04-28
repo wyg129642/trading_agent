@@ -239,8 +239,8 @@ def _per_doc_cap(hits: list[dict], cap: int) -> list[dict]:
 # ── Hit normalization (kb_service.search-compatible shape) ────────
 
 
-def _normalize_hit(row: dict, score: float) -> dict:
-    """Translate a Milvus row + rank score into the LLM-facing shape.
+def _normalize_hit(row: dict) -> dict:
+    """Translate a Milvus row into the LLM-facing shape.
 
     Compatible superset of kb_service._normalize_hit output, adding chunk-level
     fields. Legacy keys preserved verbatim so the existing _format_kb_hits and
@@ -276,7 +276,6 @@ def _normalize_hit(row: dict, score: float) -> dict:
         "tickers": list(g("tickers") or []),
         "url": g("url") or "",
         "text_len": len(g("parent_text") or ""),
-        "score": round(float(score), 4),
         # ── New chunk-level fields (CitationTracker.add_kb_items consumes) ──
         "chunk_id": g("chunk_id"),
         "chunk_index": int(g("chunk_index") or 0),
@@ -353,14 +352,7 @@ async def hybrid_search(
         "hybrid" if q_vec is not None else "bm25_only",
     )
 
-    # Normalize — Milvus returns a distance/score per row; use that.
-    out: list[dict] = []
-    for rank, row in enumerate(capped, start=1):
-        raw = row.get("distance")
-        # Preserve legitimate 0.0 scores (cosine mean perfect match under some
-        # metrics). Fall back to reciprocal rank only when score is truly absent.
-        score = float(raw) if raw is not None else (1.0 / rank)
-        out.append(_normalize_hit(row, score))
+    out: list[dict] = [_normalize_hit(row) for row in capped]
     return out
 
 

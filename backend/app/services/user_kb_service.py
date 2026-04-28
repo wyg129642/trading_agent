@@ -2926,7 +2926,6 @@ class SearchHit:
     original_filename: str
     chunk_index: int
     text: str
-    score: float
     created_at: str
     # The user who originally uploaded this doc. The personal-KB is now
     # shared team-wide for retrieval, so surfacing the uploader lets the
@@ -3159,7 +3158,6 @@ async def _vector_search_chunks(
                 original_filename=doc.get("original_filename") or "",
                 chunk_index=vh.chunk_index,
                 text=vh.text,
-                score=vh.score,
                 created_at=created.isoformat() if isinstance(created, datetime) else "",
                 uploader_user_id=str(doc.get("user_id") or vh.user_id or ""),
             )
@@ -3177,7 +3175,6 @@ def _row_to_hit(r: dict) -> SearchHit:
         original_filename=doc.get("original_filename") or "",
         chunk_index=int(r.get("chunk_index") or 0),
         text=r.get("text") or "",
-        score=float(r.get("score") or 0.0),
         created_at=created.isoformat() if isinstance(created, datetime) else "",
         uploader_user_id=str(doc.get("user_id") or r.get("user_id") or ""),
     )
@@ -3218,22 +3215,12 @@ def _rrf_fuse(
     _accumulate(lex)
     _accumulate(vec)
 
-    fused: list[SearchHit] = []
-    for _, (hit, score) in sorted(
-        combined.items(), key=lambda kv: kv[1][1], reverse=True,
-    ):
-        fused.append(
-            SearchHit(
-                document_id=hit.document_id,
-                title=hit.title,
-                original_filename=hit.original_filename,
-                chunk_index=hit.chunk_index,
-                text=hit.text,
-                score=round(score, 4),
-                created_at=hit.created_at,
-                uploader_user_id=hit.uploader_user_id,
-            )
+    fused: list[SearchHit] = [
+        hit
+        for _, (hit, _score) in sorted(
+            combined.items(), key=lambda kv: kv[1][1], reverse=True,
         )
+    ]
     return fused
 
 

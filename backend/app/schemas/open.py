@@ -126,7 +126,6 @@ class KbHit(BaseModel):
     tickers: list[str] = []
     url: str = ""
     text_len: int
-    score: float
 
 
 class KbSearchResponse(BaseModel):
@@ -215,7 +214,6 @@ class UserKbHit(BaseModel):
     original_filename: str
     chunk_index: int
     text: str = Field(description="Matching chunk body (typically a few hundred chars).")
-    score: float
     created_at: str
     uploader_user_id: str = Field(
         "",

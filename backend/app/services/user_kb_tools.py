@@ -163,7 +163,7 @@ def _format_search_result(hits: list[svc.SearchHit], citation_tracker: Any) -> s
             f"{prefix}**{hit.title}** "
             f"(文件:{hit.original_filename} · 段 {hit.chunk_index} · "
             f"上传:{hit.created_at[:10] if hit.created_at else '?'} · "
-            f"uploader={uploader} · score={hit.score:.2f})"
+            f"uploader={uploader})"
         )
         body = hit.text.strip()
         if len(body) > 1200:

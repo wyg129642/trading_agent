@@ -55,7 +55,6 @@ class VectorHit:
     user_id: str
     chunk_index: int
     text: str
-    score: float           # Milvus cosine score (higher = more similar)
 
 
 class VectorStoreUnavailable(RuntimeError):
@@ -372,7 +371,6 @@ async def vector_search(
                     user_id=str(entity.get("user_id") or ""),
                     chunk_index=int(entity.get("chunk_index") or 0),
                     text=str(entity.get("text") or ""),
-                    score=float(row.get("distance") or 0.0),
                 )
             )
         return hits

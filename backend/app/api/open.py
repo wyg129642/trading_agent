@@ -1057,7 +1057,6 @@ async def user_kb_search(
                 original_filename=h.original_filename,
                 chunk_index=h.chunk_index,
                 text=h.text,
-                score=h.score,
                 created_at=h.created_at,
                 uploader_user_id=h.uploader_user_id,
             )

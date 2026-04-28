@@ -942,7 +942,7 @@ def _build_snippet(text: str, query: str, max_chars: int = 320) -> str:
 # ── Normalize a hit into a transport dict ───────────────────────
 
 
-def _normalize_hit(spec: CollectionSpec, doc: dict, score: float, query: str) -> dict:
+def _normalize_hit(spec: CollectionSpec, doc: dict, query: str) -> dict:
     title = (doc.get(spec.title_field) or "").strip()
     text = _extract_text(spec, doc)
     date_str, ms = _extract_date(spec, doc)
@@ -967,7 +967,6 @@ def _normalize_hit(spec: CollectionSpec, doc: dict, score: float, query: str) ->
         "tickers": tickers,
         "url": url,
         "text_len": len(text),
-        "score": round(float(score), 3),
     }
 
 
@@ -1235,7 +1234,7 @@ async def _legacy_search(
         scored = [(1.0, sp, dc) for _, sp, dc in scored_rec]
 
     top = scored[:top_k]
-    return [_normalize_hit(spec, doc, sc, q) for sc, spec, doc in top]
+    return [_normalize_hit(spec, doc, q) for _sc, spec, doc in top]
 
 
 # ── Fetch full document ─────────────────────────────────────────
