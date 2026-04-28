@@ -39,6 +39,7 @@ import contextvars
 import hashlib
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta as _timedelta, timezone
@@ -2934,6 +2935,59 @@ class SearchHit:
     uploader_user_id: str = ""
 
 
+# ── Stub-chunk filter ─────────────────────────────────────────────
+#
+# The workspace auto-seeds `notes.md` + `key-driver.md` for every stock
+# folder (see `_ensure_stock_subtaxonomy` in `api/user_kb.py`). Until the
+# user actually writes something into them they're pure markdown skeleton:
+# headers, blockquote markers, an ISO date and a few template labels. They
+# still tokenize fine for BM25 (the stock name in the title is enough to
+# rank them on stock-name queries) and they still embed for dense search,
+# so without an explicit filter they leak into chat tool results and burn
+# context on docs that contain no actual research.
+#
+# We strip the skeleton (markdown structure + ISO dates + template label
+# tokens) and drop chunks whose remaining content is shorter than
+# ``_STUB_CONTENT_THRESHOLD`` characters. Threshold is sized to flag both
+# template variants (which leave only the stock name + a few stray chars)
+# while still letting through genuine one-line user notes.
+_MARKDOWN_HEADER_RE = re.compile(r"^#{1,6}\s*")
+_MARKDOWN_BLOCKQUOTE_RE = re.compile(r"^>\s*")
+_MARKDOWN_BULLET_RE = re.compile(r"^[-*+]\s+")
+_MARKDOWN_HRULE_RE = re.compile(r"^(?:-{3,}|\*{3,}|_{3,})\s*$")
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_STUB_LABEL_RE = re.compile(
+    r"股票代码[：:]?|最近更新[：:]?|核心假设|风险因素|一句话观点|关键驱动|研究笔记"
+)
+_STUB_CONTENT_THRESHOLD = 15
+
+
+def _real_content_length(text: str) -> int:
+    """Substantive character count of a chunk after stripping skeleton."""
+    if not text:
+        return 0
+    pieces: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = _MARKDOWN_HEADER_RE.sub("", line)
+        line = _MARKDOWN_BLOCKQUOTE_RE.sub("", line)
+        line = _MARKDOWN_BULLET_RE.sub("", line)
+        if _MARKDOWN_HRULE_RE.match(line):
+            continue
+        pieces.append(line)
+    body = " ".join(pieces)
+    body = _ISO_DATE_RE.sub("", body)
+    body = _STUB_LABEL_RE.sub("", body)
+    return len(body.strip())
+
+
+def _is_stub_chunk(text: str) -> bool:
+    """True when a chunk holds only auto-seeded template skeleton."""
+    return _real_content_length(text) < _STUB_CONTENT_THRESHOLD
+
+
 async def search_chunks(
     query: str,
     *,
@@ -3011,12 +3065,24 @@ async def search_chunks(
             logger.warning("user_kb dense search failed (degrading): %s", e)
 
     if mode == "lexical":
-        return lex_hits[:top_k]
-    if mode == "semantic":
-        return vec_hits[:top_k]
+        ranked = lex_hits
+    elif mode == "semantic":
+        ranked = vec_hits
+    else:
+        rrf_k = max(1, int(get_settings().user_kb_rrf_k))
+        ranked = _rrf_fuse(lex_hits, vec_hits, rrf_k=rrf_k)
 
-    rrf_k = max(1, int(get_settings().user_kb_rrf_k))
-    return _rrf_fuse(lex_hits, vec_hits, rrf_k=rrf_k)[:top_k]
+    # Drop auto-seeded template stubs (notes.md / key-driver.md) — they
+    # still match BM25/dense for stock-name queries but contain no real
+    # content, so they only burn the LLM's context.
+    filtered = [h for h in ranked if not _is_stub_chunk(h.text)]
+    dropped = len(ranked) - len(filtered)
+    if dropped:
+        logger.info(
+            "user_kb search dropped %d stub chunk(s) from %d candidates (mode=%s, query=%r)",
+            dropped, len(ranked), mode, query[:80],
+        )
+    return filtered[:top_k]
 
 
 # ── Per-retriever implementations ──────────────────────────────
