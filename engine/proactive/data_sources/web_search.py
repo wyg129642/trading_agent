@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
@@ -30,6 +31,66 @@ from engine.proactive.models import BreakingNewsItem, PortfolioHolding, StockBas
 logger = logging.getLogger(__name__)
 
 CST = ZoneInfo("Asia/Shanghai")
+
+# Per-process query cache (engine: Tavily, Baidu — Jina excluded since it's free).
+# Keyed by (engine, query) → (timestamp, results). The proactive scanner runs
+# the same fixed query templates every cycle (e.g. "MU Micron latest news today")
+# so caching across two consecutive cycles cuts external-API volume in half
+# without losing freshness — Tavily's news index updates slower than 15 min anyway.
+_SEARCH_CACHE_TTL_SEC = 900   # 15 min
+_SEARCH_CACHE_MAX = 2000
+_search_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+
+
+def _cache_get(engine: str, query: str) -> list[dict] | None:
+    entry = _search_cache.get((engine, query))
+    if not entry:
+        return None
+    ts, results = entry
+    if (time.monotonic() - ts) > _SEARCH_CACHE_TTL_SEC:
+        _search_cache.pop((engine, query), None)
+        return None
+    # Clone so callers' per-item mutations (e.g. `_source_engine`, `_published_at_utc`)
+    # don't leak back into the cache.
+    return [dict(r) for r in results]
+
+
+def _cache_set(engine: str, query: str, results: list[dict]) -> None:
+    if len(_search_cache) >= _SEARCH_CACHE_MAX:
+        cutoff = time.monotonic() - _SEARCH_CACHE_TTL_SEC
+        for k, (ts, _) in list(_search_cache.items()):
+            if ts < cutoff:
+                _search_cache.pop(k, None)
+        if len(_search_cache) >= _SEARCH_CACHE_MAX:
+            _search_cache.pop(next(iter(_search_cache)), None)
+    _search_cache[(engine, query)] = (time.monotonic(), [dict(r) for r in results])
+
+
+# Markets whose active hours line up roughly with US trading. Outside these
+# windows we skip Tavily and rely on Baidu + Jina to conserve Tavily quota.
+_TAVILY_ACTIVE_MARKETS = {"美股", "港股", "主板", "创业板", "科创板"}
+
+
+def _tavily_in_active_window(market: str | None) -> bool:
+    """Whether Tavily should run for this market at the current wall-clock time.
+
+    For US stocks: only during US market hours ±2h (CST 21:30-06:30 next day).
+    For HK / A-shares: only during their session ±2h (CST 07:30-17:30).
+    Anything else (and weekends): skip Tavily entirely; Baidu+Jina cover the gap.
+    """
+    if not market:
+        return False
+    now_cst = datetime.now(CST)
+    if now_cst.weekday() >= 5:
+        return False
+    minutes = now_cst.hour * 60 + now_cst.minute
+    if market == "美股":
+        # US session ~21:30-04:00 CST + 2h buffer either side
+        return minutes >= (21 * 60 + 30 - 120) or minutes <= (4 * 60 + 120)
+    if market in _TAVILY_ACTIVE_MARKETS:
+        # HK / A-share: 09:30-16:00 CST + 2h buffer
+        return (9 * 60 + 30 - 120) <= minutes <= (16 * 60 + 120)
+    return False
 
 
 class WebSearchPlugin(DataSourcePlugin):
@@ -57,7 +118,19 @@ class WebSearchPlugin(DataSourcePlugin):
     def _generate_queries(
         self, holding: PortfolioHolding,
     ) -> tuple[list[str], list[str]]:
-        """Generate bilingual search queries tailored to stock characteristics."""
+        """Generate bilingual search queries tailored to stock characteristics.
+
+        Two-query layout (queries_per_stock=2, default):
+          q1 — combined breaking news + financial catalysts (covers earnings,
+               guidance, ratings, target price changes, and headline news in
+               one query — the previous separate q3 was redundant since news
+               and earnings hits overlap heavily for any stock with a recent
+               event).
+          q2 — sector-tag specific (only when tags exist).
+
+        At queries_per_stock=3 the legacy split (separate q1 news, q3 earnings)
+        is restored for backward compatibility / debugging.
+        """
         cn_queries = []
         en_queries = []
 
@@ -66,9 +139,17 @@ class WebSearchPlugin(DataSourcePlugin):
         ticker = holding.ticker
         sector_tags = [t for t in holding.tags if t not in ("holding",)]
 
-        # Query 1: Core breaking news (most important)
-        cn_queries.append(f"{name_cn} 最新消息 重大变化")
-        en_queries.append(f"{ticker} {name_en} latest news today")
+        if self._queries_per_stock <= 2:
+            # Merged headline + earnings/rating query — fewer API calls,
+            # equivalent recall in practice (Tavily news topic returns the
+            # same top hits for both query templates on most days).
+            cn_queries.append(f"{name_cn} 最新消息 业绩 评级")
+            en_queries.append(
+                f"{ticker} {name_en} latest news earnings rating today"
+            )
+        else:
+            cn_queries.append(f"{name_cn} 最新消息 重大变化")
+            en_queries.append(f"{ticker} {name_en} latest news today")
 
         # Query 2: Industry-specific — use tags to make queries precise
         if sector_tags:
@@ -76,7 +157,7 @@ class WebSearchPlugin(DataSourcePlugin):
             cn_queries.append(f"{name_cn} {tag_str} 突破 订单 客户")
             en_queries.append(f"{ticker} {name_en} {sector_tags[0]} breakthrough order contract")
 
-        # Query 3: Earnings / guidance / analyst (financial catalysts)
+        # Query 3: only when caller explicitly opts back into the 3-query layout.
         if self._queries_per_stock >= 3:
             cn_queries.append(f"{name_cn} 业绩 指引 评级调整 目标价")
             en_queries.append(f"{ticker} {name_en} earnings guidance rating upgrade downgrade")
@@ -106,9 +187,15 @@ class WebSearchPlugin(DataSourcePlugin):
         for i, q in enumerate(cn_queries):
             tasks.append(self._search_baidu(q, delay=i * 0.4))
 
-        # Tavily: stagger 0.3s/query
-        for i, q in enumerate(en_queries):
-            tasks.append(self._search_tavily(q, delay=i * 0.3))
+        # Tavily: only during the holding's market hours ±2h. Outside that
+        # window, news momentum is low and Baidu+Jina cover the gap, so we
+        # skip Tavily to conserve plan quota (the proactive scanner historically
+        # burned ~25% of calls into 432 quota errors; gating by trading window
+        # cuts off the off-hours bulk that drives that).
+        tavily_active = _tavily_in_active_window(holding.market)
+        if tavily_active:
+            for i, q in enumerate(en_queries):
+                tasks.append(self._search_tavily(q, delay=i * 0.3))
 
         # Jina: free of 429s in practice; run 1 query in parallel
         if self._jina_api_key:
@@ -241,6 +328,13 @@ class WebSearchPlugin(DataSourcePlugin):
         so the caller can detect 429 storms."""
         import asyncio
         from engine.tools.web_search import baidu_search
+
+        cached = _cache_get("baidu", query)
+        if cached is not None:
+            for r in cached:
+                r["_source_engine"] = "baidu"
+            return cached
+
         if delay > 0:
             await asyncio.sleep(delay)
         try:
@@ -252,6 +346,7 @@ class WebSearchPlugin(DataSourcePlugin):
             )
             if results is None:
                 return {"_rate_limited": True, "_source_engine": "baidu"}
+            _cache_set("baidu", query, results)
             for r in results:
                 r["_source_engine"] = "baidu"
             return results
@@ -265,6 +360,13 @@ class WebSearchPlugin(DataSourcePlugin):
     async def _search_tavily(self, query: str, delay: float = 0.0) -> list[dict] | dict:
         import asyncio
         from engine.tools.web_search import tavily_search
+
+        cached = _cache_get("tavily", query)
+        if cached is not None:
+            for r in cached:
+                r["_source_engine"] = "tavily"
+            return cached
+
         if delay > 0:
             await asyncio.sleep(delay)
         try:
@@ -277,6 +379,7 @@ class WebSearchPlugin(DataSourcePlugin):
             )
             if results is None:
                 return {"_rate_limited": True, "_source_engine": "tavily"}
+            _cache_set("tavily", query, results)
             for r in results:
                 r["_source_engine"] = "tavily"
             return results
