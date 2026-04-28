@@ -715,7 +715,9 @@ def test_merge_hybrid_hits_union_dedup():
         {"doc_id": "a:2", "title": "B", "score": 1.5},
         {"doc_id": "a:3", "title": "C", "score": 0.4},
     ]
-    merged = _merge_hybrid_hits(vec, kw, top_k=10)
+    # P1b: returns (merged, stats) tuple. per_doc_cap=2 default still allows
+    # the union since each doc has at most 1 chunk in this synthetic input.
+    merged, _stats = _merge_hybrid_hits(vec, kw, top_k=10)
     doc_ids = [h["doc_id"] for h in merged]
     # Must include all three unique docs
     assert set(doc_ids) == {"a:1", "a:2", "a:3"}
@@ -725,14 +727,16 @@ def test_merge_hybrid_hits_union_dedup():
 
 def test_merge_hybrid_hits_empty_inputs():
     from backend.app.services.kb_service import _merge_hybrid_hits
-    assert _merge_hybrid_hits([], [], top_k=5) == []
+    merged, stats = _merge_hybrid_hits([], [], top_k=5)
+    assert merged == []
+    assert stats == {"after_score_merge": 0, "collapsed_by_doc": 0}
 
 
 def test_merge_hybrid_hits_top_k_truncation():
     from backend.app.services.kb_service import _merge_hybrid_hits
     vec = [{"doc_id": f"v:{i}", "title": f"V{i}"} for i in range(20)]
     kw = [{"doc_id": f"k:{i}", "title": f"K{i}"} for i in range(20)]
-    merged = _merge_hybrid_hits(vec, kw, top_k=5)
+    merged, _stats = _merge_hybrid_hits(vec, kw, top_k=5)
     assert len(merged) == 5
 
 

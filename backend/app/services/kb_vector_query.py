@@ -46,10 +46,12 @@ logger = logging.getLogger(__name__)
 
 DENSE_CANDIDATES = 100
 SPARSE_CANDIDATES = 100
-RRF_LIMIT = 50            # after fusion, before per-doc cap
-PER_DOC_CAP = 3           # max chunks from same doc in final output
+RRF_LIMIT = 50            # after Milvus-internal RRF fusion
 HNSW_EF = 128             # runtime ef for query
 BM25_DROP_RATIO = 0.2     # prune bottom 20% sparse terms for speed
+# NB: Per-doc cap moved to kb_service._merge_hybrid_hits (P1b). The hybrid
+# search now returns up to RRF_LIMIT chunks; the merge step enforces the
+# per-doc cap AFTER fusing with Phase A scores so kw confirmation is honored.
 
 
 # ── Milvus client singleton ───────────────────────────────────────
@@ -220,22 +222,6 @@ async def _milvus_hybrid(
     return [dict(hit) for hit in (rows[0] if rows else [])]
 
 
-# ── Per-doc diversity cap ─────────────────────────────────────────
-
-
-def _per_doc_cap(hits: list[dict], cap: int) -> list[dict]:
-    """Keep at most `cap` chunks per doc_id, preserving RRF rank order."""
-    by_doc: dict[str, int] = defaultdict(int)
-    kept: list[dict] = []
-    for h in hits:
-        doc_id = h.get("doc_id") or ""
-        if by_doc[doc_id] >= cap:
-            continue
-        by_doc[doc_id] += 1
-        kept.append(h)
-    return kept
-
-
 # ── Hit normalization (kb_service.search-compatible shape) ────────
 
 
@@ -342,17 +328,18 @@ async def hybrid_search(
     )
     milvus_ms = int((time.monotonic() - t1) * 1000)
 
-    # Apply per-doc cap for diversity.
-    capped = _per_doc_cap(raw, PER_DOC_CAP)
-    capped = capped[:top_k]
+    # Per-doc cap moved to kb_service._merge_hybrid_hits (P1b) so kw
+    # confirmation is honored before culling. Return up to top_k * 4 candidates
+    # so the merge has room — caller bounds final size after RRF + mirror fold.
+    candidates = raw[:max(top_k * 4, RRF_LIMIT)]
 
     logger.info(
         "kb_vector hybrid_search: q=%r results=%d embed_ms=%d milvus_ms=%d mode=%s",
-        q[:60], len(capped), embed_ms, milvus_ms,
+        q[:60], len(candidates), embed_ms, milvus_ms,
         "hybrid" if q_vec is not None else "bm25_only",
     )
 
-    out: list[dict] = [_normalize_hit(row) for row in capped]
+    out: list[dict] = [_normalize_hit(row) for row in candidates]
     return out
 
 

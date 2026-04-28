@@ -2933,6 +2933,14 @@ class SearchHit:
     # reader go ask them for context if needed. Empty string when no
     # uploader is known (shouldn't happen for valid rows).
     uploader_user_id: str = ""
+    # P4a — sha256 of the original file bytes; populated by the metadata
+    # join so the cross-user content-hash fold can collapse identical
+    # uploads from different team members.
+    content_hash: str = ""
+    # P4a — populated post-fold to tell the LLM "this doc was independently
+    # uploaded by N people" without exposing user IDs. Defaults to 1 (just
+    # the representative). Only > 1 after _collapse_by_content_hash runs.
+    also_uploaded_by_count: int = 1
 
 
 # ── Stub-chunk filter ─────────────────────────────────────────────
@@ -3082,7 +3090,99 @@ async def search_chunks(
             "user_kb search dropped %d stub chunk(s) from %d candidates (mode=%s, query=%r)",
             dropped, len(ranked), mode, query[:80],
         )
-    return filtered[:top_k]
+
+    raw_in = len(lex_hits) + len(vec_hits)
+    after_score_merge = len(filtered)
+
+    settings = get_settings()
+    # P4a — collapse same-bytes uploads from different team members.
+    collapsed_by_hash = 0
+    if getattr(settings, "user_kb_dedup_content_hash", True):
+        filtered, collapsed_by_hash = _collapse_by_content_hash(filtered)
+
+    # P4b — per-doc cap so a long PDF can't take all top_k slots.
+    cap = max(1, int(getattr(settings, "user_kb_per_doc_cap", 2)))
+    capped, collapsed_by_doc = _apply_per_doc_cap(filtered, cap=cap)
+
+    final = capped[:top_k]
+
+    # P0 — emit KB_DEDUP_STATS for user_kb_search.
+    try:
+        from backend.app.services.chat_debug import (
+            chat_trace, get_current_trace_id,
+        )
+        trace = chat_trace(trace_id=get_current_trace_id())
+        if hasattr(trace, "log_kb_dedup_stats"):
+            trace.log_kb_dedup_stats(
+                tool_name="user_kb_search",
+                query=query,
+                raw_in=raw_in,
+                after_score_merge=after_score_merge,
+                after_per_doc_cap=len(capped),
+                after_mirror_fold=len(capped),  # no mirror fold for user_kb
+                after_cross_call=len(final),    # cross-call suppression in formatter
+                final_top_k=len(final),
+                collapsed_by_doc=collapsed_by_doc,
+                collapsed_by_content_hash=collapsed_by_hash,
+            )
+    except Exception:
+        pass
+    return final
+
+
+def _collapse_by_content_hash(
+    hits: list[SearchHit],
+) -> tuple[list[SearchHit], int]:
+    """Fold same-bytes uploads from different team members into one row.
+
+    Hits with empty ``content_hash`` are passed through untouched (e.g. older
+    rows that predate the field). Subsequent matches accumulate into the
+    representative's ``also_uploaded_by_count`` so the formatter can surface
+    "uploaded by N team members" without exposing user IDs.
+    """
+    if not hits:
+        return hits, 0
+    seen: dict[str, SearchHit] = {}
+    seen_uploaders: dict[str, set[str]] = {}
+    out: list[SearchHit] = []
+    collapsed = 0
+    for h in hits:
+        ch = h.content_hash or ""
+        if not ch:
+            out.append(h)
+            continue
+        if ch in seen:
+            collapsed += 1
+            uploaders = seen_uploaders[ch]
+            if h.uploader_user_id:
+                uploaders.add(h.uploader_user_id)
+            seen[ch].also_uploaded_by_count = max(1, len(uploaders))
+            continue
+        seen[ch] = h
+        uploaders = {h.uploader_user_id} if h.uploader_user_id else set()
+        seen_uploaders[ch] = uploaders
+        h.also_uploaded_by_count = max(1, len(uploaders))
+        out.append(h)
+    return out, collapsed
+
+
+def _apply_per_doc_cap(
+    hits: list[SearchHit], *, cap: int,
+) -> tuple[list[SearchHit], int]:
+    """Cap consecutive chunks-from-same-doc to ``cap`` per document."""
+    if cap <= 0 or not hits:
+        return hits, 0
+    out: list[SearchHit] = []
+    counts: dict[str, int] = {}
+    collapsed = 0
+    for h in hits:
+        did = h.document_id
+        if counts.get(did, 0) >= cap:
+            collapsed += 1
+            continue
+        counts[did] = counts.get(did, 0) + 1
+        out.append(h)
+    return out, collapsed
 
 
 # ── Per-retriever implementations ──────────────────────────────
@@ -3205,7 +3305,14 @@ async def _vector_search_chunks(
     if doc_ids:
         cursor = _docs().find(
             {"_id": {"$in": doc_ids}},
-            {"title": 1, "original_filename": 1, "created_at": 1, "user_id": 1},
+            {
+                "title": 1, "original_filename": 1, "created_at": 1,
+                "user_id": 1,
+                # P4a — pulled here so the dense path's SearchHits carry
+                # content_hash for the cross-user fold without an extra
+                # round trip.
+                "content_hash": 1,
+            },
         )
         async for d in cursor:
             docs_by_id[str(d["_id"])] = d
@@ -3226,6 +3333,7 @@ async def _vector_search_chunks(
                 text=vh.text,
                 created_at=created.isoformat() if isinstance(created, datetime) else "",
                 uploader_user_id=str(doc.get("user_id") or vh.user_id or ""),
+                content_hash=str(doc.get("content_hash") or ""),
             )
         )
     return hits
@@ -3243,6 +3351,7 @@ def _row_to_hit(r: dict) -> SearchHit:
         text=r.get("text") or "",
         created_at=created.isoformat() if isinstance(created, datetime) else "",
         uploader_user_id=str(doc.get("user_id") or r.get("user_id") or ""),
+        content_hash=str(doc.get("content_hash") or ""),
     )
 
 

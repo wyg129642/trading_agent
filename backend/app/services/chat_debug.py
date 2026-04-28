@@ -477,14 +477,21 @@ class ChatTrace:
             "calls": normalised,
         }, round_num=round_num)
 
-    def log_tool_exec_start(self, tool_name: str, arguments: dict, round_num: int | None = None):
+    def log_tool_exec_start(
+        self,
+        tool_name: str,
+        arguments: dict,
+        round_num: int | None = None,
+        tool_call_id: str | None = None,
+    ):
         rn = round_num if round_num is not None else _current_round_num_var.get()
         _logger.info(
-            "%s | TOOL_EXEC_START | tool=%s round=%s args=%s",
-            self._prefix(), tool_name, rn, _safe_json(arguments, 800),
+            "%s | TOOL_EXEC_START | tool=%s tcid=%s round=%s args=%s",
+            self._prefix(), tool_name, tool_call_id, rn, _safe_json(arguments, 800),
         )
         self._emit("TOOL_EXEC_START", {
             "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
             "arguments": arguments,
             "round_num": rn,
         }, tool_name=tool_name, round_num=rn or None)
@@ -496,14 +503,15 @@ class ChatTrace:
         elapsed_ms: int,
         error: bool = False,
         round_num: int | None = None,
+        tool_call_id: str | None = None,
     ):
         rn = round_num if round_num is not None else _current_round_num_var.get()
         level = logging.WARNING if error else logging.INFO
         _logger.log(
             level,
-            "%s | TOOL_EXEC_DONE | tool=%s round=%s elapsed=%dms result_len=%d error=%s\n"
+            "%s | TOOL_EXEC_DONE | tool=%s tcid=%s round=%s elapsed=%dms result_len=%d error=%s\n"
             "  result_preview: %s",
-            self._prefix(), tool_name, rn, elapsed_ms, len(result), error,
+            self._prefix(), tool_name, tool_call_id, rn, elapsed_ms, len(result), error,
             _truncate(result, 1000),
         )
         # Count tool executions for run-level rollups.
@@ -516,23 +524,31 @@ class ChatTrace:
                 self._state["first_error"] = f"{tool_name}: {_truncate(result, 200)}"
         self._emit("TOOL_EXEC_DONE", {
             "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
             "result_len": len(result),
             "result": result,
             "error": error,
             "round_num": rn,
         }, tool_name=tool_name, latency_ms=elapsed_ms, round_num=rn or None)
 
-    def log_tool_timeout(self, tool_name: str, timeout_s: float, round_num: int | None = None):
+    def log_tool_timeout(
+        self,
+        tool_name: str,
+        timeout_s: float,
+        round_num: int | None = None,
+        tool_call_id: str | None = None,
+    ):
         rn = round_num if round_num is not None else _current_round_num_var.get()
         _logger.error(
-            "%s | TOOL_TIMEOUT | tool=%s round=%s timeout=%.0fs",
-            self._prefix(), tool_name, rn, timeout_s,
+            "%s | TOOL_TIMEOUT | tool=%s tcid=%s round=%s timeout=%.0fs",
+            self._prefix(), tool_name, tool_call_id, rn, timeout_s,
         )
         self._state["any_error"] = True
         if not self._state.get("first_error"):
             self._state["first_error"] = f"{tool_name} timed out after {timeout_s:.0f}s"
         self._emit("TOOL_TIMEOUT", {
             "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
             "timeout_s": timeout_s,
             "round_num": rn,
         }, tool_name=tool_name, round_num=rn or None)
@@ -984,6 +1000,59 @@ class ChatTrace:
             "result_count": result_count,
             "top_titles": list(top_titles or []),
             "src_distribution": src_counts,
+            "round_num": rn,
+        }, tool_name=tool_name, round_num=rn or None)
+
+    def log_kb_dedup_stats(
+        self,
+        tool_name: str,
+        query: str,
+        raw_in: int,
+        after_score_merge: int,
+        after_per_doc_cap: int,
+        after_mirror_fold: int,
+        after_cross_call: int,
+        final_top_k: int,
+        collapsed_by_chunk: int = 0,
+        collapsed_by_doc: int = 0,
+        collapsed_by_mirror: int = 0,
+        collapsed_by_cross_call: int = 0,
+        collapsed_by_content_hash: int = 0,
+        round_num: int | None = None,
+    ):
+        """Per-call dedup pipeline counters.
+
+        Emitted at the tail of kb_search and user_kb_search. Tracks how many
+        candidates entered each dedup stage and how many were collapsed at
+        each layer. Lets us measure P1-P4 effectiveness without code review.
+        """
+        rn = round_num if round_num is not None else _current_round_num_var.get()
+        _logger.info(
+            "%s | KB_DEDUP_STATS | tool=%s query='%s' raw_in=%d "
+            "after_score_merge=%d after_per_doc_cap=%d after_mirror_fold=%d "
+            "after_cross_call=%d final_top_k=%d "
+            "collapsed_by_chunk=%d collapsed_by_doc=%d collapsed_by_mirror=%d "
+            "collapsed_by_cross_call=%d collapsed_by_content_hash=%d round=%s",
+            self._prefix(), tool_name, _truncate(query, 120), raw_in,
+            after_score_merge, after_per_doc_cap, after_mirror_fold,
+            after_cross_call, final_top_k,
+            collapsed_by_chunk, collapsed_by_doc, collapsed_by_mirror,
+            collapsed_by_cross_call, collapsed_by_content_hash, rn,
+        )
+        self._emit("KB_DEDUP_STATS", {
+            "tool": tool_name,
+            "query": _truncate(query, 200),
+            "raw_in": raw_in,
+            "after_score_merge": after_score_merge,
+            "after_per_doc_cap": after_per_doc_cap,
+            "after_mirror_fold": after_mirror_fold,
+            "after_cross_call": after_cross_call,
+            "final_top_k": final_top_k,
+            "collapsed_by_chunk": collapsed_by_chunk,
+            "collapsed_by_doc": collapsed_by_doc,
+            "collapsed_by_mirror": collapsed_by_mirror,
+            "collapsed_by_cross_call": collapsed_by_cross_call,
+            "collapsed_by_content_hash": collapsed_by_content_hash,
             "round_num": rn,
         }, tool_name=tool_name, round_num=rn or None)
 

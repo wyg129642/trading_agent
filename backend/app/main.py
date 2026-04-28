@@ -518,6 +518,16 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("Failed to start kb_vector_sync (non-fatal)")
 
+    # P3a — Title / institution normalization backfill loop. Same staging-only
+    # ownership as kb_vector_sync (crawlers live in staging). Populates
+    # `_normalized_title` + `_inst_normalized` on each Mongo doc so the
+    # search-time mirror fold is a cheap dict lookup.
+    try:
+        from backend.app.services import kb_normalize_loop as _kb_norm
+        await _kb_norm.start_normalize_loop(settings)
+    except Exception:
+        logger.exception("Failed to start kb_normalize_loop (non-fatal)")
+
     # Realtime rule-based ticker enricher — replaces the 10-min cron with an
     # in-process 30s loop so freshly crawled docs are tagged before the LLM
     # fallback (below) sees them. Enabled by default; disable via
@@ -587,6 +597,11 @@ async def lifespan(app: FastAPI):
             await kb_vector_sync_svc.stop()
         except Exception:
             logger.exception("kb_vector_sync shutdown failed")
+    try:
+        from backend.app.services import kb_normalize_loop as _kb_norm
+        await _kb_norm.stop_normalize_loop()
+    except Exception:
+        logger.exception("kb_normalize_loop shutdown failed")
     try:
         from backend.app.services.quote_providers import futu_provider
         futu_provider.close_ctx()

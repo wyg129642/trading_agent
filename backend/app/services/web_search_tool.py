@@ -284,6 +284,28 @@ class CitationTracker:
     def __init__(self):
         self._sources: list[dict] = []
         self._key_to_index: dict[str, int] = {}
+        # P2 — track which kb chunks have already had their full body
+        # written into the LLM's tool-result stream this request. Subsequent
+        # tool-result formatters compress repeats to a `[N] (见前文 [N])`
+        # one-liner so the LLM doesn't pay for the same context twice.
+        self._emitted_chunk_keys: set[str] = set()
+
+    # ── P2: cross-call body suppression helpers ─────────────────────
+
+    def is_chunk_already_emitted(self, chunk_key: str) -> bool:
+        """True if this chunk's full body was emitted in a prior tool result.
+
+        ``chunk_key`` should be the most-specific stable identifier — for KB:
+        chunk_id when present, doc_id otherwise. For user_kb: the
+        ``f"{document_id}:{chunk_index}"`` composite. The caller is
+        responsible for choosing the key consistently with future calls.
+        """
+        return bool(chunk_key) and chunk_key in self._emitted_chunk_keys
+
+    def mark_chunk_emitted(self, chunk_key: str) -> None:
+        """Record that this chunk's full body just went into a tool result."""
+        if chunk_key:
+            self._emitted_chunk_keys.add(chunk_key)
 
     def _next_index(self) -> int:
         return len(self._sources) + 1

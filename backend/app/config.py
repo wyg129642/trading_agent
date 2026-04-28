@@ -433,6 +433,19 @@ class Settings(BaseSettings):
     # embedding model is swapped out. Bump when you change the model.
     embedding_model_version: str = "qwen3-emb-8b-v1"
 
+    # ── KB dedup pipeline (P1-P4 of fuzzy-puzzling-tiger plan) ──────
+    # Each flag isolates one stage so a problem in any one layer can be
+    # rolled back via .env without redeploy. See chat_debug
+    # KB_DEDUP_STATS for measurement.
+    kb_per_doc_cap: int = 2                       # P1b: max chunks per doc in merged top-K
+    kb_dedup_cross_call: bool = True              # P2: collapse already-emitted chunks across multi-call rounds
+    kb_dedup_mirrors: bool = True                 # P3b: (inst, normalized_title, day) cross-platform fold
+    kb_normalize_enabled: bool = True             # P3a: lifespan loop that backfills _normalized_title / _inst_normalized
+    kb_normalize_interval_seconds: int = 300      # P3a: sleep between batches
+    kb_normalize_batch_size: int = 200            # P3a: docs per batch
+    user_kb_dedup_content_hash: bool = True       # P4a: collapse same-bytes uploads across users
+    user_kb_per_doc_cap: int = 2                  # P4b: max chunks per doc in user_kb_search
+
     # App
     # APP_ENV is the single source of truth for multi-environment isolation.
     # Recognised values: "production" (default, no scoping), "staging"

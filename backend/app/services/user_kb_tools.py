@@ -137,6 +137,16 @@ def _format_search_result(hits: list[svc.SearchHit], citation_tracker: Any) -> s
     if not hits:
         return "在团队共享个人知识库中没有找到相关内容。"
 
+    from backend.app.config import get_settings
+    settings = get_settings()
+    dedup_cross_call = bool(getattr(settings, "kb_dedup_cross_call", True))
+    can_suppress = (
+        dedup_cross_call
+        and citation_tracker is not None
+        and hasattr(citation_tracker, "is_chunk_already_emitted")
+        and hasattr(citation_tracker, "mark_chunk_emitted")
+    )
+
     out: list[str] = ["共享知识库命中结果（按相关度降序）:"]
     for hit in hits:
         idx = None
@@ -159,8 +169,23 @@ def _format_search_result(hits: list[svc.SearchHit], citation_tracker: Any) -> s
                 idx = None
         prefix = f"[{idx}] " if idx is not None else "- "
         uploader = (hit.uploader_user_id or "?")[:8]  # short id for log compactness
+
+        # P4a — surface the cross-user "consensus" tag without leaking IDs.
+        also_n = int(getattr(hit, "also_uploaded_by_count", 1) or 1)
+        consensus_tag = f" 〈共 {also_n} 位团队成员上传〉" if also_n > 1 else ""
+
+        # P2 — suppress full body if this chunk was already streamed in a
+        # prior tool result this request.
+        chunk_key = f"user_kb:{hit.document_id}:{hit.chunk_index}"
+        if can_suppress and citation_tracker.is_chunk_already_emitted(chunk_key):
+            out.append(
+                f"{prefix}**{hit.title}**{consensus_tag} "
+                f"(已在本轮前次工具结果中给出完整片段，复用同一引用编号 [{idx}])"
+            )
+            continue
+
         header = (
-            f"{prefix}**{hit.title}** "
+            f"{prefix}**{hit.title}**{consensus_tag} "
             f"(文件:{hit.original_filename} · 段 {hit.chunk_index} · "
             f"上传:{hit.created_at[:10] if hit.created_at else '?'} · "
             f"uploader={uploader})"
@@ -169,6 +194,8 @@ def _format_search_result(hits: list[svc.SearchHit], citation_tracker: Any) -> s
         if len(body) > 1200:
             body = body[:1200] + "…"
         out.append(f"{header}\n{body}")
+        if can_suppress:
+            citation_tracker.mark_chunk_emitted(chunk_key)
     out.append(
         "\n如需读取完整文档，请调用 `user_kb_fetch_document(document_id=...)`。"
     )

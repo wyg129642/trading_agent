@@ -23,12 +23,17 @@ vector path in Phase B without changing the tool surface.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import re
 import time
+import unicodedata
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorCollection
@@ -751,7 +756,11 @@ def _build_filter(
 
 def _build_projection(spec: CollectionSpec) -> dict:
     """Only fetch fields we need for scoring + normalization."""
-    keep = {"_id": 1, spec.title_field: 1, "_canonical_tickers": 1}
+    keep = {
+        "_id": 1, spec.title_field: 1, "_canonical_tickers": 1,
+        # P3 mirror fold pre-computed at ingestion (see kb_normalize_loop).
+        "_normalized_title": 1, "_inst_normalized": 1,
+    }
     for f in spec.text_fields:
         keep[f] = 1
     if spec.date_str_field:
@@ -954,6 +963,11 @@ def _normalize_hit(spec: CollectionSpec, doc: dict, query: str) -> dict:
         url = str(u) if u else ""
     snippet = _build_snippet(text, query, 320)
     raw_id = str(doc.get("_id"))
+    # P3 — pre-populate normalized title / institution so the mirror fold
+    # doesn't have to round-trip Mongo for Phase A hits. Backfilled docs
+    # already carry these fields; for un-backfilled rows we compute on the fly.
+    norm_title = doc.get("_normalized_title") or _normalize_title(title)
+    norm_inst = doc.get("_inst_normalized") or _normalize_institution(inst)
     return {
         "doc_id": f"{spec.db}:{spec.collection}:{raw_id}",
         "source": spec.db,
@@ -967,6 +981,8 @@ def _normalize_hit(spec: CollectionSpec, doc: dict, query: str) -> dict:
         "tickers": tickers,
         "url": url,
         "text_len": len(text),
+        "_normalized_title": norm_title,
+        "_inst_normalized": norm_inst,
     }
 
 
@@ -1094,7 +1110,37 @@ async def search(
 
     vec_hits, kw_hits = await asyncio.gather(_run_vector(), _run_keyword())
 
-    return _merge_hybrid_hits(vec_hits, kw_hits, top_k=want_k)
+    settings = get_settings()
+    per_doc_cap = max(1, int(getattr(settings, "kb_per_doc_cap", 2)))
+    merged, merge_stats = _merge_hybrid_hits(
+        vec_hits, kw_hits, top_k=want_k, per_doc_cap=per_doc_cap,
+    )
+
+    # P3b — cross-platform mirror fold (inst, normalized_title, day).
+    raw_in = len(vec_hits) + len(kw_hits)
+    after_per_doc_cap = len(merged)
+    collapsed_by_mirror = 0
+    if getattr(settings, "kb_dedup_mirrors", True) and merged:
+        merged = await _hydrate_norm_fields(merged)
+        merged, collapsed_by_mirror = _collapse_mirrors(merged, enabled=True)
+    after_mirror_fold = len(merged)
+
+    # P0 — emit KB_DEDUP_STATS so each layer's effect is observable.
+    # `after_cross_call` and `final_top_k` are filled in by the formatter
+    # after suppression decisions; we log a partial here keyed by query so
+    # the formatter can amend.
+    _publish_dedup_stats(
+        tool_name="kb_search",
+        query=query,
+        raw_in=raw_in,
+        after_score_merge=merge_stats["after_score_merge"],
+        after_per_doc_cap=after_per_doc_cap,
+        after_mirror_fold=after_mirror_fold,
+        collapsed_by_doc=merge_stats["collapsed_by_doc"],
+        collapsed_by_mirror=collapsed_by_mirror,
+    )
+
+    return merged
 
 
 def _merge_hybrid_hits(
@@ -1102,49 +1148,355 @@ def _merge_hybrid_hits(
     keyword_hits: list[dict],
     *,
     top_k: int,
-) -> list[dict]:
-    """Merge Milvus (vector+BM25) hits with Mongo keyword hits by ``doc_id``.
+    per_doc_cap: int = 2,
+) -> tuple[list[dict], dict[str, int]]:
+    """Merge Milvus (vector+BM25) chunk hits with Mongo keyword doc hits.
 
-    Semantic score wins on duplicate. Ordering is an RRF-like blend: each engine
-    contributes ``1/(rank+k)`` points, summed across engines, then sorted.
-    k=60 matches the RRF constant Milvus uses internally, keeping the merge
-    stable regardless of individual score distributions.
+    Vector side carries chunk-level rows (multiple chunks per doc allowed up to
+    cap). Keyword side is doc-level. We RRF-fuse with per-engine ranks and key
+    by chunk_id when present (vec) else doc_id (kw). When kw matches a doc that
+    vec already returned chunks for, the kw rank's RRF mass is split evenly
+    across that doc's surfaced chunks — so kw confirmation lifts every chunk of
+    the matched doc. After fusion we sort by score, then enforce per-doc cap so
+    a single long transcript can't take all top_k slots.
+
+    Returns ``(merged_hits, dedup_counts)`` where ``dedup_counts`` carries
+    KB_DEDUP_STATS counters: ``after_score_merge`` and ``collapsed_by_doc``.
     """
     if not vector_hits and not keyword_hits:
-        return []
+        return [], {"after_score_merge": 0, "collapsed_by_doc": 0}
 
     rrf_k = 60
-    by_id: dict[str, dict] = {}
+    by_key: dict[str, dict] = {}
     score_sum: dict[str, float] = {}
+    doc_id_to_keys: dict[str, list[str]] = {}
 
-    def _doc_id(h: dict) -> str:
-        return str(h.get("doc_id") or "")
+    def _key_of(h: dict, fallback: str) -> str:
+        return str(h.get("chunk_id") or "") or str(h.get("doc_id") or "") or fallback
 
+    # Vector path — chunk-level entries; multiple chunks per doc are kept.
     for rank, hit in enumerate(vector_hits, start=1):
-        did = _doc_id(hit)
-        if not did:
+        did = str(hit.get("doc_id") or "")
+        key = _key_of(hit, fallback=f"vec:{rank}")
+        # Same chunk surfaced twice in vec list (shouldn't happen, but guard
+        # against dense+sparse fusion oddities) → accumulate.
+        if key in by_key:
+            score_sum[key] = score_sum.get(key, 0.0) + 1.0 / (rank + rrf_k)
             continue
-        by_id[did] = {**hit, "_engines": ["vector"]}
-        score_sum[did] = 1.0 / (rank + rrf_k)
+        # Stash the resolved key on the hit so the sort step uses the same
+        # identifier that score_sum was keyed by — defends against vec hits
+        # without chunk_id which would otherwise lose their score on lookup.
+        by_key[key] = {**hit, "_engines": ["vector"], "__merge_key": key}
+        score_sum[key] = 1.0 / (rank + rrf_k)
+        if did:
+            doc_id_to_keys.setdefault(did, []).append(key)
 
+    # Keyword path — doc-level entries; lift every existing vec chunk of the
+    # same doc, or insert a fresh doc-level row if vec didn't return anything.
     for rank, hit in enumerate(keyword_hits, start=1):
-        did = _doc_id(hit)
+        did = str(hit.get("doc_id") or "")
         if not did:
             continue
-        if did in by_id:
-            existing = by_id[did]
-            existing["_engines"] = sorted(set(existing.get("_engines", []) + ["keyword"]))
-            # Keep semantic snippet when present, but accept keyword snippet if
-            # the vector one is shorter than the keyword one (often richer).
-            if not existing.get("snippet") and hit.get("snippet"):
-                existing["snippet"] = hit["snippet"]
+        existing_keys = doc_id_to_keys.get(did)
+        if existing_keys:
+            boost = (1.0 / (rank + rrf_k)) / len(existing_keys)
+            for k in existing_keys:
+                score_sum[k] = score_sum.get(k, 0.0) + boost
+                row = by_key[k]
+                row["_engines"] = sorted(set(row.get("_engines", []) + ["keyword"]))
+                if not row.get("snippet") and hit.get("snippet"):
+                    row["snippet"] = hit["snippet"]
         else:
-            by_id[did] = {**hit, "_engines": ["keyword"]}
-        score_sum[did] = score_sum.get(did, 0.0) + 1.0 / (rank + rrf_k)
+            by_key[did] = {**hit, "_engines": ["keyword"], "__merge_key": did}
+            score_sum[did] = score_sum.get(did, 0.0) + 1.0 / (rank + rrf_k)
+            doc_id_to_keys.setdefault(did, []).append(did)
 
-    merged = list(by_id.values())
-    merged.sort(key=lambda h: -score_sum.get(_doc_id(h), 0.0))
-    return merged[:top_k]
+    after_score_merge = len(by_key)
+
+    merged = sorted(
+        by_key.values(),
+        key=lambda h: -score_sum.get(h.get("__merge_key") or "", 0.0),
+    )
+    for h in merged:
+        h.pop("__merge_key", None)  # internal — strip before returning
+
+    # Per-doc cap — applied after sort so we keep each doc's best-ranked chunks.
+    cap = max(1, int(per_doc_cap))
+    capped: list[dict] = []
+    doc_count: dict[str, int] = {}
+    collapsed_by_doc = 0
+    for h in merged:
+        did = str(h.get("doc_id") or "")
+        if did and doc_count.get(did, 0) >= cap:
+            collapsed_by_doc += 1
+            continue
+        if did:
+            doc_count[did] = doc_count.get(did, 0) + 1
+        capped.append(h)
+        if len(capped) >= top_k * 4:  # safety: don't iterate forever on huge lists
+            break
+
+    return capped[:top_k], {
+        "after_score_merge": after_score_merge,
+        "collapsed_by_doc": collapsed_by_doc,
+    }
+
+
+# ── Dedup stats observability (KB_DEDUP_STATS) ──────────────────
+#
+# ``search()`` and ``_format_search_result()`` are called sequentially on the
+# same task — ContextVar copies on task boundaries, so parallel kb_search
+# calls each get their own independent counter dict.
+
+_dedup_stats_var: ContextVar[dict[str, Any] | None] = ContextVar(
+    "kb_dedup_stats", default=None,
+)
+
+
+def _publish_dedup_stats(**counters: Any) -> None:
+    """Set/replace the running dedup counters for the current call."""
+    s = _dedup_stats_var.get()
+    if s is None:
+        s = {}
+        _dedup_stats_var.set(s)
+    s.update(counters)
+
+
+def _amend_dedup_stats(**counters: Any) -> None:
+    """Merge counter updates (e.g. cross-call collapse from formatter)."""
+    s = _dedup_stats_var.get()
+    if s is None:
+        s = {}
+        _dedup_stats_var.set(s)
+    s.update(counters)
+
+
+def _flush_dedup_stats(*, tool_name: str, query: str) -> None:
+    """Emit the accumulated counters to chat_trace and reset.
+
+    Called after the formatter has had a chance to record cross-call collapse.
+    Silently no-ops if chat_debug isn't wired (e.g. in unit tests).
+    """
+    s = _dedup_stats_var.get() or {}
+    if not s:
+        return
+    try:
+        from backend.app.services.chat_debug import chat_trace, get_current_trace_id
+        trace = chat_trace(trace_id=get_current_trace_id())
+        if hasattr(trace, "log_kb_dedup_stats"):
+            trace.log_kb_dedup_stats(
+                tool_name=tool_name,
+                query=query,
+                raw_in=int(s.get("raw_in", 0)),
+                after_score_merge=int(s.get("after_score_merge", 0)),
+                after_per_doc_cap=int(s.get("after_per_doc_cap", 0)),
+                after_mirror_fold=int(s.get("after_mirror_fold", 0)),
+                after_cross_call=int(s.get("after_cross_call", 0)),
+                final_top_k=int(s.get("final_top_k", 0)),
+                collapsed_by_chunk=int(s.get("collapsed_by_chunk", 0)),
+                collapsed_by_doc=int(s.get("collapsed_by_doc", 0)),
+                collapsed_by_mirror=int(s.get("collapsed_by_mirror", 0)),
+                collapsed_by_cross_call=int(s.get("collapsed_by_cross_call", 0)),
+                collapsed_by_content_hash=int(s.get("collapsed_by_content_hash", 0)),
+            )
+    except Exception:  # observability must not raise
+        pass
+    _dedup_stats_var.set(None)
+
+
+# ── Title / institution normalization (P3) ──────────────────────
+
+
+_TITLE_PUNCT_RE = re.compile(r"[^\w一-鿿]+", re.UNICODE)
+
+
+def _normalize_title(title: str) -> str:
+    """Whitespace + punctuation + full→half-width normalization.
+
+    Pure form: no brokerage-prefix stripping (institution itself is often
+    the brokerage; stripping would falsely collapse same-day reports from
+    different brokerages with the same title boilerplate).
+
+    Whitespace is stripped entirely (not just collapsed) — Chinese titles
+    vary widely on optional spacing (e.g. ``2026Q1业绩`` vs ``2026Q1 业绩``)
+    and we want both to canonicalize to the same key. This is safe because
+    we don't use the normalized form for human display, only for the
+    mirror-fold (inst, normalized_title, day) tuple.
+    """
+    if not title:
+        return ""
+    # NFKC: full-width → half-width, ligatures → ASCII
+    s = unicodedata.normalize("NFKC", title).lower().strip()
+    # Drop punctuation entirely. The remaining alphanumeric + CJK substring is
+    # robust against varying space/dash/em-dash conventions across platforms.
+    s = _TITLE_PUNCT_RE.sub("", s)
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+@lru_cache(maxsize=1)
+def _load_inst_aliases() -> dict[str, str]:
+    """Load institution-name → canonical alias map.
+
+    The file ``backend/app/services/ticker_data/inst_aliases.json`` is a
+    flat ``{"raw_name": "CANONICAL"}`` dict. Missing file or malformed
+    JSON → empty map (we degrade to literal-string matching).
+    """
+    here = Path(__file__).parent / "ticker_data" / "inst_aliases.json"
+    try:
+        with here.open(encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k).strip().lower(): str(v).strip().upper()
+                    for k, v in data.items() if k and v}
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("inst_aliases.json failed to load: %s", e)
+    return {}
+
+
+def _normalize_institution(inst: str) -> str:
+    """Map institution string to canonical key via alias table.
+
+    Falls back to NFKC + lowercase + trim of the raw string when no alias is
+    present. Keeps the field non-empty as long as the source field had content
+    so the mirror fold can match by literal name.
+    """
+    if not inst:
+        return ""
+    raw = unicodedata.normalize("NFKC", inst).strip().lower()
+    aliases = _load_inst_aliases()
+    return aliases.get(raw, raw)
+
+
+# ── Mirror fold (P3b) ──────────────────────────────────────────
+
+
+async def _hydrate_norm_fields(hits: list[dict]) -> list[dict]:
+    """Attach ``_normalized_title`` and ``_inst_normalized`` to each hit.
+
+    Phase A's `_legacy_search` already produces docs that have these fields
+    (after P3a backfill); Phase B's vector hits don't carry them, so we batch
+    them per (db, collection) and fetch from Mongo. Hits without parseable
+    doc_id, or whose Mongo doc has no normalized field, fall back to the
+    title/institution we have at hand.
+    """
+    if not hits:
+        return hits
+
+    # Group missing-field hits by Mongo (db, collection); each group → one
+    # `find({_id: $in: [...]})` round trip.
+    needs: dict[tuple[str, str], list[tuple[dict, str]]] = {}
+    for h in hits:
+        if h.get("_normalized_title") is not None and h.get("_inst_normalized") is not None:
+            continue
+        did = str(h.get("doc_id") or "")
+        if not did or did.count(":") < 2:
+            # No fetchable id → fall back to in-memory normalization.
+            h["_normalized_title"] = _normalize_title(h.get("title") or "")
+            h["_inst_normalized"] = _normalize_institution(h.get("institution") or "")
+            continue
+        db_name, coll_name, raw_id = did.split(":", 2)
+        needs.setdefault((db_name, coll_name), []).append((h, raw_id))
+
+    if not needs:
+        return hits
+
+    from bson import ObjectId
+
+    async def _fetch_group(db_name: str, coll_name: str, group: list[tuple[dict, str]]) -> None:
+        spec = SPECS_BY_KEY.get(f"{db_name}/{coll_name}")
+        if spec is None:
+            for h, _ in group:
+                h["_normalized_title"] = _normalize_title(h.get("title") or "")
+                h["_inst_normalized"] = _normalize_institution(h.get("institution") or "")
+            return
+        # Build _id list — most ids are ObjectId hex strings, but some
+        # platforms (alphapai/jinmen) use string ids.
+        ids: list[Any] = []
+        id_to_h: dict[str, dict] = {}
+        for h, raw_id in group:
+            id_to_h[raw_id] = h
+            try:
+                ids.append(ObjectId(raw_id))
+            except Exception:
+                ids.append(raw_id)
+        try:
+            cursor = _coll(spec).find(
+                {"_id": {"$in": ids}},
+                {"_normalized_title": 1, "_inst_normalized": 1, spec.title_field: 1,
+                 spec.institution_field or "_skip": 1},
+            )
+            async for d in cursor:
+                raw = str(d.get("_id"))
+                h = id_to_h.get(raw)
+                if h is None:
+                    continue
+                nt = d.get("_normalized_title")
+                if not nt:
+                    nt = _normalize_title(d.get(spec.title_field) or h.get("title") or "")
+                ni = d.get("_inst_normalized")
+                if not ni:
+                    ni = _normalize_institution(_extract_institution(spec, d) or h.get("institution") or "")
+                h["_normalized_title"] = nt
+                h["_inst_normalized"] = ni
+        except Exception as e:
+            logger.warning("hydrate_norm_fields failed for %s/%s: %s", db_name, coll_name, e)
+        # Anything we didn't get back → fall back to in-memory.
+        for h, _ in group:
+            if h.get("_normalized_title") is None:
+                h["_normalized_title"] = _normalize_title(h.get("title") or "")
+            if h.get("_inst_normalized") is None:
+                h["_inst_normalized"] = _normalize_institution(h.get("institution") or "")
+
+    await asyncio.gather(*(
+        _fetch_group(db, coll, grp) for (db, coll), grp in needs.items()
+    ))
+    return hits
+
+
+def _collapse_mirrors(
+    hits: list[dict], *, enabled: bool = True,
+) -> tuple[list[dict], int]:
+    """Fold cross-platform near-duplicates by (inst, normalized_title, day).
+
+    Same brokerage report mirrored across gangtise/alphapai/alphaengine has
+    different doc_ids but matching three-tuple. We keep the highest-ranked
+    representative and tag it with ``_mirror_count`` so the formatter can
+    surface "and N other platforms also carry this".
+
+    Three-tuple components must ALL be non-empty for the row to participate
+    — otherwise we'd collapse legitimately-different docs that happened to
+    miss a normalization field.
+    """
+    if not enabled or len(hits) <= 1:
+        return hits, 0
+    seen: dict[tuple[str, str, str], dict] = {}
+    out: list[dict] = []
+    collapsed = 0
+    for h in hits:
+        key = (
+            (h.get("_inst_normalized") or "").strip(),
+            (h.get("_normalized_title") or "").strip(),
+            (h.get("date") or "")[:10].strip(),
+        )
+        if not all(key):
+            out.append(h)
+            continue
+        if key in seen:
+            collapsed += 1
+            rep = seen[key]
+            rep["_mirror_count"] = int(rep.get("_mirror_count") or 1) + 1
+            # Track which sources mirror this doc — useful for transparency.
+            mirrors = rep.setdefault("_mirror_sources", [rep.get("source") or ""])
+            other = h.get("source") or ""
+            if other and other not in mirrors:
+                mirrors.append(other)
+            continue
+        seen[key] = h
+        out.append(h)
+    return out, collapsed
 
 
 async def _legacy_search(
@@ -1234,7 +1586,28 @@ async def _legacy_search(
         scored = [(1.0, sp, dc) for _, sp, dc in scored_rec]
 
     top = scored[:top_k]
-    return [_normalize_hit(spec, doc, q) for _sc, spec, doc in top]
+    hits = [_normalize_hit(spec, doc, q) for _sc, spec, doc in top]
+
+    # P3b — mirror fold also applies to the legacy path so KB_SEARCH_LEGACY=true
+    # behaves consistently with the hybrid path. _normalize_hit already populated
+    # _normalized_title / _inst_normalized so no extra hydration round-trip.
+    settings = get_settings()
+    raw_in = len(deduped)
+    after_score_merge = len(hits)
+    after_per_doc_cap = after_score_merge   # legacy has no cap (1 per doc/coll)
+    collapsed_by_mirror = 0
+    if getattr(settings, "kb_dedup_mirrors", True):
+        hits, collapsed_by_mirror = _collapse_mirrors(hits, enabled=True)
+
+    _publish_dedup_stats(
+        raw_in=raw_in,
+        after_score_merge=after_score_merge,
+        after_per_doc_cap=after_per_doc_cap,
+        after_mirror_fold=len(hits),
+        collapsed_by_doc=0,
+        collapsed_by_mirror=collapsed_by_mirror,
+    )
+    return hits
 
 
 # ── Fetch full document ─────────────────────────────────────────
@@ -1501,6 +1874,11 @@ def _format_search_result(hits: list[dict], citation_tracker: Any) -> str:
     When a citation tracker is provided, each hit is registered and the returned
     `citation_index` is used as the [N] marker — sharing the same index space as
     web_search / alphapai / jinmen so the LLM can cite any source uniformly.
+
+    P2 — cross-call body suppression: hits whose chunk_id (or doc_id) was
+    already emitted in a prior tool-result this request are collapsed to a
+    one-line `[N] (已在前次工具结果中给出全文)` reference. Citation index is
+    preserved so the LLM can still cite. Toggle via ``kb_dedup_cross_call``.
     """
     if not hits:
         return "（知识库内未找到相关结果。可尝试放宽筛选条件、扩大日期范围或换用不同关键词。）"
@@ -1509,6 +1887,16 @@ def _format_search_result(hits: list[dict], citation_tracker: Any) -> str:
         indexed = citation_tracker.add_kb_items(hits)
     else:
         indexed = [{**h, "citation_index": i + 1} for i, h in enumerate(hits)]
+
+    settings = get_settings()
+    dedup_cross_call = bool(getattr(settings, "kb_dedup_cross_call", True))
+    can_suppress = (
+        dedup_cross_call
+        and citation_tracker is not None
+        and hasattr(citation_tracker, "is_chunk_already_emitted")
+        and hasattr(citation_tracker, "mark_chunk_emitted")
+    )
+    suppressed_count = 0
 
     lines = [f"共找到 {len(indexed)} 条知识库结果："]
     for h in indexed:
@@ -1521,13 +1909,40 @@ def _format_search_result(hits: list[dict], citation_tracker: Any) -> str:
         snippet = (h.get("snippet") or "").strip()
         doc_id = h.get("doc_id") or ""
         ticker_s = ("[" + "/".join(tickers[:4]) + "]") if tickers else ""
-        header = f"[{idx}] 「{label}·{inst}·{date}」 {ticker_s} {title}".strip()
+        # Suppression key — chunk_id is finest, doc_id is coarser fallback.
+        chunk_key = str(h.get("chunk_id") or "") or doc_id
+        already_emitted = (
+            can_suppress and citation_tracker.is_chunk_already_emitted(chunk_key)
+        )
+        # Mirror surfacing — let the LLM know this report is consensus across N
+        # platforms even though we collapsed it to one row.
+        mirror_n = int(h.get("_mirror_count") or 1)
+        mirror_tag = f" 〈跨平台镜像 ×{mirror_n}〉" if mirror_n > 1 else ""
+
+        if already_emitted:
+            suppressed_count += 1
+            lines.append(
+                f"[{idx}] 「{label}·{inst}·{date}」{mirror_tag} {title}"
+                f"  (已在本轮前次工具结果中给出完整片段，复用同一引用编号 [{idx}])"
+            )
+            continue
+
+        header = f"[{idx}] 「{label}·{inst}·{date}」{mirror_tag} {ticker_s} {title}".strip()
         lines.append(header)
         if snippet:
             lines.append(f"    摘要: {snippet}")
         if doc_id:
             lines.append(f"    doc_id: {doc_id}  (如需完整原文，调用 kb_fetch_document)")
         lines.append("")
+        if can_suppress and chunk_key:
+            citation_tracker.mark_chunk_emitted(chunk_key)
+
+    # P0 — finalize KB_DEDUP_STATS for this call.
+    _amend_dedup_stats(
+        after_cross_call=len(indexed) - suppressed_count,
+        final_top_k=len(indexed),
+        collapsed_by_cross_call=suppressed_count,
+    )
     return "\n".join(lines).rstrip()
 
 
@@ -1861,7 +2276,10 @@ async def execute_tool(
                     top_titles=[(h.get("title") or "")[:160] for h in hits[:10]],
                     sources=[h.get("source") for h in hits[:10]],
                 )
-            return _format_search_result(hits, citation_tracker)
+            try:
+                return _format_search_result(hits, citation_tracker)
+            finally:
+                _flush_dedup_stats(tool_name="kb_search", query=query)
 
         if name == "kb_fetch_document":
             doc_id = (arguments.get("doc_id") or "").strip()
