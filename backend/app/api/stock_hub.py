@@ -1059,6 +1059,12 @@ async def _query_breaking_news(
         ],
         *[NewsItem.title.ilike(f"%{_escape_like(p)}%") for p in like_patterns],
     )
+    # 雪球热榜 ingestion stores the raw Xueqiu API response (encrypted WAF
+    # token + base64 ciphertext) under `content`, so the cards render as
+    # gibberish. Filter the source out of the StockHub breaking-news pull
+    # until the upstream decoder is fixed.
+    SOURCE_BLOCKLIST = ("雪球热榜",)
+    source_filter = NewsItem.source_name.notin_(SOURCE_BLOCKLIST)
 
     from datetime import datetime, timezone
 
@@ -1069,6 +1075,7 @@ async def _query_breaking_news(
         select(func.count(NewsItem.id.distinct()))
         .outerjoin(AnalysisResult, AnalysisResult.news_item_id == NewsItem.id)
         .where(ticker_match)
+        .where(source_filter)
     )
     total = (await db.execute(count_q)).scalar() or 0
     if total == 0 or not with_fetch:
@@ -1078,6 +1085,7 @@ async def _query_breaking_news(
         select(NewsItem, AnalysisResult)
         .outerjoin(AnalysisResult, AnalysisResult.news_item_id == NewsItem.id)
         .where(ticker_match)
+        .where(source_filter)
     )
     if before_ms is not None:
         stmt = stmt.where(
