@@ -167,6 +167,18 @@ PLATFORMS: dict[str, PlatformSpec] = {
         login_hint="可选: 浏览器登录 newsletter.semianalysis.com 后复制整串 document.cookie (含 substack.sid=...). 留空即匿名模式.",
         login_needs_password=False,
     ),
+    "wechat_mp": PlatformSpec(
+        key="wechat_mp",
+        display_name="微信公众号 (mp.weixin.qq.com)",
+        dir_name="wechat_mp",
+        token_fields=("token",),
+        supports_auto_login=True,
+        login_hint="扫码登录公众号管理员后台 (需已注册公众号的微信号). "
+                   "session ~4 天后失效, 撞 401/-6 时自动标 expired.",
+        login_needs_password=False,
+        login_mode="qr",
+        supports_qr_login=True,
+    ),
 }
 
 
@@ -524,6 +536,8 @@ def _build_data_sources() -> dict[str, tuple[str, tuple[str, ...]]]:
         # 2026-04-24 迁到独立 foreign-website DB (之前 co-host 在 funda)
         "semianalysis": (getattr(s, "semianalysis_mongo_db", "foreign-website"),
                         (getattr(s, "semianalysis_collection", "semianalysis_posts"),)),
+        # 微信公众号 (mp.weixin.qq.com) — 2026-04-29 直采
+        "wechat_mp":   (getattr(s, "wechat_mp_mongo_db", "wechat-mp"), ("articles",)),
     }
 
 
@@ -1377,6 +1391,61 @@ async def _probe_alphaengine(creds: dict, timeout: float = 10.0) -> tuple[str, s
     return "unknown", f"200 OK 但无 _final 事件: {detail}"
 
 
+async def _probe_wechat_mp(creds: dict, timeout: float = 10.0) -> tuple[str, str]:
+    """探活: 用 searchbiz 调一个肯定不会撞结果的关键字, 看 base_resp.ret。
+    quota 成本 1 (列入正常使用配额; 平台日上限 ~500, 探活每分钟一次仍可控)。
+    """
+    import httpx
+    import random as _random
+
+    tok = (creds or {}).get("token", "")
+    cookies_list = (creds or {}).get("cookies") or []
+    if not tok:
+        return "expired", "no token"
+    if not cookies_list:
+        return "expired", "no cookies"
+
+    url = "https://mp.weixin.qq.com/cgi-bin/searchbiz"
+    cookies = {c.get("name"): c.get("value")
+               for c in cookies_list if c.get("name") and c.get("value")}
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": f"https://mp.weixin.qq.com/cgi-bin/home?t=home/index&token={tok}&lang=zh_CN",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "*/*",
+    }
+    params = {
+        "action": "search_biz", "token": tok, "lang": "zh_CN",
+        "f": "json", "ajax": "1",
+        "random": f"{_random.random():.16f}",
+        "query": "__probe_no_match__zzz", "begin": "0", "count": "5",
+    }
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        resp = await client.get(url, params=params, headers=headers, cookies=cookies)
+    if resp.status_code in (302, 401, 403):
+        return "expired", f"HTTP {resp.status_code} (重定向到登录页)"
+    if resp.status_code != 200:
+        return "unknown", f"HTTP {resp.status_code}"
+    try:
+        body = resp.json()
+    except Exception:
+        return "unknown", f"非 JSON 响应 (前 80 字符): {resp.text[:80]}"
+    base = body.get("base_resp") or {}
+    ret = base.get("ret")
+    msg = base.get("err_msg") or ""
+    if ret == 0:
+        total = body.get("total")
+        return "ok", f"searchbiz 响应正常 · total={total}"
+    if ret == -6 or "login" in msg.lower():
+        return "expired", f"会话失效 ret={ret} msg={msg}"
+    if ret in (200013, 200002) or "freq" in msg.lower():
+        return "ratelimited", f"频率限制 ret={ret} msg={msg}"
+    return "unknown", f"未识别 ret={ret} msg={msg}"
+
+
 _DIRECT_PROBES = {
     "alphapai": _probe_alphapai,
     "gangtise": _probe_gangtise,
@@ -1386,4 +1455,5 @@ _DIRECT_PROBES = {
     "jinmen": _probe_jinmen,
     "sentimentrader": _probe_sentimentrader,
     "alphaengine": _probe_alphaengine,
+    "wechat_mp": _probe_wechat_mp,
 }

@@ -186,6 +186,11 @@ class Settings(BaseSettings):
     alphaengine_mongo_db: str = "alphaengine"
     alphaengine_pdf_dir: str = "/home/ygwang/crawl_data/alphaengine_pdfs"
 
+    # 微信公众号 (mp.weixin.qq.com) 直采 (2026-04-29 上线)
+    wechat_mp_mongo_uri: str = REMOTE_CRAWL_MONGO_URI
+    wechat_mp_mongo_db: str = "wechat-mp"
+    wechat_mp_image_root: str = "/home/ygwang/crawl_data/wechat_mp_images"
+
     # AceCamp 内容字段直接从 API 拿到 markdown 全文, 绝大多数无独立 PDF —
     # 仅 can_download 的少数文章会写入此目录 (/articles/download_url 返回 S3 URL)
     acecamp_pdf_dir: str = "/home/ygwang/crawl_data/acecamp_pdfs"

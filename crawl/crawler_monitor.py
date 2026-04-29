@@ -92,6 +92,7 @@ PLATFORMS = [
     {"key": "alphaengine", "label": "AlphaEngine · 阿尔法引擎", "color": "#b388ff"},
     {"key": "semianalysis","label": "SemiAnalysis",           "color": "#ffd166"},
     {"key": "the_information", "label": "The Information",    "color": "#7dd3fc"},
+    {"key": "wechat_mp",   "label": "微信公众号 · MP",       "color": "#07c160"},
 ]
 
 SOURCES = [
@@ -479,6 +480,23 @@ SOURCES = [
         "log": ROOT / "the_information" / "logs" / "watch.log",
         "proc_match": r"the_information.*scraper\.py",
         "item_fields": ["title", "category", "release_time"],
+        "time_field": "release_time",
+    },
+    # --- 微信公众号 (mp.weixin.qq.com) — 2026-04-29 ---
+    # MP 后台路径直采, 白名单起步只 1 号 (机器之心). state_id 在 scraper.py 是
+    # `crawler_account_<name>` 格式, 这里取机器之心一条做指标主面;
+    # 后续如果 accounts.yaml 加号, 这里也要并行加新条目 (像 alphapai 那样).
+    {
+        "platform": "wechat_mp",
+        "key": "wechat_mp_default",
+        "label": "公众号文章",
+        "db": "wechat-mp",
+        "collection": "articles",
+        "state_id": "crawler_account_机器之心",
+        "doc_filter": {},
+        "log": ROOT / "wechat_mp" / "logs" / "watch.log",
+        "proc_match": r"wechat_mp.*scraper\.py",
+        "item_fields": ["title", "account_name", "release_time"],
         "time_field": "release_time",
     },
 ]
@@ -1685,6 +1703,19 @@ ALL_SCRAPERS: list[tuple] = [
                     "--days", "14"],                    "watch.log"),
     ("dart",       ["--watch", "--interval", "7200",
                     "--days", "30"],                    "watch.log"),
+
+    # ─── 微信公众号 (mp.weixin.qq.com) — 2026-04-29 ───────────────────────
+    # MP 后台直采,白名单 accounts.yaml 起步只放机器之心 1 号. 单 watcher
+    # 跑全表(轮询所有 enabled 公众号),10 min 一轮,每号轮内命中 dupe 即停.
+    # 反爆参数对齐 tmwgsicp/wechat-download-api 实测值: 3s base + 2s jitter,
+    # cap 500/天 (公众号 admin 账号 ~4 天 session, 单号超 500/天有封号风险).
+    # 触发 401/-6 → SessionDead → watcher 退出,credential_manager 标 expired,
+    # 前端 DataSources 红灯提示重新扫码.
+    ("wechat_mp",  ["--watch", "--resume", "--interval", "600",
+                    "--throttle-base", "3.0", "--throttle-jitter", "2.0",
+                    "--burst-size", "30",
+                    "--burst-cooldown-min", "30", "--burst-cooldown-max", "60",
+                    "--daily-cap", "500"],              "watch.log"),
 ]
 
 

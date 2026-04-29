@@ -69,6 +69,9 @@ PLATFORM_LOCALE: dict[str, dict[str, str]] = {
                     "accept_lang": "zh-CN,zh;q=0.9,en;q=0.6"},
     "thirdbridge": {"locale": "zh-CN", "timezone_id": "Asia/Shanghai",
                     "accept_lang": "zh-CN,zh;q=0.9,en;q=0.6"},
+    # 微信公众号管理后台 mp.weixin.qq.com — 扫码登录,session ~4 天后失效
+    "wechat_mp":   {"locale": "zh-CN", "timezone_id": "Asia/Shanghai",
+                    "accept_lang": "zh-CN,zh;q=0.9,en;q=0.6"},
     # US sites — match US user baseline to avoid locale-IP mismatch the other
     # way (Shanghai IP + US locale is uncommon but so is CN locale for
     # Funda/SentimenTrader's subscriber base).

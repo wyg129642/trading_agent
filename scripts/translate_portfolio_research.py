@@ -53,9 +53,10 @@ logger = logging.getLogger("translate_portfolio")
 # already store native zh titles (alphapai, jinmen, alphaengine — Chinese
 # headlines on every doc) are skipped on title to avoid noise.
 DEFAULT_TARGETS: list[tuple[str, str, list[str]]] = [
-    ("gangtise-full", "researches",           ["title", "content_md", "brief_md"]),
-    ("gangtise-full", "summaries",            ["title", "content_md", "brief_md"]),
-    ("gangtise-full", "chief_opinions",       ["title", "content_md", "brief_md", "description_md"]),
+    # Gangtise 三集合 (researches / summaries / chief_opinions) 已通过平台原生
+    # translatedBrief / translatedFormattedBrief / translatedTitle 提供 100%
+    # 中文翻译 (外资研报; 内资本身就是中文). backend/app/api/stock_hub.py 通过
+    # native_zh_paths 直接消费这些字段, 不需要 LLM 翻译. (2026-04-29 移除)
     ("alphaengine",   "foreign_reports",      ["content_md", "doc_introduce"]),
     ("alphaengine",   "china_reports",        ["content_md", "doc_introduce"]),
     ("funda",         "posts",                ["title", "content_md"]),
@@ -69,15 +70,18 @@ DEFAULT_TARGETS: list[tuple[str, str, list[str]]] = [
     # "JPM | APAC THEMATICS"). list_item.titleCn / list_item.contentCn
     # cover most of these natively, so stock_hub prefers them first; the
     # LLM `title_zh` is only the fallback when titleCn is empty.
-    ("alphapai-full", "reports",              ["title", "content_md"]),
+    # pdf_text_md = full PDF body extracted by extract_pdf_texts.py — for
+    # foreign-broker reports it's English even when the platform supplies a
+    # Chinese summary, so translate it too.
+    ("alphapai-full", "reports",              ["title", "content_md", "pdf_text_md"]),
     ("alphapai-full", "roadshows",            ["title", "content_md", "transcript_md"]),
-    # jinmen oversea_reports / reports / meetings sometimes have English
-    # titles (e.g. "17 Education...Q4 2025 Earnings Call"); body fields are
-    # already Chinese-summarized by jinmen so only `title` needs LLM.
-    ("jinmen-full",   "oversea_reports",      ["title", "content_md"]),
-    ("jinmen-full",   "reports",              ["title", "content_md"]),
+    # jinmen oversea_reports has English PDF bodies (Goldman/MS broker
+    # notes) under pdf_text_md while summary_md is jinmen's Chinese AI
+    # digest — both deserve a `_zh` so the drawer renders fully in Chinese.
+    ("jinmen-full",   "oversea_reports",      ["title", "content_md", "pdf_text_md"]),
+    ("jinmen-full",   "reports",              ["title", "content_md", "pdf_text_md"]),
     ("jinmen-full",   "meetings",             ["title", "content_md", "summary_md"]),
-    ("jiuqian-full",  "forum",                ["title", "content_md", "summary_md", "expert_content_md"]),
+    ("jiuqian-full",  "forum",                ["title", "content_md", "summary_md", "expert_content_md", "pdf_text_md"]),
     ("third-bridge",  "interviews",           ["title", "transcript_md", "agenda_md"]),
     ("acecamp",       "articles",             ["title", "content_md", "transcribe_md", "summary_md"]),
 ]

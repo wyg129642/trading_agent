@@ -435,6 +435,8 @@ const VIEWER_SECTIONS: Record<string, { key: string; label: string }[]> = {
   funda:       [{ key: 'home', label: '主页' }],
   acecamp:     [{ key: 'home', label: '主页' }],
   thirdbridge: [{ key: 'home', label: '全部论坛' }],
+  // 微信公众号管理后台 — 扫码登录后跳到 home/index 页, 这里做主页 deep-link
+  wechat_mp:   [{ key: 'home', label: '后台首页' }],
   // meritco viewer seeds localStorage.token + X-User-Type (2026-04-24);
   // sections above drive the deep-link menu.
 }

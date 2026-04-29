@@ -60,12 +60,16 @@ DEFAULT_TARGETS: list[tuple[str, str, list[str]]] = [
     ("ir_filings",    "sec_edgar",            ["title", "pdf_text_md"]),
     ("ir_filings",    "hkex",                 ["title", "pdf_text_md"]),
     ("ir_filings",    "asx",                  ["title", "pdf_text_md"]),
-    ("alphapai-full", "reports",              ["title", "content_md"]),
+    # `pdf_text_md` = full PDF body extracted by extract_pdf_texts.py (Tika/
+    # pypdf). For foreign-broker reports the body is English even when the
+    # platform supplies a Chinese summary, so translate it too. Long PDFs
+    # are chunked by LongTranslator (~6K chars/chunk).
+    ("alphapai-full", "reports",              ["title", "content_md", "pdf_text_md"]),
     ("alphapai-full", "roadshows",            ["title", "content_md", "transcript_md"]),
-    ("jinmen-full",   "oversea_reports",      ["title", "content_md"]),
-    ("jinmen-full",   "reports",              ["title", "content_md"]),
+    ("jinmen-full",   "oversea_reports",      ["title", "content_md", "pdf_text_md"]),
+    ("jinmen-full",   "reports",              ["title", "content_md", "pdf_text_md"]),
     ("jinmen-full",   "meetings",             ["title", "content_md", "summary_md"]),
-    ("jiuqian-full",  "forum",                ["title", "content_md", "summary_md", "expert_content_md"]),
+    ("jiuqian-full",  "forum",                ["title", "content_md", "summary_md", "expert_content_md", "pdf_text_md"]),
     ("third-bridge",  "interviews",           ["title", "transcript_md", "agenda_md"]),
     ("acecamp",       "articles",             ["title", "content_md", "transcribe_md", "summary_md"]),
 ]

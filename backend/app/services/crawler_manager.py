@@ -269,6 +269,20 @@ SPECS: dict[str, CrawlerSpec] = {
         # Requires crtfc_key in crawl/dart/credentials.json.
         "default": ("--watch", "--interval", "7200", "--days", "30"),
     }),
+
+    # 微信公众号 (mp.weixin.qq.com) 直采 (2026-04-29).
+    # 单 variant `default`, 跑 accounts.yaml 全表;白名单起步只放机器之心 1 个.
+    # 反爆参数对齐 tmwgsicp/wechat-download-api 实测值: 3s base + 2s jitter,
+    # daily-cap 500/天 (公众号管理员账号 ~4 天 session, 单号超 500/天有封号风险).
+    # interval 600s (10 min) — 文章日均 ~5 篇, 10 min 一轮足够追实时.
+    "wechat_mp":  CrawlerSpec("wechat_mp", "wechat_mp", {
+        "default": ("--watch", "--resume",
+                    "--interval", "600",
+                    "--throttle-base", "3.0", "--throttle-jitter", "2.0",
+                    "--burst-size", "30",
+                    "--burst-cooldown-min", "30", "--burst-cooldown-max", "60",
+                    "--daily-cap", "500"),
+    }),
 }
 
 
@@ -304,6 +318,7 @@ _VARIANT_LOG_NAME = {
     ("alphaengine", "news"):           "watch_news.log",
     ("alphaengine", "detail_enrich"):  "watch_detail_enrich.log",
     ("semianalysis", "default"):       "watch.log",
+    ("wechat_mp",    "default"):       "watch.log",
 }
 
 

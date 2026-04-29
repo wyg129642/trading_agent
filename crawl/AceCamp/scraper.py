@@ -345,6 +345,41 @@ def fetch_opinions_list(session, page: int, size: int) -> dict:
 
 # ==================== 详情抓取 ====================
 
+def probe_session_alive(session) -> tuple[bool, str]:
+    """启动期登录态探活 (2026-04-29).
+
+    AceCamp Rails session 自然过期 (~24h inactivity) 后, list 端点对匿名仍开放
+    返回公开摘要, 但 detail 接口对匿名一律 paywall (返 ret=False code=10003).
+    继续跑只能写 skipped_empty 浪费 CPU + 误判 quota 烧光; 父进程 (backfill_6months
+    / crawler_monitor) 还会反复 spawn 也是空转. 用 users/me 的 data:null 信号
+    在启动期硬拦, 让 watcher 直接 exit, 引导用户在 viewer 重登补 cookie.
+
+    return (alive, msg). alive=False 表示匿名/失效 → 调用方应 sys.exit(2).
+    """
+    try:
+        resp = api_call(session, "GET", "/users/me",
+                        params={"get_follows": "true", "with_owner": "true",
+                                "with_resume": "true", "version": "2.0"},
+                        retries=1, timeout=10)
+    except SessionDead as e:
+        return False, f"users/me 抛 SessionDead: {e}"
+    except Exception as e:
+        # 网络/解析错 — 不阻塞启动, 让正常爬流程兜底
+        return True, f"探活异常 {type(e).__name__}: {str(e)[:120]} (放行)"
+    if not isinstance(resp, dict):
+        return True, f"users/me 非 JSON 响应 (放行)"
+    user = resp.get("data")
+    if isinstance(user, dict) and (user.get("id") or user.get("user_id") or user.get("username")):
+        uid = user.get("id") or user.get("user_id")
+        name = user.get("username") or user.get("name") or user.get("nick_name") or ""
+        return True, f"user_id={uid}{(' name=' + str(name)) if name else ''}"
+    if user is None and resp.get("ret") is True:
+        return False, "users/me data=null — Rails session 已失效 (匿名 session)"
+    code = resp.get("code")
+    msg = str(resp.get("msg") or "")
+    return False, f"users/me 异常 code={code} {msg[:80]}"
+
+
 # Detail 端点连续失败/空正文的上限. 账号被封控时 detail 会稳定返回
 # code=10003/10040 (quota 耗尽) 或正文为空, 但 list 端点仍然能返摘要,
 # 如果不早停, scraper 就会一直 upsert 新 doc, content_md 全是空壳 —
@@ -1412,6 +1447,19 @@ def main():
     if args.today:
         count_today(session, db, args)
         return
+
+    # 启动期登录态硬拦 (2026-04-29): users/me data:null = 匿名 session →
+    # detail 全 paywall, 继续跑只会 skipped_empty 浪费 CPU. 直接退出, 让运维
+    # 在 DataSources 实时查看里重登. show_state/today/clean/reset_state 等
+    # 管理路径已在上面 return, 不会跑到这里.
+    alive, msg = probe_session_alive(session)
+    if not alive:
+        print(f"\n[ERROR] 登录态失效 — {msg}")
+        print(f"  → cookie 仍能调 list 但 detail 全部 paywall, 继续抓只会写 skipped_empty.")
+        print(f"  → 修复: 在 DataSources 页面点 acecamp 实时查看, 浏览器内完成登录,")
+        print(f"     cdp_screencast 会自动写回 credentials.json, 之后重启 scraper.")
+        sys.exit(2)
+    print(f"[auth] 登录态 OK ({msg})")
 
     # 首次抓元数据
     if db[COL_ACCOUNT].estimated_document_count() == 0 or args.force:

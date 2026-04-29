@@ -140,7 +140,7 @@ async def list_interviews(
     user: User = Depends(get_current_user),
 ):
     coll = _db()["interviews"]
-    match: dict[str, Any] = {}
+    match: dict[str, Any] = {"deleted": {"$ne": True}}
     if q:
         match["$or"] = [
             {"title": {"$regex": q, "$options": "i"}},
@@ -205,6 +205,11 @@ async def get_interview(interview_id: str, user: User = Depends(get_current_user
         doc = await coll.find_one({"uuid": interview_id})
     if not doc:
         raise HTTPException(404, "Interview not found")
+    if doc.get("deleted"):
+        raise HTTPException(
+            410,
+            f"Interview was soft-deleted (reason={doc.get('_deleted_reason') or 'unknown'})",
+        )
 
     brief = _brief(doc)
     return {
@@ -223,12 +228,17 @@ async def get_stats(user: User = Depends(get_current_user)):
     coll = _db()["interviews"]
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    total = await coll.count_documents({})
-    today = await coll.count_documents({"release_time": {"$regex": f"^{today_str}"}})
-    with_transcript = await coll.count_documents({"stats.转录字数": {"$gt": 0}})
+    visible = {"deleted": {"$ne": True}}
+    total = await coll.count_documents(visible)
+    today = await coll.count_documents(
+        {**visible, "release_time": {"$regex": f"^{today_str}"}}
+    )
+    with_transcript = await coll.count_documents(
+        {**visible, "stats.转录字数": {"$gt": 0}}
+    )
 
     latest_doc = await coll.find_one(
-        {}, sort=[("release_time_ms", -1)], projection={"release_time": 1}
+        visible, sort=[("release_time_ms", -1)], projection={"release_time": 1}
     )
     latest = latest_doc.get("release_time") if latest_doc else None
 

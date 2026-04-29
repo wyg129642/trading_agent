@@ -182,6 +182,10 @@ SOURCES: list[_Source] = [
             ("中文正文", "list_item.contentCn"),
             ("正文", "content"),
             ("摘要", "list_item.content"),
+            # AlphaPai's web fields are short (titles + 500-char snippets);
+            # the actual report body lives in the PDF and is extracted to
+            # pdf_text_md by extract_pdf_texts.py. 98% coverage.
+            ("PDF 正文", "pdf_text_md"),
         ),
         source_label="AlphaPai · 研报",
         # AlphaPai mirrors foreign-broker (JPM/MS/GS) reports verbatim — title
@@ -240,6 +244,10 @@ SOURCES: list[_Source] = [
         body_sections=(
             ("要点", "summary_point_md"),
             ("摘要", "summary_md"),
+            # PDF 全文 — extract_pdf_texts.py writes pdf_text_md (Tika first,
+            # pypdf fallback). 99% of reports have it; surface so the drawer
+            # shows the full body, not just the AI-generated summary.
+            ("PDF 正文", "pdf_text_md"),
         ),
         id_coerce="int-or-str",
         source_label="进门 · A股研报",
@@ -256,6 +264,10 @@ SOURCES: list[_Source] = [
         body_sections=(
             ("要点", "summary_point_md"),
             ("摘要", "summary_md"),
+            # 88% of oversea_reports have pdf_text_md (extract_pdf_texts.py
+            # cron). The summary_md is jinmen's AI digest (~1K chars); the
+            # full text in pdf_text_md is the actual broker note body.
+            ("PDF 正文", "pdf_text_md"),
         ),
         id_coerce="int-or-str",
         source_label="进门 · 海外研报",
@@ -285,9 +297,18 @@ SOURCES: list[_Source] = [
         org_field="organization",
         pdf_route="/api/gangtise-db/items/research/{id}/pdf",
         pdf_gate=("pdf_local_path", "pdf_size_bytes"),
+        # 2026-04-29 重排为"简介 + 正文":
+        #   - 简介 = brief_md (formattedBrief 回填后, 外资 ~2785 字).
+        #     native_zh_paths 已挂 translatedBrief / translatedFormattedBrief
+        #     提供原生中文版, 不再走 LLM 翻译.
+        #   - 正文 = pdf_text_md (PDF 抽出全文 ~30-90k 字; 真完整 a)/b)/c)
+        #     列表在这里). 内资 pdf_text_md 暂空 → section 自动 drop, 等
+        #     extract_pdf_texts.py cron 抽完会自动出现.
+        # 移除 content_md (dump_research:926 把它写成 brief 副本, 再展示
+        # 就是重复).
         body_sections=(
-            ("摘要", "brief_md"),
-            ("正文", "content_md"),
+            ("简介", "brief_md"),
+            ("正文", "pdf_text_md"),
         ),
         source_label="岗底斯 · 研报",
         # Gangtise itself supplies a free Chinese translation on every foreign
@@ -334,9 +355,15 @@ SOURCES: list[_Source] = [
         # side by side.
         preview_field=("description_md", "brief_md", "content_md"),
         org_field="organization",
+        # 2026-04-29: chief_opinions 含 parsed_msg.rptId 时是同一篇 researches
+        # 的"首席观点"分发. 详情接口会运行时 join researches[rptId], 把
+        # researches.brief_md (formattedBrief 回填后的完整原生摘要) 灌到
+        # _joined_full_brief; chief 自身的 brief/content 是平台老截断版, 优先
+        # 走 join 过来的完整 brief. 不展示 PDF 全文 — chief 对应卡片就保持
+        # "完整原生摘要"形态.
         body_sections=(
             ("简介", "description_md"),
-            ("正文", ("content_md", "brief_md")),
+            ("正文", ("_joined_full_brief", "content_md", "brief_md")),
         ),
         source_label="岗底斯 · 首席观点",
         # chief_opinions stores the upstream translation in parsed_msg.
@@ -348,6 +375,12 @@ SOURCES: list[_Source] = [
             "content_md":     "parsed_msg.translatedDescription",
             "brief_md":       "parsed_msg.translatedDescription",
             "title":          "parsed_msg.translatedTitle",
+            # 2026-04-29: chief→research 运行时 join 时灌 _joined_full_brief
+            # (英文) + _joined_full_brief_zh (从 researches 的 translatedBrief
+            # / translatedFormattedBrief 取最长). 详情接口 sections 渲染会按
+            # picked_path = "_joined_full_brief" 查表, 直接用 _joined_full_brief_zh
+            # 作为中文版.
+            "_joined_full_brief": "_joined_full_brief_zh",
         },
     ),
     # ── Funda (US) ─────────────────────────────────────────────────────────
@@ -402,7 +435,11 @@ SOURCES: list[_Source] = [
         pdf_gate=("pdf_local_path", "pdf_size_bytes"),
         body_sections=(
             ("摘要", "doc_introduce"),
-            ("正文", "content_md"),
+            # content_md is the platform's processed body; pdf_text_md is the
+            # raw extracted PDF text. Prefer pdf_text_md when content_md is
+            # short or missing (alphaengine's content_md is sometimes a brief
+            # blurb while the full report lives in the PDF).
+            ("正文", ("pdf_text_md", "content_md")),
         ),
         source_label="AlphaEngine · 国内研报",
     ),
@@ -416,7 +453,7 @@ SOURCES: list[_Source] = [
         pdf_gate=("pdf_local_path", "pdf_size_bytes"),
         body_sections=(
             ("摘要", "doc_introduce"),
-            ("正文", "content_md"),
+            ("正文", ("pdf_text_md", "content_md")),
         ),
         source_label="AlphaEngine · 海外研报",
     ),
@@ -476,6 +513,8 @@ SOURCES: list[_Source] = [
             ("背景", "background_md"),
             ("讨论主题", "topic_md"),
             ("正文", "content_md"),
+            # 100% of meritco forum PDFs are extracted to pdf_text_md.
+            ("PDF 正文", "pdf_text_md"),
         ),
         id_coerce="int-or-str",
         source_label="久谦中台 · 专家论坛",
@@ -778,8 +817,14 @@ async def _query_spec(
         ("alphapai", "reports"),
         ("alphapai", "roadshows"),
         ("alphapai", "comments"),
+        ("thirdbridge", "interviews"),
     }:
         base_match["deleted"] = {"$ne": True}
+
+    # Low-value gate: docs whose body_sections + pdf_text_md sum to <100 chars
+    # (set by scripts/mark_low_value_docs.py; idempotent with self-heal). Always
+    # honoured across every source. ir_filings/* opt out by never being marked.
+    base_match["_low_value"] = {"$ne": True}
 
     # Pagination: if caller passed before_ms and the collection has a *_ms
     # field, use it as a strict less-than; otherwise fall back to skip-less
@@ -1430,6 +1475,61 @@ async def stock_hub_doc(
             f"{source}.{collection}/{item_id} was soft-deleted "
             f"(reason={doc.get('_deleted_reason') or 'unknown'})",
         )
+    # Low-value docs (scripts/mark_low_value_docs.py) are hidden from list
+    # responses; same treatment for direct detail so cached links can't bypass.
+    if doc.get("_low_value"):
+        raise HTTPException(
+            410,
+            f"{source}.{collection}/{item_id} was marked low-value "
+            f"(chars={doc.get('_low_value_chars')}, "
+            f"threshold={doc.get('_low_value_threshold')})",
+        )
+
+    # 2026-04-29 chief→research join: gangtise.chief_opinions 79% 的可见条目带
+    # parsed_msg.rptId, 指向 researches 集合里的同一篇研报. chief 自身只存了
+    # 平台截断的 brief (e.g. Deutsche Bank "Agents Taking Cloud..." 那条 chief
+    # 只有 2690 字 brief 停在 "from: a) its"); researches[rptId] 那边
+    # brief_md=2785 + pdf_text_md=44914 才是完整内容. 在这里运行时 join — 不写
+    # Mongo (避免 ~3GB 写放大), 直接挂到 doc 上让 body_sections 渲染.
+    if (spec.source, spec.collection) == ("gangtise", "chief_opinions"):
+        rpt_id = (doc.get("parsed_msg") or {}).get("rptId")
+        if rpt_id:
+            try:
+                research_doc = await _client(uri)[db_name]["researches"].find_one(
+                    {"_id": str(rpt_id)},
+                    {
+                        "brief_md": 1, "content_md": 1, "pdf_text_md": 1,
+                        "pdf_local_path": 1, "pdf_size_bytes": 1, "rpt_id": 1,
+                        # 平台原生中文翻译 (外资 100% 有). 取最长版本灌为
+                        # _joined_full_brief_zh, chief 详情中英 toggle 不再
+                        # 走 LLM `<field>_zh`.
+                        "list_item.translatedBrief": 1,
+                        "list_item.translatedFormattedBrief": 1,
+                        "detail_result.translatedBrief": 1,
+                        "detail_result.translatedFormattedBrief": 1,
+                    },
+                )
+            except Exception as e:
+                logger.warning("chief→research join failed for rpt_id=%s: %s", rpt_id, e)
+                research_doc = None
+            if research_doc:
+                rb = research_doc.get("brief_md") or research_doc.get("content_md") or ""
+                if isinstance(rb, str) and len(rb) > len(doc.get("content_md") or ""):
+                    doc["_joined_full_brief"] = rb
+                # 中文版: 取 4 个候选里最长的 (translatedFormattedBrief 通常
+                # 比 translatedBrief 长 ~50%, HTML 版多带段落标签). _strip_html
+                # 留给下游 _normalize_markdown 处理 (它能 strip 残留 HTML).
+                li = research_doc.get("list_item") or {}
+                dr = research_doc.get("detail_result") or {}
+                zh_candidates = [
+                    dr.get("translatedFormattedBrief") or "",
+                    li.get("translatedFormattedBrief") or "",
+                    dr.get("translatedBrief") or "",
+                    li.get("translatedBrief") or "",
+                ]
+                best_zh = max(zh_candidates, key=lambda s: len(s) if isinstance(s, str) else 0)
+                if isinstance(best_zh, str) and best_zh.strip():
+                    doc["_joined_full_brief_zh"] = best_zh
 
     # Assemble body sections. Each entry's field_path is either a string or
     # a tuple of strings — the tuple form picks the first non-empty path

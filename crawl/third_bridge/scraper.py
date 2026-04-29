@@ -644,16 +644,17 @@ def dump_one(client: httpx.Client, db, item: dict, lang: str,
         },
         "crawled_at": datetime.now(timezone.utc),
     }
-    # Truncated guard: 4 个 body 字段全空 → 付费墙锁住 / 实录还没出.
-    # 跳过不入库, 让下次再撞同 uuid 时重新走 detail (这时若 cookie 还在 +
-    # 实录已上线就能入库).
+    # Truncated guard: real body (transcript / intro / commentary) all empty
+    # → 付费墙锁住 / 实录还没出 / 该账号无 transcripts entitlement.
+    # 议程 + 专家列表是会前 metadata, 不算正文 — 单凭它们入库会污染 kb_search +
+    # StockHub (LLM 拿到只有 agenda 的 stub 没法答问题). 跳过不入库, 让下次再
+    # 撞同 uuid 时重新走 detail (cookie 在 + 实录上线就能正式入库).
     if not (
         (transcript_md and transcript_md.strip())
-        or (agenda_md and agenda_md.strip())
         or (introduction_md and introduction_md.strip())
-        or (specialists_md and specialists_md.strip())
+        or (commentary_md and commentary_md.strip())
     ):
-        return {"状态": "跳过-空内容", "标题": title, **doc["stats"]}
+        return {"状态": "跳过-空正文", "标题": title, **doc["stats"]}
     _stamp_ticker(doc, "thirdbridge", col)
     col.replace_one({"_id": uuid}, doc, upsert=True)
     return {"状态": "重爬" if force else "新增", "标题": title, **doc["stats"]}

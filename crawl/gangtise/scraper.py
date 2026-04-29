@@ -898,8 +898,15 @@ def dump_research(session, db, item: dict, pdf_dir: Path,
             return "skipped", ex.get("stats") or {}
 
     detail = fetch_research_detail(session, item.get("rptId"))
-    brief_raw = item.get("brief") or detail.get("brief") or ""
-    brief = _strip_html(brief_raw)
+    # 2026-04-29: gangtise 平台返回 brief (纯文本) + formattedBrief (HTML 版).
+    # 部分外资研报 brief 在中途断句 (e.g. 德意志银行 Google Cloud Next 那条
+    # brief=2690 字结尾 "from: a) its", formattedBrief=3198 字含 b)/c)). 优先
+    # 用 formattedBrief 后 strip HTML, 不够再退到 brief.
+    fmt_raw = item.get("formattedBrief") or detail.get("formattedBrief") or ""
+    plain_raw = item.get("brief") or detail.get("brief") or ""
+    fmt_text = _strip_html(fmt_raw) if fmt_raw else ""
+    plain_text = _strip_html(plain_raw)
+    brief = fmt_text if len(fmt_text) > len(plain_text) else plain_text
 
     release_ms = item.get("pubTime") or detail.get("pubTime") or 0
     release_time = _ms_to_str(release_ms)

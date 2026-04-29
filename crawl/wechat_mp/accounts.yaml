@@ -1,0 +1,12 @@
+# 微信公众号白名单 — 直采+白名单模式 (2026-04-29)
+# 起步只放机器之心,跑稳后再扩。每个条目可在首次抓取后由 scraper 写回 fakeid 缓存。
+# fakeid 是 MP 后台 searchbiz API 返回的公众号唯一标识 (与 __biz 不是同一个东西,
+# fakeid 仅在已登录会话内有意义,会话切换可能变化但通常稳定)。
+
+accounts:
+  - name: 机器之心
+    aliases: [Synced, jiqizhixin]
+    enabled: true
+    # 首次 searchbiz 后由 scraper 自动填:
+    # fakeid: "MzA3MzI4MjgzMw=="
+    # discovered_at: "2026-04-29T..."

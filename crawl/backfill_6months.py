@@ -301,22 +301,36 @@ PARALLEL_PLATFORMS: set[str] = {
 # ----- Oldest-doc probe ----------------------------------------------------
 
 def probe_oldest_ms(mc: MongoClient, target: Target) -> int | None:
-    """Return oldest release_time_ms for a target, or None if empty."""
-    coll = mc[_resolve_db(target.mongo_db)][target.mongo_coll]
-    for f in target.date_fields:
-        q = {f: {"$exists": True, "$gt": 0}}
-        q.update(target.mongo_filter)
-        doc = coll.find_one(q, sort=[(f, 1)], projection={f: 1})
-        if doc and doc.get(f):
-            return int(doc[f])
-    return None
+    """Return oldest release_time_ms for a target, or None if empty.
+
+    Soft-fails to None on Mongo transient errors (server selection timeout,
+    AutoReconnect) so phase2 write contention can't kill the orchestrator.
+    """
+    try:
+        coll = mc[_resolve_db(target.mongo_db)][target.mongo_coll]
+        for f in target.date_fields:
+            q = {f: {"$exists": True, "$gt": 0}}
+            q.update(target.mongo_filter)
+            doc = coll.find_one(q, sort=[(f, 1)], projection={f: 1})
+            if doc and doc.get(f):
+                return int(doc[f])
+        return None
+    except Exception as e:
+        logging.warning(f"[probe_oldest_ms] {target.key}: {type(e).__name__}: {str(e)[:120]}")
+        return None
 
 
 def probe_count(mc: MongoClient, target: Target) -> int:
-    coll = mc[_resolve_db(target.mongo_db)][target.mongo_coll]
-    if target.mongo_filter:
-        return coll.count_documents(target.mongo_filter)
-    return coll.estimated_document_count()
+    """Soft-fails to 0 on Mongo transient errors — start_count is only used
+    for delta reporting, not for control flow."""
+    try:
+        coll = mc[_resolve_db(target.mongo_db)][target.mongo_coll]
+        if target.mongo_filter:
+            return coll.count_documents(target.mongo_filter)
+        return coll.estimated_document_count()
+    except Exception as e:
+        logging.warning(f"[probe_count] {target.key}: {type(e).__name__}: {str(e)[:120]}")
+        return 0
 
 
 # ----- Runner --------------------------------------------------------------

@@ -71,6 +71,7 @@ AUTO_LOGIN_SCRIPTS: dict[str, str] = {
     "alphaengine": "alphaengine/auto_login.py",
     "funda": "funda/auto_login.py",
     "thirdbridge": "third_bridge/auto_login.py",
+    "wechat_mp": "wechat_mp/auto_login.py",
 }
 
 SESSION_TTL_SECONDS = 600  # keep status around for 10 min after completion

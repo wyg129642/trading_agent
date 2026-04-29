@@ -400,6 +400,20 @@ def _build_specs() -> list[CollectionSpec]:
             url_field="web_url", has_pdf=True,
             milvus_indexed=False,
         ),
+        # ─── 微信公众号 (mp.weixin.qq.com) — 2026-04-29 ──────────
+        # 直采+白名单, 起步只放机器之心. low_quality=False (与旧的
+        # alphapai-full.wechat_articles 二手聚合源对比, 这是用户精选信源).
+        # milvus_indexed=True → kb_vector_sync 5min 轮询自动捞起入向量库.
+        CollectionSpec(
+            db="wechat_mp", collection="articles",
+            doc_type="wechat_mp_article", doc_type_cn="微信公众号文章",
+            title_field="title",
+            text_fields=("content_md", "digest"),
+            date_str_field=None, date_ms_field="release_time_ms",
+            ticker_field="_canonical_tickers", ticker_fallback_path=None,
+            institution_field="account_name", institution_kind="str",
+            url_field="url", has_pdf=False,
+        ),
     ]
 
 
@@ -442,6 +456,9 @@ MONGO_DB_ALIASES: dict[str, str] = {
     # funda, acecamp unchanged — no entry means "use spec.db verbatim".
     # semianalysis lives in its own foreign-website DB (2026-04-24 迁出 funda).
     "semianalysis": "foreign-website",
+    # 2026-04-29: 微信公众号 spec.db 用下划线 wechat_mp (Milvus 友好), Mongo
+    # DB 名是连字符 wechat-mp.
+    "wechat_mp":   "wechat-mp",
 }
 
 
@@ -843,6 +860,7 @@ def _build_filter(
         ("alphapai", "reports"),
         ("alphapai", "roadshows"),
         ("alphapai", "comments"),
+        ("thirdbridge", "interviews"),
     }:
         q["deleted"] = {"$ne": True}
 
