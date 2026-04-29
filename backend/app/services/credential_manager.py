@@ -1040,44 +1040,101 @@ async def _probe_thirdbridge(creds: dict, timeout: float = 12.0) -> tuple[str, s
     return "unknown", f"HTTP 200 but account fields missing (cookie may still be valid)"
 
 
+def _decode_acecamp_user_token(cookie: str) -> tuple[str | None, str]:
+    """Decode the user_token JWT embedded in the AceCamp cookie string.
+
+    AceCamp cookie carries `user_token=<jwt>` next to the Rails session id.
+    The JWT payload (Anthropic-shape: `eyJhbGciOiJIUzI1NiJ9.<b64>.<sig>`)
+    has fields `user_id`, `refresh_at`, `expires_in`. Token is HS256 so we
+    can't *verify* without the secret, but for "is this token live?" decoding
+    + checking expiry is sufficient.
+
+    Returns: (user_id_str | None, error_status).
+      error_status: "" on valid, "missing"/"malformed"/"expired" on issue.
+    """
+    import re, base64, json, time
+
+    if not cookie:
+        return None, "missing"
+    m = re.search(r"user_token=([^;\s]+)", cookie)
+    if not m:
+        return None, "missing"
+    parts = m.group(1).split(".")
+    if len(parts) < 2:
+        return None, "malformed"
+    try:
+        pad = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(pad))
+    except Exception:
+        return None, "malformed"
+    user_id = payload.get("user_id") or payload.get("uid") or payload.get("sub")
+    if not user_id:
+        return None, "malformed"
+    refresh_at = payload.get("refresh_at") or payload.get("iat") or 0
+    expires_in = payload.get("expires_in") or payload.get("exp_in") or 0
+    if refresh_at and expires_in:
+        # JWT 的 expires_in 跟 refresh_at 是绝对秒, refresh_at + expires_in = 过期时刻
+        if (float(refresh_at) + float(expires_in)) < time.time():
+            return None, "expired"
+    return str(user_id), ""
+
+
 async def _probe_acecamp(creds: dict, timeout: float = 10.0) -> tuple[str, str]:
-    """GET /api/v1/users/me — the SPA uses this exact call to decide "logged in".
+    """JWT decode + users/me + list 端点 + content 质量, 三层判.
 
-    2026-04-22: switched from `articles/article_list` to `users/me`.
-    article_list succeeds for ANONYMOUS guest sessions too (Rails sets
-    `_ace_camp_tech_production_session` on first visit to anyone), so the old
-    probe couldn't tell whether the saved creds were actually bound to a user.
-    Symptoms: scraper pulled free articles fine but paid ones came back as
-    ~100-char title-only previews, and the real-time viewer showed
-    "Log in / Sign up" despite health reporting "ok".
+    2026-04-22 → 04-29 → 04-29 (二次修正): 健康判据收敛.
+      - users/me data:null = 服务端 Rails session 已销毁, 即"匿名". list 端点
+        对匿名仍开放 (返公开摘要), detail 接口对匿名一律 paywall (返 ret=False
+        code=10003). 这种状态: scraper 能拉 list 但**永远拿不到 detail 正文**,
+        StockHub 卡片"信息不全"的根因.
+      - 04-29 一度把 anonymous 当 ok, 因为想区分"users/me 端点变了"和"真匿名".
+        实测 (cookie user_id=50522192 + Bearer JWT) 都返 data:null → 端点没变,
+        是 cookie session 真的失效. 还原成 anonymous → 监控正确报橙色, 引导
+        viewer 重登.
+      - JWT exp / 缺失 → expired (user 必须重登, 而非 cookie 局部 refresh).
 
-    Real-login signal: users/me returns `{"data": {...user object}}` for a
-    logged-in session, `{"data": null, "ret": true, "code": 200}` for
-    anonymous. HTTP 200 in both cases.
+    返回 (health, detail):
+      - "ok": users/me 拿到 user 对象 → cookie 真有效, 正文质量也通过.
+      - "anonymous": users/me data:null → 重登捕获新 session cookie.
+      - "expired": JWT 不可用 / HTTP 401 / 业务鉴权 401|403|1001.
+      - "degraded": users/me ok, 但近 20 条 articles ≥50% 正文 <200 字 → detail
+        端点疑似被封控 (quota 10003/10040 / 真付费墙).
+      - "unknown": 网络异常等.
     """
     import httpx
 
     cookie = (creds or {}).get("cookie", "")
     if not cookie:
         return "expired", "no cookie"
-    url = "https://api.acecamptech.com/api/v1/users/me"
+
+    user_id, jwt_err = _decode_acecamp_user_token(cookie)
+    if jwt_err == "missing":
+        return "anonymous", "cookie 缺 user_token JWT (未登录捕获)"
+    if jwt_err == "expired":
+        return "expired", "user_token JWT 已过期, 需重新登录"
+
     headers = {
         "Cookie": cookie,
         "Accept": "application/json",
         "Origin": "https://www.acecamptech.com",
         "Referer": "https://www.acecamptech.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "X-Requested-With": "XMLHttpRequest",
     }
-    params = {
-        "get_follows": "true",
-        "with_owner": "true",
-        "with_resume": "true",
-        "version": "2.0",
-    }
-    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-        resp = await client.get(url, headers=headers, params=params)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            resp = await client.get(
+                "https://api.acecamptech.com/api/v1/users/me",
+                headers=headers,
+                params={"get_follows": "true", "with_owner": "true",
+                         "with_resume": "true", "version": "2.0"},
+            )
+    except httpx.HTTPError as e:
+        return "unknown", f"网络错误: {type(e).__name__}: {str(e)[:120]}"
 
     if resp.status_code in (401, 403):
-        return "expired", f"HTTP {resp.status_code}"
+        return "expired", f"HTTP {resp.status_code} (cookie 失效)"
     try:
         data = resp.json()
     except ValueError:
@@ -1087,12 +1144,6 @@ async def _probe_acecamp(creds: dict, timeout: float = 10.0) -> tuple[str, str]:
     if isinstance(user, dict) and (user.get("id") or user.get("user_id") or user.get("username")):
         uid = user.get("id") or user.get("user_id")
         name = user.get("username") or user.get("name") or user.get("nick_name") or ""
-        # users/me 通过只代表 cookie 还绑着用户 — 不代表 detail 端点还能拉正文.
-        # AceCamp 团队金卡被封控的典型症状: users/me 返 200 + user 对象齐全, 但
-        # /articles/article_info 每次返 code=10003/10040 (quota), 结果 scraper 把
-        # 列表摘要当 content_md 塞进库, 整库 content_md 空. 补一层"最近入库内容
-        # 质量"检查: 若近 20 条 articles 的 content_md 长度 <200 字符占比 ≥70%,
-        # 就把状态降级为 degraded (红色, 必须换账号).
         quality = await _probe_content_quality(
             db_name=_get_settings_for_dbmap().acecamp_mongo_db,
             coll_name="articles",
@@ -1100,33 +1151,26 @@ async def _probe_acecamp(creds: dict, timeout: float = 10.0) -> tuple[str, str]:
             min_content_chars=200,
         )
         base_msg = f"user_id={uid} name={name}".strip()
-        # 阈值 0.5: 最近 20 条里有一半以上正文 <200 字 = detail 端点已严重降级.
-        # 留 50% 余量给"刚发布的业绩会/路演还没转写完"这类正常空壳 (参考 Jinmen
-        # staged AI summary 的同类现象: 纪要上传后 +15-60min 才有正文). 真正的
-        # quota 封控会让这个比例冲到 80%+, 健康账号稳定在 10-30%.
         if quality.get("probed") and quality["empty_ratio"] >= 0.5:
             return "degraded", (
                 f"{base_msg} · 近 {quality['sample_size']} 条 articles 中 "
                 f"{quality['empty_count']} 条正文 <200 字 "
-                f"({quality['empty_ratio']*100:.0f}%) — detail 端点疑似被封控, "
-                f"list 端点仍返摘要, dashboard 入库数字虚高"
+                f"({quality['empty_ratio']*100:.0f}%) — detail 端点疑似被封控 "
+                f"(quota 10003/10040 / 付费墙)"
             )
         return "ok", base_msg
-    # Anonymous session — distinct from "expired token". Server accepted the
-    # cookie (200 OK) but the cookie isn't bound to a logged-in user. This
-    # happens when:
-    #   - cookie was captured before the user actually logged in (e.g. visitor
-    #     session created on first page load)
-    #   - server-side session expired/aged out (cookie still parses but user
-    #     mapping was deleted)
-    # Either way: refreshing the token won't help — user must re-login in
-    # the remote browser. Surfaces orange (not red) so research知道 scraper
-    # is still pulling preview content (anonymous tier).
-    if user is None and data.get("ret") is True:
-        return "anonymous", "匿名 session · cookie 未绑定到用户 (users/me 返回 data=null)"
-    code = data.get("code")
-    msg = str(data.get("msg") or data.get("message") or "")
-    return "anonymous", f"非登录态 · code={code} {msg[:80]}".strip()
+
+    if user is None and isinstance(data, dict) and data.get("ret") is True:
+        return "anonymous", (
+            f"匿名 session · 服务端 Rails session 已失效 (users/me data=null). "
+            f"JWT user_id={user_id} 仍存但服务器不认, list 端点仍开放但 detail "
+            f"全部 paywall — 请在实时查看里重登捕获新 session cookie."
+        )
+    code = (data or {}).get("code")
+    msg = str((data or {}).get("msg") or "")
+    if code in (401, 403, 1001):
+        return "expired", f"业务鉴权失败 code={code} {msg[:60]}"
+    return "anonymous", f"users/me 异常 code={code} {msg[:80]}"
 
 
 async def _probe_jinmen(creds: dict, timeout: float = 10.0) -> tuple[str, str]:

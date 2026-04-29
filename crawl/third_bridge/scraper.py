@@ -569,6 +569,7 @@ def dump_one(client: httpx.Client, db, item: dict, lang: str,
 
     agenda = detail.get("agenda") or []
     agenda_md = format_agenda(agenda)
+    specialists_md = format_specialists(specialists)
 
     lang_obj = detail.get("language") or {}
     ctype_obj = detail.get("contentType") or {}
@@ -605,7 +606,7 @@ def dump_one(client: httpx.Client, db, item: dict, lang: str,
         "target_companies": target_companies,
         "relevant_companies": relevant_companies,
         "specialists": specialists,
-        "specialists_md": format_specialists(specialists),
+        "specialists_md": specialists_md,
         "moderators": moderators,
         "researcher_email": (detail.get("researcher") or {}).get("email"),
         "themes": _pick_labels(detail.get("themes")),
@@ -643,6 +644,16 @@ def dump_one(client: httpx.Client, db, item: dict, lang: str,
         },
         "crawled_at": datetime.now(timezone.utc),
     }
+    # Truncated guard: 4 个 body 字段全空 → 付费墙锁住 / 实录还没出.
+    # 跳过不入库, 让下次再撞同 uuid 时重新走 detail (这时若 cookie 还在 +
+    # 实录已上线就能入库).
+    if not (
+        (transcript_md and transcript_md.strip())
+        or (agenda_md and agenda_md.strip())
+        or (introduction_md and introduction_md.strip())
+        or (specialists_md and specialists_md.strip())
+    ):
+        return {"状态": "跳过-空内容", "标题": title, **doc["stats"]}
     _stamp_ticker(doc, "thirdbridge", col)
     col.replace_one({"_id": uuid}, doc, upsert=True)
     return {"状态": "重爬" if force else "新增", "标题": title, **doc["stats"]}

@@ -48,12 +48,18 @@ declare -a ROWS=(
   "gangtise|gangtise|--type research --skip-pdf --page-size 50|500|gangtise_research"
   "gangtise|gangtise|--type chief --skip-pdf --page-size 50|200|gangtise_chief"
   # AceCamp (2026-04-24 封控事故后调整):
-  # - articles: --skip-detail (list 元数据 only, 避开 VIP detail quota 10003/10040)
   # - events: 已被平台移除, 不再抓
   # - opinions: 走 opinion_info 独立端点不吃 article quota 池, 保留 detail
   # - 日 catchup 上限下调 (200→120 / 200→80), 给其它路径留 quota
-  "AceCamp|acecamp|--type articles --skip-detail|120|acecamp_articles"
-  "AceCamp|acecamp|--type opinions|80|acecamp_opinions"
+  # 2026-04-28 (二次): 用户要求 1/10 速率重启, max 也×1/10 (120→12 / 80→8).
+  # 2026-04-29: --skip-detail 移除. 之前的 list-only 写库会把付费内容的"提纲式
+  #   summary" 当 content_md 入库, StockHub 上一堆"信息不全"的截断卡 (用户反馈
+  #   案例: "黄金再次新高的逻辑及后市展望"). dump_article 在 skip_detail 路径
+  #   现在硬不写, 这里同步去掉 flag 让 catchup 走完整 detail 路径; quota 烧光
+  #   有 SoftCooldown (10003/10040 自动 30min 静默) + tripwire (15 连空抛
+  #   SessionDead, scraper 退出) 兜住.
+  "AceCamp|acecamp|--type articles|12|acecamp_articles"
+  "AceCamp|acecamp|--type opinions|8|acecamp_opinions"
   "alphaengine|alphaengine|--category all|300|alphaengine_all"
 )
 

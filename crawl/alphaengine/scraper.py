@@ -87,6 +87,34 @@ ALPHAENGINE_TOKEN = ""
 CREDS_FILE = Path(__file__).resolve().parent / "credentials.json"
 
 
+def _coerce_to_markdown(s: Any) -> str:
+    """API 返回的 content / original_text 偶尔是整页 HTML 源码
+    (`<html><head>...</body></html>`) 而非纯文本. 检测到 HTML 起手就剥掉
+    script/style/meta/title, markdownify 段落/标题/列表保留语义结构, 失败回退
+    到正则 strip + html.unescape."""
+    if not isinstance(s, str) or not s.strip():
+        return ""
+    if not s.lstrip().startswith("<"):
+        return s
+    try:
+        from bs4 import BeautifulSoup
+        from markdownify import markdownify as _md
+        try:
+            soup = BeautifulSoup(s, "lxml")
+        except Exception:
+            soup = BeautifulSoup(s, "html.parser")
+        for tag in soup.find_all(["script", "style", "meta", "title", "link", "noscript"]):
+            tag.decompose()
+        md = _md(str(soup), heading_style="ATX", strip=["a", "img"])
+        md = html.unescape(md)
+        md = re.sub(r"[ \t]+\n", "\n", md)
+        md = re.sub(r"\n{3,}", "\n\n", md)
+        return md.strip()
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", s)
+        return html.unescape(re.sub(r"\s+", " ", text)).strip()
+
+
 def _load_token_from_file() -> str:
     if not CREDS_FILE.exists():
         return ""
@@ -899,6 +927,17 @@ def dump_item(db, category: dict, item: dict,
         "web_url": f"{API_BASE}/#/summary-center?tabsActive={category['code']}&sub_id={did}",
         "stats": stats,
         "crawled_at": datetime.now(timezone.utc),
+        # 截断标记: list 端的 doc_introduce 还没被 enrich 端的全文覆盖,
+        # 同时也没有 PDF 兜底 → Stock Hub 按 TRUNCATION_FLAG_SOURCES 屏蔽
+        # (news 类别永久禁 enrich 设计如此, 其他类别会被 enrich_loop 后续
+        # 补全文 + clear flag, 重新可见). 判定: content_md == doc_introduce
+        # AND content_md < 1000 字 AND 无 PDF.
+        "content_truncated": bool(
+            content_md
+            and content_md == doc_introduce
+            and len(content_md) < 1000
+            and pdf_size <= 0
+        ),
     }
     _stamp_ticker(doc, "alphaengine", col)
     col.replace_one({"_id": did}, doc, upsert=True)
@@ -1381,12 +1420,16 @@ def backfill_pdfs(session, db, args) -> dict:
                 ok += 1
                 cap.bump(); _BUDGET.bump()
                 rel = str(dest.relative_to(pdf_dir))
+                # PDF 兜底拿到了 → 即便 content_md 仍是 list 预览, doc 也应
+                # 重新可见 (Stock Hub 上有 PDF 就有完整正文路径). 同步清
+                # content_truncated 标记.
                 coll.update_one({"_id": did}, {"$set": {
                     "pdf_local_path": str(dest),
                     "pdf_rel_path": rel,
                     "pdf_size_bytes": n,
                     "pdf_download_error": "",
                     "pdf_unavailable": False,
+                    "content_truncated": False,
                 }})
                 tqdm.write(f"  ✓ [{did[:16]}] {title}  {n:,}B")
                 # Realtime push — the item now has a PDF
@@ -1545,6 +1588,10 @@ def enrich_via_detail(session, db, args) -> dict:
             # summary items, `content` IS the transcript; for research, it's
             # the PDF text. Always includes digest/main_point headers so the
             # UI drawer shows them prominently.
+            # news_items 的 content/original_text 偶尔是 `<html><head>...` 整页
+            # 源码 (而非纯文本), 直接存会让 StockHub 渲染原样标签.
+            content = _coerce_to_markdown(content)
+            original_text = _coerce_to_markdown(original_text)
             parts = []
             if digest:
                 parts.append(f"### 摘要\n\n{digest}")
@@ -1567,6 +1614,12 @@ def enrich_via_detail(session, db, args) -> dict:
             }
             if section:
                 update["section"] = section
+            # enrich 拿到了显著长度的全文 → 清掉 dump 时打的截断标记,
+            # 让 Stock Hub 重新展示该条 (TRUNCATION_FLAG_SOURCES 过滤靠
+            # content_truncated=True). 阈值 1000 与 dump_one_doc 入库判定
+            # 对齐 (短于 1000 仍视作 list 预览级).
+            if len(new_content_md) >= 1000:
+                update["content_truncated"] = False
 
             # Fetch PDF via signed COS URL (bypasses download quota)
             got_pdf_now = False

@@ -812,10 +812,13 @@ async def _count_db_today(start_ms: int, end_ms: int) -> dict:
             {"_orphan_candidate_count": {"$lt": 1}},
         ],
     }
+    # chief_opinions soft-deletes itself (cleanup_gangtise_chief.py /
+    # dump_research reverse hook); other gangtise collections don't.
+    chief_flt = {**flt, "deleted": {"$ne": True}}
     summary, research, chief = await asyncio.gather(
         db["summaries"].count_documents(flt),
         db["researches"].count_documents(flt),
-        db["chief_opinions"].count_documents(flt),
+        db["chief_opinions"].count_documents(chief_flt),
     )
     return {"summary": summary, "research": research, "chief": chief}
 

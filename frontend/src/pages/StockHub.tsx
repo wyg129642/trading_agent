@@ -26,11 +26,13 @@ interface HubItem {
   category: Exclude<Category, 'all'>
   category_label: string
   title: string
+  title_zh?: string | null
   release_time: string | null
   release_time_ms: number | null
   url: string | null
   pdf_url: string | null
   preview: string
+  preview_zh?: string | null
   organization: string
   sentiment?: string | null
   impact_magnitude?: string | null
@@ -47,13 +49,20 @@ interface HubResponse {
   next_before_ms: number | null
 }
 
-interface DocSection { label: string; markdown: string }
+interface DocSection { label: string; markdown: string; markdown_zh?: string | null }
 
 interface DocPdfAttachment {
   index: number
   name: string
   size_bytes: number
   url: string
+}
+
+interface LocalAiSummary {
+  tldr: string
+  bullets: string[]
+  model: string
+  generated_at: string | null
 }
 
 interface DocDetailResponse {
@@ -64,6 +73,7 @@ interface DocDetailResponse {
   category_label: string
   id: string
   title: string
+  title_zh?: string | null
   release_time: string | null
   release_time_ms: number | null
   organization: string
@@ -72,6 +82,7 @@ interface DocDetailResponse {
   pdf_urls: DocPdfAttachment[]
   tickers: string[]
   sections: DocSection[]
+  local_ai_summary?: LocalAiSummary | null
   sentiment?: string | null
   impact_magnitude?: string | null
 }
@@ -177,6 +188,20 @@ export default function StockHub() {
   const [search, setSearch] = useState('')
   const [hoverIndex, setHoverIndex] = useState<number>(-1)
   const cardRefs = useRef<Array<HTMLDivElement | null>>([])
+
+  // Shared 中文/原文 lang preference for both list cards (preview) and the
+  // detail drawer. Persisted to localStorage so the choice survives reloads.
+  const LANG_PREF_KEY = 'stockhub.detailLang'
+  const [lang, setLang] = useState<'zh' | 'orig'>(() => {
+    try { return (localStorage.getItem(LANG_PREF_KEY) as 'zh' | 'orig') || 'zh' } catch { return 'zh' }
+  })
+  useEffect(() => {
+    try { localStorage.setItem(LANG_PREF_KEY, lang) } catch { /* noop */ }
+  }, [lang])
+  const anyTranslatedInList = items.some((it) =>
+    ((it.preview_zh || '').trim().length > 0) ||
+    ((it.title_zh || '').trim().length > 0),
+  )
 
   // Detail drawer state — fetched lazily on card click.
   // The list endpoint returns only a 320-char preview; the drawer shows
@@ -565,6 +590,19 @@ export default function StockHub() {
         {(['research', 'commentary', 'minutes', 'interview', 'breaking'] as const).map((c) =>
           categoryButton(c, byCat[c] || 0, CATEGORY_META[c].label, CATEGORY_META[c]),
         )}
+        {anyTranslatedInList && (
+          <div style={{ marginLeft: 'auto' }}>
+            <Segmented
+              size="small"
+              value={lang}
+              onChange={(v) => setLang(v as 'zh' | 'orig')}
+              options={[
+                { label: '中文', value: 'zh' },
+                { label: '原文', value: 'orig' },
+              ]}
+            />
+          </div>
+        )}
       </div>
 
       {/* Body */}
@@ -674,7 +712,10 @@ export default function StockHub() {
                           lineHeight: 1.45,
                         }}
                       >
-                        {it.title}
+                        {(() => {
+                          const zh = (it.title_zh || '').trim()
+                          return lang === 'zh' && zh.length > 0 ? zh : it.title
+                        })()}
                         {it.sentiment && it.sentiment !== 'neutral' && (
                           <Tag
                             color={it.sentiment === 'bullish' ? 'green' : it.sentiment === 'bearish' ? 'red' : 'default'}
@@ -690,19 +731,25 @@ export default function StockHub() {
                         )}
                       </div>
 
-                      {/* Preview */}
-                      {it.preview && (
-                        <div
-                          style={{
-                            fontSize: 13, color: '#475569', lineHeight: 1.55,
-                            display: '-webkit-box',
-                            WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
-                            overflow: 'hidden',
-                          }}
-                        >
-                          {it.preview}
-                        </div>
-                      )}
+                      {/* Preview — show translation when available and lang=zh */}
+                      {(() => {
+                        const zh = (it.preview_zh || '').trim()
+                        const showZh = lang === 'zh' && zh.length > 0
+                        const body = showZh ? zh : it.preview
+                        if (!body) return null
+                        return (
+                          <div
+                            style={{
+                              fontSize: 13, color: '#475569', lineHeight: 1.55,
+                              display: '-webkit-box',
+                              WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+                              overflow: 'hidden',
+                            }}
+                          >
+                            {body}
+                          </div>
+                        )
+                      })()}
 
                       {/* Actions */}
                       <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
@@ -792,6 +839,8 @@ export default function StockHub() {
         onLoadPdf={loadPdf}
         onDownloadPdf={downloadPdf}
         clearPdf={clearPdf}
+        lang={lang}
+        setLang={setLang}
       />
     </div>
   )
@@ -820,6 +869,29 @@ interface DetailDrawerProps {
   onLoadPdf: (url: string) => void | Promise<void>
   onDownloadPdf: (url: string, filename: string) => void | Promise<void>
   clearPdf: () => void
+  lang: 'zh' | 'orig'
+  setLang: (v: 'zh' | 'orig') => void
+}
+
+// Drawer width is user-resizable via the left-edge handle. Persisted across
+// sessions in localStorage; clamped on window resize so it never exceeds the
+// viewport.
+const DRAWER_WIDTH_KEY = 'stockhub.drawerWidth'
+const DRAWER_MIN_WIDTH = 480
+const DRAWER_MAX_PADDING = 80  // keep at least this much of the left list visible
+
+function getInitialDrawerWidth(): number {
+  const fallback = Math.min(900, Math.floor(window.innerWidth * 0.92))
+  try {
+    const raw = localStorage.getItem(DRAWER_WIDTH_KEY)
+    if (raw) {
+      const n = parseInt(raw, 10)
+      if (!isNaN(n)) {
+        return Math.min(Math.max(DRAWER_MIN_WIDTH, n), window.innerWidth - DRAWER_MAX_PADDING)
+      }
+    }
+  } catch { /* localStorage may be unavailable in some embeds */ }
+  return fallback
 }
 
 function DetailDrawer({
@@ -828,7 +900,78 @@ function DetailDrawer({
   pdfBlobUrl, pdfLoading, pdfError, pdfProgress,
   activePdfIdx, setActivePdfIdx,
   onClose, onLoadPdf, onDownloadPdf, clearPdf,
+  lang, setLang,
 }: DetailDrawerProps) {
+  // ── Resizable width ──────────────────────────────────────
+  const [drawerWidth, setDrawerWidth] = useState<number>(getInitialDrawerWidth)
+  const [resizing, setResizing] = useState(false)
+  const [hoverHandle, setHoverHandle] = useState(false)
+
+  // ── Lang toggle (中文/原文) ──────────────────────────────
+  // Lang preference is owned by the parent so list cards and the detail
+  // drawer share it; persistence is wired in the parent.
+  const hasAnyTranslation = (
+    (detail?.title_zh || '').trim().length > 0 ||
+    !!detail?.sections?.some(
+      (s) => typeof s.markdown_zh === 'string' && s.markdown_zh.trim().length > 0,
+    )
+  )
+
+  // Persist width
+  useEffect(() => {
+    try {
+      localStorage.setItem(DRAWER_WIDTH_KEY, String(drawerWidth))
+    } catch { /* ignore quota / disabled storage */ }
+  }, [drawerWidth])
+
+  // Re-clamp on window resize so the drawer never overflows the viewport
+  useEffect(() => {
+    const onResize = () => {
+      setDrawerWidth((w) =>
+        Math.min(Math.max(DRAWER_MIN_WIDTH, w), window.innerWidth - DRAWER_MAX_PADDING),
+      )
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  const handleResizePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      e.preventDefault()
+      const startX = e.clientX
+      const startWidth = drawerWidth
+      setResizing(true)
+      // Lock body cursor + disable selection while dragging so the cursor
+      // doesn't flicker over text.
+      const prevCursor = document.body.style.cursor
+      const prevUserSelect = document.body.style.userSelect
+      document.body.style.cursor = 'col-resize'
+      document.body.style.userSelect = 'none'
+
+      const onMove = (ev: PointerEvent) => {
+        // Drawer slides in from the right, so dragging LEFT widens it.
+        const dx = startX - ev.clientX
+        const next = Math.min(
+          Math.max(DRAWER_MIN_WIDTH, startWidth + dx),
+          window.innerWidth - DRAWER_MAX_PADDING,
+        )
+        setDrawerWidth(next)
+      }
+      const onUp = () => {
+        setResizing(false)
+        document.body.style.cursor = prevCursor
+        document.body.style.userSelect = prevUserSelect
+        document.removeEventListener('pointermove', onMove)
+        document.removeEventListener('pointerup', onUp)
+        document.removeEventListener('pointercancel', onUp)
+      }
+      document.addEventListener('pointermove', onMove)
+      document.addEventListener('pointerup', onUp)
+      document.addEventListener('pointercancel', onUp)
+    },
+    [drawerWidth],
+  )
+
   // Resolve which pdf URL to fetch (single-pdf vs. meritco multi-attachment)
   const pdfCandidates: DocPdfAttachment[] = useMemo(() => {
     if (!detail) return []
@@ -875,12 +1018,46 @@ function DetailDrawer({
     <Drawer
       open={open}
       onClose={onClose}
-      width={Math.min(900, Math.floor(window.innerWidth * 0.92))}
+      width={drawerWidth}
       closable={false}
       title={null}
       destroyOnClose
-      styles={{ body: { padding: 0 } }}
+      styles={{ body: { padding: 0, position: 'relative' } }}
     >
+      {/* Left-edge resize handle. Hit area is 10px wide for easy grabbing,
+          but only a 2px line is drawn (brighter on hover/drag). Sits on top
+          of the sticky header via z-index. */}
+      <div
+        onPointerDown={handleResizePointerDown}
+        onMouseEnter={() => setHoverHandle(true)}
+        onMouseLeave={() => setHoverHandle(false)}
+        title="拖动调整宽度"
+        style={{
+          position: 'absolute',
+          top: 0,
+          bottom: 0,
+          left: -5,
+          width: 10,
+          cursor: 'col-resize',
+          zIndex: 20,
+          background: 'transparent',
+          touchAction: 'none',
+        }}
+      >
+        <div
+          style={{
+            position: 'absolute',
+            top: 0,
+            bottom: 0,
+            left: 4,
+            width: 2,
+            background: resizing ? '#3b82f6' : hoverHandle ? '#93c5fd' : 'transparent',
+            transition: 'background 0.12s ease',
+            pointerEvents: 'none',
+          }}
+        />
+      </div>
+
       {/* Header */}
       <div
         style={{
@@ -916,7 +1093,15 @@ function DetailDrawer({
               </div>
             )}
             <div style={{ fontSize: 18, fontWeight: 600, color: '#0f172a', lineHeight: 1.4 }}>
-              {detail?.title || item?.title || '...'}
+              {(() => {
+                if (lang === 'zh') {
+                  const dz = (detail?.title_zh || '').trim()
+                  if (dz) return dz
+                  const iz = (item?.title_zh || '').trim()
+                  if (iz) return iz
+                }
+                return detail?.title || item?.title || '...'
+              })()}
             </div>
           </div>
           <Button
@@ -938,6 +1123,17 @@ function DetailDrawer({
               ...(pdfCandidates.length ? [{ label: 'PDF', value: 'pdf' as const }] : []),
             ]}
           />
+          {hasAnyTranslation && view === 'sections' && (
+            <Segmented
+              size="small"
+              value={lang}
+              onChange={(v) => setLang(v as 'zh' | 'orig')}
+              options={[
+                { label: '中文', value: 'zh' },
+                { label: '原文', value: 'orig' },
+              ]}
+            />
+          )}
           <div style={{ flex: 1 }} />
           {detail?.url && (
             <Tooltip title="在新标签打开原文">
@@ -974,6 +1170,56 @@ function DetailDrawer({
           <Alert type="error" showIcon message="加载失败" description={error} style={{ margin: 20 }} />
         ) : !detail ? null : view === 'sections' ? (
           <>
+            {/* AI 摘要 — qwen-plus card-preview summary written by the
+                local_ai_summary worker. Rendered above the body sections so
+                the takeaway is visible without scrolling past disclaimers. */}
+            {detail.local_ai_summary && (detail.local_ai_summary.tldr || (detail.local_ai_summary.bullets || []).length > 0) && (
+              <section style={{ marginBottom: 24 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                  <div
+                    style={{
+                      fontSize: 13, fontWeight: 600, color: '#0369a1',
+                      padding: '6px 10px', borderRadius: 4,
+                      background: '#e0f2fe',
+                      display: 'inline-block',
+                    }}
+                  >
+                    AI 摘要
+                  </div>
+                  <span style={{
+                    fontSize: 11, color: '#64748b',
+                    background: '#f1f5f9', padding: '2px 6px', borderRadius: 3,
+                  }}>
+                    {detail.local_ai_summary.model || 'qwen-plus'}
+                  </span>
+                </div>
+                <div style={{
+                  background: '#f8fafc', border: '1px solid #e2e8f0',
+                  borderLeft: '3px solid #0ea5e9',
+                  padding: '14px 16px', borderRadius: 4,
+                }}>
+                  {detail.local_ai_summary.tldr && (
+                    <div style={{
+                      fontSize: 14, color: '#0f172a', lineHeight: 1.7,
+                      fontWeight: 500,
+                    }}>
+                      {detail.local_ai_summary.tldr}
+                    </div>
+                  )}
+                  {(detail.local_ai_summary.bullets || []).length > 0 && (
+                    <ul style={{
+                      marginTop: detail.local_ai_summary.tldr ? 12 : 0,
+                      marginBottom: 0, paddingLeft: 20,
+                      fontSize: 13, color: '#334155', lineHeight: 1.65,
+                    }}>
+                      {detail.local_ai_summary.bullets.map((b, i) => (
+                        <li key={i} style={{ marginBottom: 4 }}>{b}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </section>
+            )}
             {detail.sections.length === 0 ? (
               <Empty
                 description={
@@ -989,23 +1235,36 @@ function DetailDrawer({
                 style={{ padding: '40px 0' }}
               />
             ) : (
-              detail.sections.map((sec, i) => (
-                <section key={i} style={{ marginBottom: 28 }}>
-                  <div
-                    style={{
-                      fontSize: 13, fontWeight: 600, color: '#475569',
-                      padding: '6px 10px', borderRadius: 4,
-                      background: '#f1f5f9', marginBottom: 10,
-                      display: 'inline-block',
-                    }}
-                  >
-                    {sec.label}
-                  </div>
-                  <div style={{ fontSize: 14, color: '#1e293b', lineHeight: 1.75 }}>
-                    <MarkdownRenderer content={sec.markdown} />
-                  </div>
-                </section>
-              ))
+              detail.sections.map((sec, i) => {
+                const zh = (sec.markdown_zh || '').trim()
+                const showZh = lang === 'zh' && zh.length > 0
+                const body = showZh ? zh : sec.markdown
+                return (
+                  <section key={i} style={{ marginBottom: 28 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                      <div
+                        style={{
+                          fontSize: 13, fontWeight: 600, color: '#475569',
+                          padding: '6px 10px', borderRadius: 4,
+                          background: '#f1f5f9',
+                          display: 'inline-block',
+                        }}
+                      >
+                        {sec.label}
+                      </div>
+                      {showZh && (
+                        <span style={{
+                          fontSize: 11, color: '#0891b2',
+                          background: '#cffafe', padding: '2px 6px', borderRadius: 3,
+                        }}>AI 翻译</span>
+                      )}
+                    </div>
+                    <div style={{ fontSize: 14, color: '#1e293b', lineHeight: 1.75 }}>
+                      <MarkdownRenderer content={body} />
+                    </div>
+                  </section>
+                )
+              })
             )}
             {detail.tickers.length > 0 && (
               <div style={{ marginTop: 20, paddingTop: 16, borderTop: '1px solid #e2e8f0' }}>
@@ -1104,6 +1363,13 @@ function PdfPane({
             style={{ margin: 20 }}
           />
         ) : blobUrl ? (
+          // PDF Open Parameters (#view=FitH&toolbar=1&navpanes=0) are NOT
+          // applied here: Chrome PDFium silently drops them on blob: URLs
+          // and on some PDFs aborts the iframe load entirely
+          // (net::ERR_ABORTED), so the page shows blank even though the
+          // bytes are fine and a forced ?download=1 still works. Chrome's
+          // PDF viewer picks a sensible default zoom on its own; not worth
+          // breaking inline preview for the auto-fit-width nicety.
           <iframe
             src={blobUrl}
             title="PDF"

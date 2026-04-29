@@ -187,32 +187,98 @@ async def _ensure_playwright():
     except ImportError as e:
         raise FetchError(f"playwright not installed: {e}")
     p = await async_playwright().start()
-    browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+    # `--disable-http2` works around `ERR_HTTP2_PROTOCOL_ERROR` from sites that
+    # mis-handle HTTP/2 (verified on investor.wdc.com 2026-04-28). Doesn't hurt
+    # any of the other IR pages — they all support HTTP/1.1.
+    browser = await p.chromium.launch(headless=True,
+                                       args=["--no-sandbox", "--disable-http2"])
     _PLAYWRIGHT_BROWSER = (p, browser)
     return _PLAYWRIGHT_BROWSER
 
 
-async def fetch_html_browser(url: str, *, timeout_ms: int = 30000,
-                              wait_until: str = "domcontentloaded",
-                              extra_wait_ms: int = 2000) -> str:
-    """Render JS-heavy IR pages via Playwright. Reuses one Chromium across the
-    run."""
+# Per-host context cache — Akamai's `ak_bmsc` PoW solution + Cloudflare
+# `cf_clearance` cookie are both expensive to obtain (~5-10s) but valid for
+# 1-2 hours. Reusing a context per host means the second IR page on the same
+# host (e.g. landing-page traversal under investors.micron.com) gets the
+# challenge-passed cookies for free.
+_CONTEXT_CACHE: dict[str, Any] = {}
+
+
+async def _get_context_for_host(host: str):
+    """Returns a Playwright context for `host`, creating + persisting cookies
+    on first call so subsequent fetches reuse the bot-mitigation session."""
     p, browser = await _ensure_playwright()
+    if host in _CONTEXT_CACHE:
+        return _CONTEXT_CACHE[host]
+    # Real Chrome 120 sec-ch-ua headers (Akamai/Cloudflare's bot detection
+    # cross-checks UA string against client-hints; mismatch = challenge fired).
+    extra_headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Linux"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
     context = await browser.new_context(
         user_agent=UA,
         ignore_https_errors=True,
-        viewport={"width": 1280, "height": 900},
+        viewport={"width": 1366, "height": 900},
+        locale="en-US",
+        timezone_id="America/Los_Angeles",
+        extra_http_headers=extra_headers,
     )
+    # playwright-stealth: patches navigator.webdriver, chrome.runtime,
+    # Notification permissions, plugin/mimetype arrays, WebGL vendor/renderer,
+    # canvas-fingerprint noise — defeats the standard bot-detection JS that
+    # Akamai+Cloudflare run inline.
+    try:
+        from playwright_stealth import Stealth
+        await Stealth().apply_stealth_async(context)
+    except Exception as e:
+        logger.debug("playwright-stealth not applied to %s: %s", host, e)
+    _CONTEXT_CACHE[host] = context
+    return context
+
+
+async def fetch_html_browser(url: str, *, timeout_ms: int = 60000,
+                              wait_until: str = "domcontentloaded",
+                              extra_wait_ms: int = 2000,
+                              wait_for_selector: Optional[str] = None) -> str:
+    """Render JS-heavy IR pages via Playwright. Reuses per-host context so
+    bot-mitigation cookies (Akamai ak_bmsc, Cloudflare cf_clearance) carry
+    over between fetches."""
+    host = urlparse(url).netloc
+    context = await _get_context_for_host(host)
     page = await context.new_page()
     try:
         await page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+        # Detect Cloudflare challenge page and wait it out
+        title = await page.title()
+        if title and "just a moment" in title.lower():
+            logger.info("[%s] Cloudflare challenge detected; waiting up to 30s for clearance", host)
+            try:
+                await page.wait_for_function(
+                    "() => !document.title.toLowerCase().includes('just a moment')",
+                    timeout=30000,
+                )
+            except Exception:
+                logger.warning("[%s] Cloudflare challenge did not clear in time", host)
+        if wait_for_selector:
+            try:
+                await page.wait_for_selector(wait_for_selector, timeout=15000)
+            except Exception:
+                pass        # selector miss is OK — extract whatever's there
         if extra_wait_ms:
             await page.wait_for_timeout(extra_wait_ms)
         html = await page.content()
         return html
     finally:
         await page.close()
-        await context.close()
 
 
 # ============================================================
@@ -294,6 +360,116 @@ def extract_pdf_links(html: str, base_url: str) -> list[dict]:
             "category": cat, "category_name": label,
         })
     return _dedup(out)
+
+
+# ===== v2 (2026-04-28): landing-page traversal =====
+# Many IR pages link press releases as HTML landing pages (e.g.
+# `intc.com/news-events/press-releases/<slug>` or
+# `investors.micron.com/news-releases/news-release-details/<slug>`) — the
+# real PDF (earnings release Ex 99.1 / fact sheet) lives one click deeper.
+# `extract_landing_links` returns those candidate landing-page URLs;
+# `extract_pdf_links_from_landing` then re-renders each in Playwright and
+# pulls direct PDFs out.
+
+# Heuristic patterns for landing-page anchors per IR site. Keys are URL
+# substrings; values describe what they look like. Order doesn't matter.
+LANDING_PAGE_PATTERNS = [
+    re.compile(r"/news-?events?/press-?releases?/(?!default)", re.I),
+    re.compile(r"/news-?releases?/news-release-details/", re.I),
+    re.compile(r"/press-?releases?/[^/?]+", re.I),
+    re.compile(r"/news/(?:news-)?detail", re.I),
+    re.compile(r"/financial-?releases?/[^/?]+", re.I),
+    re.compile(r"/investor[/-]news/", re.I),
+    re.compile(r"/news/[^/?]+\.html?$", re.I),
+    # Bloom Energy newsroom pattern: `/news/<slug>/` (trailing slash, no .html)
+    # — added 2026-04-28 v3 after switching from investor.bloomenergy.com
+    # (Cloudflare-challenged) to www.bloomenergy.com/newsroom/.
+    re.compile(r"/news/[a-z0-9][a-z0-9-]+/?$", re.I),
+]
+
+# Skip patterns — pages we don't want to walk (overview / hub / index pages).
+LANDING_SKIP_PATTERNS = [
+    re.compile(r"/(default|index|home|overview|landing)\.aspx?$", re.I),
+    re.compile(r"\.(jpg|jpeg|png|gif|svg|css|js|ico|woff|ttf|mp4)(\?|$)", re.I),
+    re.compile(r"#"),
+    re.compile(r"^javascript:", re.I),
+    re.compile(r"^mailto:", re.I),
+]
+
+LANDING_TEXT_HINT = re.compile(
+    r"earnings|results|quarter|annual|fiscal|press release|financial|investor",
+    re.I,
+)
+
+
+def extract_landing_candidates(html: str, base_url: str,
+                                max_candidates: int = 30) -> list[dict]:
+    """Find anchors that look like press-release / earnings landing pages.
+    Returns up to `max_candidates` items in document order."""
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    out: list[dict] = []
+    seen: set[str] = set()
+    parsed_base = urlparse(base_url)
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if any(p.search(href) for p in LANDING_SKIP_PATTERNS):
+            continue
+        full = urljoin(base_url, href)
+        # Same-host only — don't follow off-site (Twitter, YouTube etc.)
+        try:
+            parsed = urlparse(full)
+        except Exception:
+            continue
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if parsed.netloc and parsed_base.netloc and parsed.netloc != parsed_base.netloc:
+            # Allow the same registered domain (investor.intel.com vs
+            # newsroom.intel.com both belong to "intel.com")
+            base_root = ".".join(parsed_base.netloc.split(".")[-2:])
+            if base_root not in parsed.netloc:
+                continue
+        text = (a.get_text() or "").strip()
+        # Either the URL matches a landing pattern OR the anchor text hints at
+        # earnings/quarterly content
+        url_match = any(p.search(href) for p in LANDING_PAGE_PATTERNS)
+        text_match = bool(text) and bool(LANDING_TEXT_HINT.search(text))
+        if not (url_match or text_match):
+            continue
+        # Skip direct PDFs (already handled by extract_pdf_links)
+        if href.lower().endswith(".pdf"):
+            continue
+        if full in seen:
+            continue
+        seen.add(full)
+        cat, label = _classify(text + " " + href)
+        out.append({
+            "url": full, "text": text, "category": cat, "category_name": label,
+        })
+        if len(out) >= max_candidates:
+            break
+    return out
+
+
+async def extract_pdf_links_from_landing(landing_url: str,
+                                          ticker_canonical: str) -> list[dict]:
+    """Re-render the landing page and extract direct PDF links inside. Uses
+    Playwright (most landing pages are also JS). Best-effort — silent on
+    fetch errors so one bad landing doesn't kill the whole crawl."""
+    try:
+        html = await fetch_html_browser(
+            landing_url, timeout_ms=20000,
+            wait_until="domcontentloaded", extra_wait_ms=1500,
+        )
+    except Exception as e:
+        logger.debug("[%s] landing fetch %s failed: %s",
+                     ticker_canonical, landing_url, e)
+        return []
+    pdfs = extract_pdf_links(html, landing_url)
+    return pdfs
 
 
 def _dedup(items: list[dict]) -> list[dict]:
@@ -421,13 +597,19 @@ async def crawl_one_entry(http_s: requests.Session, entry: dict, *,
     coll = get_collection(SOURCE)
     counters = {"added": 0, "updated": 0, "skipped": 0, "errors": 0}
 
-    needs_browser = bool(entry.get("requires_browser")) and allow_browser
+    # v2 (2026-04-28): default to Playwright for ALL IR pages when browser is
+    # available. Most modern IR sites are SPAs or behind Cloudflare/Akamai
+    # bot-mitigation; plain HTTP requests time out (Micron) or get a 403
+    # (Coherent's `Bloom Energy` mirror, etc.). YAML `requires_browser=False`
+    # was a stale signal — only set explicitly to skip browser. Pass
+    # `--no-browser` for a fast plain-HTTP smoke.
+    needs_browser = allow_browser
     html = ""
     try:
         if needs_browser:
             html = await fetch_html_browser(
                 url,
-                timeout_ms=int(entry.get("browser_timeout_ms") or 30000),
+                timeout_ms=int(entry.get("browser_timeout_ms") or 60000),
                 wait_until=entry.get("browser_wait_until") or "domcontentloaded",
                 extra_wait_ms=int(entry.get("browser_extra_wait_ms") or 2000),
             )
@@ -442,13 +624,43 @@ async def crawl_one_entry(http_s: requests.Session, entry: dict, *,
                    error=str(e)[:300])
         return counters
 
-    links = extract_pdf_links(html, url)
-    if limit:
-        links = links[:limit]
-    logger.info("[%s] %s → %d PDF candidates",
-                ticker.canonical, entry.get("name"), len(links))
+    direct_links = extract_pdf_links(html, url)
+    landing_links = extract_landing_candidates(html, url, max_candidates=30)
 
-    for link in links:
+    # Phase 1: ingest direct PDFs found on the IR landing page
+    logger.info("[%s] %s → %d direct PDFs, %d landing-page candidates",
+                ticker.canonical, entry.get("name"),
+                len(direct_links), len(landing_links))
+
+    all_links: list[dict] = list(direct_links)
+
+    # Phase 2 (v2 — 2026-04-28): walk landing-page candidates → harvest PDFs.
+    # Cap walks at min(15, --max) to bound runtime. Most IR pages have ~5-30
+    # candidates; visiting them all serially via Playwright would be slow.
+    landing_cap = min(15, limit or 15)
+    landings_to_walk = landing_links[:landing_cap]
+    if needs_browser and landings_to_walk:
+        logger.info("[%s] walking %d landing pages (cap=%d)…",
+                    ticker.canonical, len(landings_to_walk), landing_cap)
+        for cand in landings_to_walk:
+            inner = await extract_pdf_links_from_landing(
+                cand["url"], ticker.canonical,
+            )
+            for il in inner:
+                # Inherit the landing's category if extractor couldn't classify
+                if il["category"] == "other":
+                    il["category"] = cand["category"]
+                    il["category_name"] = cand["category_name"]
+                all_links.append(il)
+        # Re-dedupe (same PDF might be linked from multiple landings)
+        all_links = _dedup(all_links)
+        logger.info("[%s] after landing walk: %d total PDFs",
+                    ticker.canonical, len(all_links))
+
+    if limit:
+        all_links = all_links[:limit]
+
+    for link in all_links:
         try:
             status = ingest_pdf(coll, ticker, url, link, http_s,
                                 source_label=entry.get("name") or "")
@@ -460,7 +672,9 @@ async def crawl_one_entry(http_s: requests.Session, entry: dict, *,
 
     save_state(SOURCE, bucket=ticker.canonical,
                last_run_at=datetime.now(timezone.utc),
-               links_seen=len(links))
+               links_seen=len(all_links),
+               direct_pdfs=len(direct_links),
+               landing_walked=len(landings_to_walk) if needs_browser else 0)
     record_daily_stat(SOURCE, ticker.canonical,
                       added=counters["added"], skipped=counters["skipped"],
                       errors=counters["errors"], pdfs=counters["added"])

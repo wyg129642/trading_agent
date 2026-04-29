@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pydantic import BaseModel
 
+from backend.app.api._mongo_filters import NOT_SOFT_DELETED
 from backend.app.config import get_settings
 from backend.app.deps import get_current_user
 from backend.app.models.user import User
@@ -41,6 +42,19 @@ CATEGORY_COLLECTION = {
     "research": "researches",
     "chief": "chief_opinions",
 }
+
+
+def _category_filter(category: str, extra: dict | None = None) -> dict:
+    """Per-category Mongo filter injecting chief_opinions soft-delete gate.
+
+    chief_opinions writes `deleted: True` on cleanup / cross-coll dedup; UI
+    must not show those. summaries/researches don't soft-delete (yet) — pass
+    `extra` through unchanged.
+    """
+    base = dict(extra or {})
+    if category == "chief":
+        base.update(NOT_SOFT_DELETED)
+    return base
 
 CATEGORY_LABEL_CN = {
     "summary": "纪要",
@@ -213,6 +227,8 @@ async def list_items(
         match["foreign_party"] = (research_origin == "foreign")
     if ors:
         match["$or"] = ors
+    if category == "chief":
+        match.update(NOT_SOFT_DELETED)
 
     total = await coll.count_documents(match)
     pipeline = [
@@ -249,7 +265,9 @@ async def get_item(
 ):
     if category not in CATEGORY_COLLECTION:
         raise HTTPException(400, "Unknown category")
-    doc = await _mongo_db()[CATEGORY_COLLECTION[category]].find_one({"_id": item_id})
+    doc = await _mongo_db()[CATEGORY_COLLECTION[category]].find_one(
+        _category_filter(category, {"_id": item_id})
+    )
     if not doc:
         raise HTTPException(404, "Item not found")
     return {
@@ -314,18 +332,18 @@ async def get_stats(user: User = Depends(get_current_user)):
 
     for cat, cname in CATEGORY_COLLECTION.items():
         coll = db[cname]
-        per_category[cat] = await coll.count_documents({})
+        per_category[cat] = await coll.count_documents(_category_filter(cat))
         today[cat] = await coll.count_documents(
-            {"release_time": {"$regex": f"^{today_str}"}}
+            _category_filter(cat, {"release_time": {"$regex": f"^{today_str}"}})
         )
         latest_doc = await coll.find_one(
-            {}, sort=[("release_time_ms", -1)],
+            _category_filter(cat), sort=[("release_time_ms", -1)],
             projection={"release_time": 1},
         )
         latest_per_category[cat] = latest_doc.get("release_time") if latest_doc else None
 
         pipeline = [
-            {"$match": {"organization": {"$nin": [None, ""]}}},
+            {"$match": _category_filter(cat, {"organization": {"$nin": [None, ""]}})},
             {"$group": {"_id": "$organization", "n": {"$sum": 1}}},
             {"$sort": {"n": -1}},
             {"$limit": 8},
@@ -340,7 +358,7 @@ async def get_stats(user: User = Depends(get_current_user)):
     last_7_days: dict[str, dict[str, int]] = {}
     for cat, cname in CATEGORY_COLLECTION.items():
         pipeline = [
-            {"$match": {"release_time": {"$type": "string"}}},
+            {"$match": _category_filter(cat, {"release_time": {"$type": "string"}})},
             {"$group": {
                 "_id": {"$substrBytes": ["$release_time", 0, 10]},
                 "n": {"$sum": 1},

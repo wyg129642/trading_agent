@@ -833,6 +833,19 @@ def _build_filter(
             if s_filter:
                 q[spec.date_str_field] = s_filter
 
+    # Soft-delete gate. chief_opinions cleanup + alphapai.reports thin-clip
+    # cleanup (see crawl/alphapai_crawl/scraper.py::_is_thin_clip_item +
+    # scripts/cleanup_alphapai_thin_clips.py). The filter is harmless on
+    # collections without a `deleted` field, but adding it conditionally
+    # keeps queries clean elsewhere.
+    if (spec.db, spec.collection) in {
+        ("gangtise", "chief_opinions"),
+        ("alphapai", "reports"),
+        ("alphapai", "roadshows"),
+        ("alphapai", "comments"),
+    }:
+        q["deleted"] = {"$ne": True}
+
     return q
 
 
@@ -1722,16 +1735,26 @@ async def fetch_document(
         return {"found": False, "doc_id": doc_id, "error": f"unknown source/collection {source}/{collection}"}
     coll = _coll(spec)
     # String _id is standard across our crawlers; some collections use ObjectId though
+    # Soft-delete gate: mirror _build_filter so a tombstoned doc never
+    # reaches the LLM via fetch_document. chief_opinions + alphapai.reports.
+    extra_q: dict = {}
+    if (spec.db, spec.collection) in {
+        ("gangtise", "chief_opinions"),
+        ("alphapai", "reports"),
+        ("alphapai", "roadshows"),
+        ("alphapai", "comments"),
+    }:
+        extra_q["deleted"] = {"$ne": True}
     doc: dict | None = None
     try:
-        doc = await coll.find_one({"_id": raw_id})
+        doc = await coll.find_one({"_id": raw_id, **extra_q})
     except Exception as e:
         logger.warning("fetch_document find_one(str) failed: %s", e)
     if doc is None:
         try:
             from bson import ObjectId
             if len(raw_id) == 24:
-                doc = await coll.find_one({"_id": ObjectId(raw_id)})
+                doc = await coll.find_one({"_id": ObjectId(raw_id), **extra_q})
         except Exception:
             doc = None
     if doc is None:
@@ -1739,7 +1762,7 @@ async def fetch_document(
         # but _id might be numeric too in some docs)
         if raw_id.isdigit():
             try:
-                doc = await coll.find_one({"_id": int(raw_id)})
+                doc = await coll.find_one({"_id": int(raw_id), **extra_q})
             except Exception:
                 pass
     if not doc:

@@ -799,6 +799,21 @@ def dump_forum_item(client: httpx.Client, cfg: HttpConfig, item: dict,
             if first.get("pdf_download_error"):
                 doc["pdf_download_error"] = first["pdf_download_error"]
 
+    # Truncated guard: 5 个 body 字段全空 + 无 PDF 附件 → staged content
+    # 还没生成 / 专家路演未撰写纪要 (见 MEMORY.md crawler_meritco_staged_content).
+    # 跳过不入库, 让下次再撞同 fid 时重走 detail (这时若内容已补就入库).
+    body_empty = not any(
+        (doc.get(f) or "").strip() for f in
+        ("content_md", "transcript_md", "summary_md", "insight_md", "expert_content_md")
+    )
+    has_pdf_att = bool(doc.get("pdf_attachments") and any(
+        a.get("pdf_local_path") and (a.get("pdf_size_bytes") or 0) > 0
+        for a in (doc.get("pdf_attachments") or [])
+    ))
+    if body_empty and not has_pdf_att:
+        return {"id": fid, "标题": title, "时间": release_time,
+                "状态": "跳过-空内容无附件", **doc["stats"]}
+
     _stamp_ticker(doc, "meritco", col)
     col.replace_one({"_id": fid}, doc, upsert=True)
 

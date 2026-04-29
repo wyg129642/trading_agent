@@ -108,10 +108,16 @@ class Target:
 #                      加速等于"快速消耗 quota → 进入 30min cooldown → 每天少做几个
 #                      cycle", 反而是负优化. 1x 让单 cycle 慢慢吃满 400 条 quota.
 SPEED_MULT: dict[str, float] = {
-    "gangtise":     5.0,
-    "jinmen":       3.0,
-    "alphaengine":  1.0,
-    # other platforms default to 1.0 (alphapai/meritco/funda/acecamp)
+    # 2026-04-29: 全平台慢速档 (用户明确 "保证不被封号"). 在 0.5x baseline 基础上
+    # 再降一档到 0.3-0.4x. base 10-13s, burst 9-12, cooldown 150-450s.
+    # gangtise 单独保留 1.5x (历史无封控记录, 数据量大, 太慢会跑不完).
+    "gangtise":     1.5,
+    "jinmen":       0.3,
+    "alphaengine":  0.4,
+    "alphapai":     0.4,
+    "meritco":      0.4,
+    "funda":        0.4,
+    "acecamp":      0.4,
 }
 
 # 2026-04-27: 完全禁用 quota 闸 — 用户授权 "不限额, 慢慢爬一般不会封号".
@@ -243,14 +249,14 @@ TARGETS: list[Target] = [
            "funda", "sentiments"),
 
     # AceCamp — articles + opinions (events 已于 2026-04 被平台移除)
-    # 2026-04-24 封控事故后调整:
-    # - 6 月回填不抓 article_info detail — VIP quota ~12/天, 回填 30 万条 detail
-    #   根本不可能; 先把 list 元数据 (title/organization/release_time/hashtags)
-    #   回灌到位, detail 留给实时活跃用户 + 未来 quota 恢复后的分批补齐脚本.
-    # - page_size 30 (旧 50): 单 list 调用返回更少, 一轮切分更细, 配合
-    #   UNIVERSAL_FLAGS 的 break_every 更频繁, 避免稳态高密度.
+    # 2026-04-29: --skip-detail 移除. 之前的 list-only stub 写库会把付费内容的
+    # "提纲式 summary" 当 content_md 入库, StockHub 上看到的"信息不全"卡片
+    # (用户反馈案例: "黄金再次新高的逻辑及后市展望") 源头就是这条. dump_article
+    # 现在在 skip_detail=True 路径强制不写, 这里同步去掉 flag 让 backfill 正经
+    # 拉 detail; quota 烧光由 SoftCooldown (10003/10040 自动 30min 静默) +
+    # tripwire (15 连空抛 SessionDead, scraper 退出) 双重兜住.
     Target("acecamp", "articles", "crawl/AceCamp",
-           ["--type", "articles", "--page-size", "30", "--skip-detail"],
+           ["--type", "articles", "--page-size", "30"],
            "acecamp", "articles"),
     Target("acecamp", "opinions", "crawl/AceCamp",
            ["--type", "opinions", "--page-size", "30"],

@@ -1450,6 +1450,19 @@ RESTART_CONFIG: dict[str, dict] = {
                 "留空即匿名模式 — 可抓列表卡片 (title/authors/date/excerpt/image), "
                 "全文体在付费墙后默认 isContentPaywalled=True.",
     },
+    # 不是 scraper, 是 LLM 卡片摘要 worker (qwen-plus). 用 4-tuple 走自定义
+    # script 路径; LLM key 全局来自 .env 不需要 creds_file. 仍然 register 进来
+    # 是为了走 /api/start-all 的统一 spawn/kill + admin UI 状态.
+    "local_ai_summary": {
+        "dir": ROOT / "local_ai_summary",
+        "log": ROOT / "local_ai_summary" / "logs" / "watch.log",
+        "proc_match": r"local_ai_summary.*runner\.py",
+        "args": [],
+        "creds_file": None,
+        "token_field": None,
+        "token_check": lambda s: True,
+        "desc": "qwen-plus 卡片摘要 worker; 凭 .env 里的 LLM_ENRICHMENT_API_KEY 工作, 无需独立凭证.",
+    },
 }
 
 
@@ -1547,6 +1560,15 @@ ALL_SCRAPERS: list[tuple] = [
     # (2) 这里加一行 ("alphapai", ["--category", "wechat"], "watch_wechat.log").
     # 默认**不要**打开 — 已明确不爬.
 
+    # local_ai_summary: qwen-plus 卡片预览摘要 worker. 持仓股票相关、近 14 天、
+    # 缺 native summary 的 doc 走 LLM 提炼成 100-150 字中文卡片摘要,
+    # 写入 local_ai_summary.tldr → StockHub 列表卡片优先展示.
+    # 第 4 元素 = 自定义 script (不是 scraper.py), 触发 crawler_monitor 的
+    # 4-tuple spawn 路径 (line 1796).
+    ("local_ai_summary",
+        ["--watch", "--interval", "600", "--since-days", "14", "--max", "60"],
+        "watch.log", "runner.py"),
+
     # funda: 3 分类并行
     ("funda",       ["--category", "post"],                "watch_post.log"),
     ("funda",       ["--category", "earnings_report"],     "watch_earnings_report.log"),
@@ -1586,17 +1608,25 @@ ALL_SCRAPERS: list[tuple] = [
     #   - opinions 保留 detail (用独立 opinion_info 端点, 不吃 article quota 池).
     # 2026-04-28: 跟 SPECS 同步又紧一档 — base 3.0→3.5, jitter 2.0→2.5,
     # burst 20→15, 冷却 15-40s→25-60s, interval 120/180→180/240. 历史封控过.
-    ("acecamp",     ["--type", "articles", "--skip-detail",
-                     "--interval", "180",
-                     "--throttle-base", "3.5", "--throttle-jitter", "2.5",
-                     "--burst-size", "15",
-                     "--burst-cooldown-min", "25", "--burst-cooldown-max", "60"],
+    # 2026-04-29: 三处同步 (这里 + crawler_manager.SPECS + daily_catchup +
+    # backfill_6months):
+    #   - articles: --skip-detail 移除 (用户禁止 list-only stub 写库, 见
+    #     scraper.py dump_article line 558 + 启动期 startup guard).
+    #   - 节奏跟 crawler_manager.SPECS["acecamp"] 完全对齐: 1/10 事故速率
+    #     (25/15/3/1800), articles + opinions 都加 --daily-cap 50.
+    ("acecamp",     ["--type", "articles",
+                     "--interval", "1800",
+                     "--throttle-base", "25.0", "--throttle-jitter", "15.0",
+                     "--burst-size", "3",
+                     "--burst-cooldown-min", "90", "--burst-cooldown-max", "180",
+                     "--daily-cap", "50"],
                                                            "watch_articles.log"),
     ("acecamp",     ["--type", "opinions",
-                     "--interval", "240",
-                     "--throttle-base", "3.5", "--throttle-jitter", "2.5",
-                     "--burst-size", "15",
-                     "--burst-cooldown-min", "25", "--burst-cooldown-max", "60"],
+                     "--interval", "2400",
+                     "--throttle-base", "25.0", "--throttle-jitter", "15.0",
+                     "--burst-size", "3",
+                     "--burst-cooldown-min", "90", "--burst-cooldown-max", "180",
+                     "--daily-cap", "50"],
                                                            "watch_opinions.log"),
 
     # alphaengine: 4 分类并行 + 1 独立 PDF 回填 worker.

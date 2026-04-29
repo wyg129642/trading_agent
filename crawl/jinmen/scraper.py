@@ -812,17 +812,18 @@ def dump_meeting(session: requests.Session, item: dict, release_time: str,
         "crawled_at": datetime.now(timezone.utc),
     }
 
-    _stamp_ticker(doc, "jinmen", col)
-    col.replace_one({"_id": rid}, doc, upsert=True)
-
-    # OTP 侦测: 所有 stats=0 + aiSummaryAuth=0 + summary_info.uuid 存在
-    # → 平台锁在 WAF OTP 后. 记到 otp_pending, 监控台挂按钮让人解锁.
-    # aiSummaryAuth 的字段可能是 data.aiSummaryAuth / data.auth / 直接 auth_data.aiSummaryAuth
-    total = sum(int(stats.get(k, 0) or 0) for k in
-                ("速览字数", "章节", "指标", "对话条数"))
-    if total == 0:
+    # Truncated guard: 4 个 body 字段全空 = AI summary 还没生成 (staged trap,
+    # 见 MEMORY.md crawler_jinmen_staged_ai). 不入库, 让下次实时轮再撞上同
+    # _id 时重新走 detail (这时 AI 摘要可能已好). OTP 侦测仍跑 — auth_data
+    # 拿到就能判, 不依赖入库.
+    body_empty = not (
+        (transcript and transcript.strip())
+        or (points_text and points_text.strip())
+        or (chapter_text and chapter_text.strip())
+        or (indicator_text and indicator_text.strip())
+    )
+    if body_empty:
         ai_auth = auth_data.get("aiSummaryAuth") if isinstance(auth_data, dict) else None
-        # 实际字段位置: info.uuid + info.recipient (顶层, 不在 aiSummary 下)
         uuid_val = info.get("uuid") or (info.get("aiSummary") or {}).get("uuid") or ""
         recipient = info.get("recipient") or (info.get("aiSummary") or {}).get("recipient") or ""
         if ai_auth == 0 and uuid_val:
@@ -832,12 +833,19 @@ def dump_meeting(session: requests.Session, item: dict, release_time: str,
                                   release_time_ms=release_time_ms)
             except Exception:
                 pass
-    else:
-        # 有内容了 → 可能早先被 OTP 卡住, 现在自然解锁. 顺手清理 pending.
-        try:
-            clear_otp_pending(db, rid)
-        except Exception:
-            pass
+        return {
+            "roadshowId": rid, "标题": title, "时间": release_time, "机构": org,
+            "状态": "跳过-AI摘要未生成", **stats,
+        }
+
+    _stamp_ticker(doc, "jinmen", col)
+    col.replace_one({"_id": rid}, doc, upsert=True)
+
+    # 正常入库后清 OTP pending (有内容了说明早先 OTP 卡住已自然解锁)
+    try:
+        clear_otp_pending(db, rid)
+    except Exception:
+        pass
 
     return {
         "roadshowId": rid, "标题": title, "时间": release_time, "机构": org,
@@ -1238,6 +1246,10 @@ def dump_report(session: requests.Session, item: dict, db, pdf_dir: Path,
         },
         "crawled_at": datetime.now(timezone.utc),
     }
+    # Truncated guard: summary 空 + PDF 没下到 → 跳过不入库
+    if (not summary_md.strip()) and pdf_size <= 0:
+        return {"状态": "跳过-空内容无PDF", "标题": title,
+                "pdf_err": pdf_err, **doc["stats"]}
     _stamp_ticker(doc, "jinmen", col)
     col.replace_one({"_id": rid}, doc, upsert=True)
     return {"状态": "重爬" if force else "新增", "标题": title,
@@ -1453,6 +1465,12 @@ def dump_oversea_report(session: requests.Session, item: dict, db, pdf_dir: Path
         },
         "crawled_at": datetime.now(timezone.utc),
     }
+    # Truncated guard: summary 空 + PDF 没下到 → 整条无内容 (海外原文报告平台
+    # 既无文字摘要又拒绝 PDF, 对 stock-hub 无价值). 跳过不入库, 让下次实时轮
+    # 再撞上同 _id 时若平台后补了内容/PDF 再入库.
+    if (not summary_md.strip()) and pdf_size <= 0:
+        return {"状态": "跳过-空内容无PDF", "标题": title,
+                "pdf_err": pdf_err, **doc["stats"]}
     _stamp_ticker(doc, "jinmen", col)
     col.replace_one({"_id": rid}, doc, upsert=True)
     return {"状态": "重爬" if force else "新增", "标题": title,

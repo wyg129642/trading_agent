@@ -322,6 +322,15 @@ class Settings(BaseSettings):
     llm_enrichment_model: str = "qwen-plus"
     realtime_llm_enrichment_enabled: bool = False
 
+    # News-item EN→ZH translator (Postgres ``news_items`` ⇒ StockHub 突发新闻).
+    # Lifespan worker at backend/app/services/news_translator.py polls recent
+    # English rows and writes title_zh/summary_zh into ``metadata_`` JSONB so
+    # the existing frontend lang toggle picks them up.
+    news_translator_enabled: bool = True
+    news_translator_interval_seconds: int = 300
+    news_translator_per_cycle_max: int = 50
+    news_translator_lookback_days: int = 14
+
     # Realtime rule-based ticker enricher — runs `enrich_tickers.py
     # --incremental` in-process every `interval_sec` so freshly crawled
     # docs reach `_canonical_tickers` within ~one cycle of being inserted

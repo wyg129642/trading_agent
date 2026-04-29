@@ -920,6 +920,121 @@ _SAFE_FNAME_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 _FNAME_MAX_BYTES = 240
 
 
+# 外资券商关键词 (institution.name 子串). 用于识别 "无 market_type 标签但
+# 显然是外资研报" 的条目 — 即 sweep-today watcher 走 list/v2 不带 marketType
+# 过滤时混进来的 JPM/MS/Citi 等空内容条目. 与 dump_one() 的 _is_empty_foreign_report
+# 配合, 让爬虫不再把"平台未提供文字摘要"的外资研报入库.
+_FOREIGN_BROKER_PATTERNS = re.compile(
+    "|".join(re.escape(s) for s in (
+        "摩根大通", "JP Morgan", "JPMorgan", "JPM",
+        "高盛", "Goldman Sachs",
+        "摩根士丹利", "Morgan Stanley",
+        "花旗银行", "花旗", "Citi", "Citigroup",
+        "瑞银", "UBS",
+        "瑞信", "Credit Suisse",
+        "德意志银行", "Deutsche Bank",
+        "美银", "美国银行", "BofA", "BoA", "Bank of America", "美林", "Merrill",
+        "巴克莱", "Barclays",
+        "汇丰", "HSBC",
+        "野村", "Nomura",
+        "麦格理", "Macquarie",
+        "BNP", "法国巴黎", "PNB Paribas",
+        "Jefferies", "杰富瑞",
+        "里昂", "CLSA",
+        "渣打", "Standard Chartered",
+        "三菱日联", "MUFG",
+        "Mizuho", "瑞穗",
+        "Bernstein",
+        "Wells Fargo", "富国",
+        "Susquehanna",
+    ))
+)
+
+
+def _institution_name(item_or_doc: dict) -> str:
+    """Extract institution display name (handles list-of-dict and single-dict)."""
+    inst = item_or_doc.get("institution") or item_or_doc.get("publishInstitution")
+    if isinstance(inst, list) and inst:
+        inst = inst[0]
+    if isinstance(inst, dict):
+        return str(inst.get("name") or "")
+    if isinstance(inst, str):
+        return inst
+    return ""
+
+
+# detail.source labels for AlphaPai's external "clip" feeds (Seeking Alpha
+# articles, JPM TMT-Breakout newsletters, etc.). These items are republished
+# only as a 200–600 char teaser blurb — full body sits behind the original
+# paywall, AlphaPai never carries a PDF or htmlContent for them. They render
+# in StockHub /research as a card with no body and no PDF link, pure noise.
+# Discovery: 2026-04-29, ~10.5k such docs in alphapai-full.reports.
+# Re-add a label here only after confirming via mongo source × pdfFlag stat
+# that the new label always co-occurs with pdfFlag=False + htmlContent=None.
+_THIN_CLIP_SOURCES = frozenset({
+    "seekingalpha", "tb_jpm", "tmt_breakout", "ttg_html", "html",
+})
+
+
+def _is_thin_clip_item(item: dict, doc: dict) -> bool:
+    """True if this is a third-party feed clipping (teaser only — no PDF, no html body).
+
+    Identified post-detail by detail.source ∈ known clip feeds AND no pdfFlag AND
+    blank htmlContent. The contentCn teaser is preserved on the in-memory doc
+    only so the caller can log it; the upsert path writes a soft-delete
+    tombstone instead, picked up automatically by the Milvus delete-sweep
+    (`sweep_deleted_docs` honors ``deleted: {$ne: True}``).
+    """
+    detail = doc.get("detail") or {}
+    src = (detail.get("source") or "").strip()
+    if src not in _THIN_CLIP_SOURCES:
+        return False
+    if detail.get("pdfFlag"):
+        return False
+    if (detail.get("htmlContent") or "").strip():
+        return False
+    return True
+
+
+def _is_empty_foreign_report(item: dict, doc: dict, market_type: Optional[str]) -> bool:
+    """Decide whether a 研报 doc should be dropped instead of upserted.
+
+    True iff:
+      - This is an 外资研报 (market_type=='us' OR institution name is a known
+        foreign broker — covers the sweep-today watcher that omits marketType
+        and ingests mixed-language list pages).
+      - AND every text field is empty (top-level ``content`` + ``list_item.content``
+        + ``list_item.contentCn`` all blank).
+      - AND no usable PDF (``pdf_local_path`` empty or ``pdf_size`` ≤ 0).
+
+    Rationale: those rows render as "[平台未提供文字摘要]" in StockHub /research
+    and are pure noise. They never get filled in retrospectively because the
+    list endpoint won't echo them back once they slip past the page-1 window —
+    so leaving them out keeps the corpus clean. If a future poll re-surfaces
+    the same item with content populated, dedup miss → re-fetch → write
+    (with content) — no permanent suppression.
+    """
+    inst_name = _institution_name(item) or _institution_name(doc)
+    is_foreign = (market_type == "us") or bool(
+        inst_name and _FOREIGN_BROKER_PATTERNS.search(inst_name)
+    )
+    if not is_foreign:
+        return False
+
+    has_text = bool(
+        (doc.get("content") or "").strip()
+        or ((item.get("contentCn") or "").strip())
+        or ((item.get("content") or "").strip())
+    )
+    if has_text:
+        return False
+
+    pdf_size = doc.get("pdf_size") or 0
+    pdf_local = (doc.get("pdf_local_path") or "").strip()
+    has_pdf = bool(pdf_local and pdf_size > 0)
+    return not has_pdf
+
+
 def _truncate_to_bytes(s: str, max_bytes: int = _FNAME_MAX_BYTES) -> str:
     """按 UTF-8 字节宽度截断字符串, 不会截到半个字符."""
     if not s:
@@ -1310,7 +1425,19 @@ def dump_one(session, db, category_key: str, cfg: dict, item: dict,
         ex = col.find_one({"_id": dedup_id},
                           {"_id": 1, "content": 1, "pdf_size": 1, "pdf_error": 1,
                            "pdf_error_kind": 1, "pdf_flag": 1,
-                           "content_truncated": 1, "hasPermission": 1})
+                           "content_truncated": 1, "hasPermission": 1,
+                           "deleted": 1, "_deleted_reason": 1})
+        # Soft-deleted thin-clip tombstone: do NOT re-fetch detail. Returning
+        # here also means cleanup-script soft-deletes survive future watcher
+        # passes — same dedup_id stays invisible without re-ingesting noise.
+        if ex and ex.get("deleted") and ex.get("_deleted_reason") == "thin_clip":
+            return "skipped", {
+                "content_len": 0,
+                "pdf_size": 0,
+                "pdf_error": "",
+                "pdf_flag": False,
+                "skip_reason": "thin_clip_known",
+            }
         if ex:
             # 研报: 已入库但 PDF 下载失败过 → 重试 (除了永久无权限).
             # 老数据没有 pdf_error_kind 字段, 在这里现场分类一次, 让历史的
@@ -1331,6 +1458,11 @@ def dump_one(session, db, category_key: str, cfg: dict, item: dict,
             # 纪要次数已达上限") → 下次再扫时尝试重拉, 如果新的一天额度回来了就能拿到全文
             elif category_key == "roadshow" and ex.get("content_truncated"):
                 pass  # fall through to re-fetch
+            # 券商点评: 不进 re-fetch 队列. 实测 detail 日配额 ~100-150,
+            # 一旦给老 truncated 补就会挤掉当日新 comment 的全文 detail.
+            # 用户决策 2026-04-29: 每日配额全部用于当日新 comment, 老
+            # truncated 永久维持 ~200 字 list 预览, UI banner 揭示截断状态.
+            #   → comment 不加入 dedup-skip allow-list.
             else:
                 return "skipped", {
                     "content_len": len(ex.get("content") or ""),
@@ -1339,12 +1471,57 @@ def dump_one(session, db, category_key: str, cfg: dict, item: dict,
                     "pdf_flag": ex.get("pdf_flag", False),
                 }
 
+    # 每日 detail 配额已耗尽 → 不打 detail RPC, 也不入库 stub. 仅当 (账号, 类别)
+    # exhausted flag 已亮起时触发. 配额跨午夜自动重置后, 同 dedup_id 会在下一轮
+    # list 中被重新发现, 第一次 fetch_detail 直接成功写完整 doc. 把当日剩余 detail
+    # 配额留给真正的当日新增 (顶部最新一页), 不浪费在重复扫描 + 写截断 stub 上.
+    #
+    # 例外: 研报 (category=report) 即使文字 detail 配额耗尽, 单独的 PDF 端点配额
+    # 仍可用 + 平台标 pdfFlag=True 时 PDF 通常仍能下载, 这条路径保留正常 upsert.
+    # roadshow / comment 都没有 PDF, 跳过 stub 没有副作用.
+    if (not force
+            and not list_only
+            and _CURRENT_ACCOUNT_ID
+            and category_key in {"roadshow", "comment", "report"}
+            and is_token_exhausted(_CURRENT_ACCOUNT_ID, category_key)
+            and not (category_key == "report" and item.get("pdfFlag"))):
+        return "skipped", {
+            "content_len": 0, "pdf_size": 0, "pdf_error": "",
+            "pdf_flag": False, "skip_reason": "quota_exhausted",
+        }
+
     # list_only: 跳过 detail 抓取, 节省 3s/条 throttle. 后续 backfill 可用
     # `--force` 配合补 detail.
     if list_only:
         detail = {}
     else:
         detail = fetch_detail(session, cfg, item)
+
+    # detail RPC 撞每日 quota → 不入库 content_truncated stub. 同样的 quota_exhausted
+    # 短路, 但放在 detail 之后捕获那些"撞之前还没 mark"的边缘 case (e.g. 同一轮
+    # 第一条触发 400000 的请求 — exhausted flag 是这一调用 *设置* 的, 不是
+    # *读取* 的, 上面的 pre-gate 看不到). 三种命中:
+    #   * detail._err.code = 400000 ("已达到今日查看上限") — roadshow / report 共用
+    #   * detail._err.code = 403000 ("访问超限") — comment 专属
+    #   * roadshow list_item.hasPermission=False + noPermissionReason.code=7
+    #     ("用户访问纪要次数已达上限") — list 端就告知配额耗尽, detail 不必看
+    if not list_only and category_key in {"roadshow", "comment"} and isinstance(detail, dict):
+        err = detail.get("_err") or {}
+        no_perm = item.get("noPermissionReason") or {}
+        is_quota_blocked = (
+            err.get("code") in (400000, 403000)
+            or (category_key == "roadshow"
+                and item.get("hasPermission") is False
+                and isinstance(no_perm, dict)
+                and no_perm.get("code") == 7)
+        )
+        if is_quota_blocked:
+            if _CURRENT_ACCOUNT_ID:
+                mark_token_exhausted(_CURRENT_ACCOUNT_ID, category_key)
+            return "skipped", {
+                "content_len": 0, "pdf_size": 0, "pdf_error": "",
+                "pdf_flag": False, "skip_reason": "quota_exhausted",
+            }
     title = item.get("title", "")
     time_norm = _normalize_time(item, cfg["time_field"])
 
@@ -1392,6 +1569,16 @@ def dump_one(session, db, category_key: str, cfg: dict, item: dict,
               "accountName", "accountId"):
         v = item.get(k)
         if v not in (None, "", []):
+            # list_item.content 偶尔是 WeChat 转载的 HTML 包装
+            # (`<meta http-equiv><div class="rich_media_content">...`),
+            # 直接存会让 StockHub 渲染成一坨 HTML 文本. 检测到 HTML 起手就
+            # 走 _html_to_md, 同时把原始 HTML 留到 content_html 备查.
+            if k == "content" and isinstance(v, str) and v.lstrip().startswith("<"):
+                md = _html_to_md(v)
+                if md:
+                    doc["content"] = md
+                    doc["content_html"] = v
+                    continue
             doc[k] = v
 
     # 研报: detail.content 是"展开"后的全量核心观点, 覆盖 list 的 180 字截断版
@@ -1452,6 +1639,27 @@ def dump_one(session, db, category_key: str, cfg: dict, item: dict,
             if (doc.get("content") or "").strip():
                 doc["content_truncated"] = False
 
+    # 券商点评同样有 detail 端配额上限. 实测 14860 条中 12586 条 (~84.7%) 落在
+    # _err.code=403000 "访问超限" — 那种状态下 list_item.content 只是 ~200 字
+    # list-card 预览, 不是正文. 上面字段循环把 list_item.content 拷到 doc.content
+    # 当作"正文"基线, 这里要把它撤回 (truncated 状态下没有真正文, 不能让 200 字
+    # snippet 假装成 body — 否则 stock_hub / kb_search 会把它当全文索引、点开正文 tab
+    # 显示残缺片段). 200 字 snippet 仍保留在 doc["list_item"]["content"], 渲染规则
+    # 走 "摘要" 段位 + UI banner 明示截断.
+    if category_key == "comment":
+        err = (detail or {}).get("_err") or {}
+        is_quota_blocked = err.get("code") in (400000, 403000)
+        if is_quota_blocked:
+            doc["content_truncated"] = True
+            doc["quota_msg"] = err.get("message") or ""
+            # 撤回 list_item→top-level 的 content baseline
+            doc.pop("content", None)
+        else:
+            # detail 真的回了内容 (即使长度未必显著超过 list 200 字, 平台本身
+            # 就这么短的也算成功) — 清掉旧标记
+            if isinstance(detail, dict) and detail.get("content") is not None:
+                doc["content_truncated"] = False
+
     # 研报 PDF 下载
     if category_key == "report" and pdf_dir is not None:
         enrich_report_doc(session, doc, item, pdf_dir, token,
@@ -1477,6 +1685,48 @@ def dump_one(session, db, category_key: str, cfg: dict, item: dict,
             existing.add(market_type)
         if existing:
             doc[sub_field] = sorted(existing)
+
+    # 外资研报"全空"短路: 文字三件套 + PDF 全空时不入库. 这些条目在 StockHub
+    # 渲染为 "[平台未提供文字摘要]", 纯噪声. 见 _is_empty_foreign_report.
+    if category_key == "report" and _is_empty_foreign_report(item, doc, market_type):
+        return "skipped", {
+            "content_len": 0,
+            "pdf_size": 0,
+            "pdf_error": "",
+            "pdf_flag": doc.get("pdf_flag", False),
+            "skip_reason": "empty_foreign_report",
+        }
+
+    # 第三方剪报短路: detail.source ∈ {seekingalpha / tb_jpm / tmt_breakout / ...}
+    # 是 AlphaPai 转贴的外部 feed teaser, 永远只有 ~250 字 contentCn 预览, 没有
+    # PDF 也没有 htmlContent. 写入一个 soft-delete tombstone (deleted=True,
+    # _deleted_reason="thin_clip"), 下次同 dedup_id 进 dump_one 时上面的早退
+    # branch 直接返回, 不再发 detail RPC; 同时 sweep_deleted_docs 会在 24h 内
+    # 把 Milvus 中已索引的旧 chunks 一并清掉. 见 _is_thin_clip_item.
+    if category_key == "report" and _is_thin_clip_item(item, doc):
+        col.replace_one(
+            {"_id": dedup_id},
+            {
+                "_id": dedup_id,
+                "category": category_key,
+                "title": title,
+                "publish_time": time_norm,
+                "release_time_ms": release_time_ms,
+                "raw_id": item.get("id"),
+                "deleted": True,
+                "_deleted_at": datetime.now(timezone.utc),
+                "_deleted_reason": "thin_clip",
+                "_clip_source": (detail or {}).get("source"),
+            },
+            upsert=True,
+        )
+        return "skipped", {
+            "content_len": 0,
+            "pdf_size": 0,
+            "pdf_error": "",
+            "pdf_flag": False,
+            "skip_reason": "thin_clip",
+        }
 
     _stamp_ticker(doc, "alphapai", col)
     col.replace_one({"_id": dedup_id}, doc, upsert=True)
@@ -1590,6 +1840,14 @@ def run_category_streaming(session, db, category_key: str, args) -> dict:
                     was_skip = True  # 借用 was_skip 抑制下方 throttle
                 if status == "skipped":
                     skipped += 1; page_skipped += 1; was_skip = True
+                    if info.get("skip_reason") == "empty_foreign_report":
+                        print(f"  ⊘ {time_str} [{category_key}] {title}  外资研报全空, 跳过入库")
+                    elif info.get("skip_reason") == "thin_clip":
+                        print(f"  ⊘ {time_str} [{category_key}] {title}  第三方剪报 teaser, 跳过入库")
+                    elif info.get("skip_reason") == "thin_clip_known":
+                        was_skip = True  # already skipped, don't waste throttle
+                    elif info.get("skip_reason") == "quota_exhausted":
+                        print(f"  ⊘ {time_str} [{category_key}] {title}  今日 detail 配额耗尽, 留给当日新增 (跨天后 list 重发现)")
                 else:
                     added += 1; page_added += 1
                     cap.bump(); _BUDGET.bump()
@@ -1735,7 +1993,16 @@ def run_category(session, db, category_key: str, args) -> dict:
             if status == "skipped":
                 skipped += 1
                 was_skip = True
-                tqdm.write(f"  · {time_str} [{category_key}] {title}  已存在{suffix}")
+                if info.get("skip_reason") == "empty_foreign_report":
+                    tqdm.write(f"  ⊘ {time_str} [{category_key}] {title}  外资研报全空, 跳过入库")
+                elif info.get("skip_reason") == "thin_clip":
+                    tqdm.write(f"  ⊘ {time_str} [{category_key}] {title}  第三方剪报 teaser, 跳过入库")
+                elif info.get("skip_reason") == "thin_clip_known":
+                    pass  # silent — already short-circuited via _skipped index
+                elif info.get("skip_reason") == "quota_exhausted":
+                    tqdm.write(f"  ⊘ {time_str} [{category_key}] {title}  今日 detail 配额耗尽, 跳过 stub")
+                else:
+                    tqdm.write(f"  · {time_str} [{category_key}] {title}  已存在{suffix}")
             else:
                 added += 1
                 cap.bump(); _BUDGET.bump()

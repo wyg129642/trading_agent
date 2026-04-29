@@ -520,17 +520,33 @@ def html_to_md(raw_html: str, max_len: int = 200_000) -> str:
         from bs4 import BeautifulSoup
         from markdownify import markdownify as _md
 
-        soup = BeautifulSoup(raw_html, "html.parser")
-        # 剥掉所有 XBRL 隐藏 fact + script/style + display:none 块
-        for tag in soup.find_all(["ix:hidden", "ix:header", "script", "style"]):
-            tag.decompose()
+        # lxml 解析 XML 命名空间更稳; html.parser 在 decompose 时偶发
+        # 'NoneType' object has no attribute 'get' (迭代器持有已 detach 的子节点).
+        try:
+            soup = BeautifulSoup(raw_html, "lxml")
+        except Exception:
+            soup = BeautifulSoup(raw_html, "html.parser")
+        # 1. 收集要剥的 tag 再统一 decompose, 避免迭代-中-变更.
+        to_decompose: list = []
         for tag in soup.find_all(True):
-            style = (tag.get("style") or "").lower().replace(" ", "")
+            name = (tag.name or "").lower()
+            if name in ("ix:hidden", "ix:header", "script", "style"):
+                to_decompose.append(tag); continue
+            style_attr = tag.get("style") if hasattr(tag, "get") else None
+            style = (style_attr or "").lower().replace(" ", "")
             if "display:none" in style or "visibility:hidden" in style:
+                to_decompose.append(tag)
+        for tag in to_decompose:
+            try:
                 tag.decompose()
-        # ix:nonNumeric / ix:nonFraction 是 inline XBRL 包装,保留 text、丢标签
-        for tag in soup.find_all(re.compile(r"^ix:")):
-            tag.unwrap()
+            except Exception:
+                pass
+        # 2. ix:nonNumeric / ix:nonFraction 是 inline XBRL 包装, 保留 text 丢标签.
+        for tag in list(soup.find_all(re.compile(r"^ix:", re.IGNORECASE))):
+            try:
+                tag.unwrap()
+            except Exception:
+                pass
 
         md = _md(str(soup), heading_style="ATX", strip=["a", "img"])
         md = html_lib.unescape(md)

@@ -261,6 +261,10 @@ async def _query_source(
     coll = _client(uri)[db_name][spec.collection]
 
     match: dict[str, Any] = {"_canonical_tickers": canonical_id}
+    # Soft-delete gate for gangtise.chief_opinions (cleanup_gangtise_chief.py
+    # / dump_research reverse hook); other collections don't soft-delete.
+    if spec.collection == "chief_opinions":
+        match["deleted"] = {"$ne": True}
     if from_date or to_date:
         rng: dict[str, str] = {}
         if from_date:

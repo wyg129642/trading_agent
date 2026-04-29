@@ -399,10 +399,10 @@ start_backend() {
 
     info "Starting backend [${APP_ENV}] on port ${APP_PORT} (engine auto-starts as managed subprocess)..."
     mkdir -p "$PROJECT_DIR/logs" "$PROJECT_DIR/data"
-    export HTTP_PROXY="http://127.0.0.1:7890"
-    export HTTPS_PROXY="http://127.0.0.1:7890"
-    export ALL_PROXY="http://127.0.0.1:7890"
-    export NO_PROXY="localhost,127.0.0.1,.local"
+    export HTTP_PROXY="$(_load_env_var HTTP_PROXY http://192.168.31.97:30801)"
+    export HTTPS_PROXY="$(_load_env_var HTTPS_PROXY http://192.168.31.97:30801)"
+    export ALL_PROXY="$(_load_env_var ALL_PROXY http://192.168.31.97:30801)"
+    export NO_PROXY="$(_load_env_var NO_PROXY localhost,127.0.0.1,.local,jumpbox,116.239.28.36,192.168.31.0/24)"
     PYTHONPATH="$PROJECT_DIR" nohup uvicorn backend.app.main:app \
         --host 0.0.0.0 --port "${APP_PORT}" --workers 1 --log-level info \
         >> "$BACKEND_LOG" 2>&1 &

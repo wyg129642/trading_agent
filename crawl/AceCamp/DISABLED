@@ -1,3 +1,0 @@
-2026-04-24: AceCamp 账号被平台官方封控, detail 端点持续返空壳, list 端点仅能拉标题/摘要.
-用户要求: 账号恢复前一律不抓, 以免把 dashboard "今日入库" 染成假数据.
-恢复方法: 账号恢复 + /data-sources 验证 health=ok + 空壳比例 <30% 后, `rm crawl/AceCamp/DISABLED`.

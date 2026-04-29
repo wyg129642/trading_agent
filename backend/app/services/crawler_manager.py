@@ -160,20 +160,31 @@ SPECS: dict[str, CrawlerSpec] = {
         # SoftCooldown (10003/10040 自动触发) + --skip-detail (detail 不触 quota).
         # 2026-04-28: 又紧一档 (3.0→3.5 base, 2.0→2.5 jitter, burst 20→15,
         # 冷却 15-40→25-60s). AceCamp 团队金卡封过一次, 用户明确要求"再小心一些".
+        # 2026-04-28 (二次): 用户要求恢复 AceCamp 但速率降到事故时的 1/10
+        #   事故时 base=2.5/jitter=1.5/burst=30/cap=500 → 1/10 = 25/15/3/50
+        #   interval 也×10 (180→1800, 240→2400). 加 --daily-cap 50 兜住列表流量,
+        #   即便 quota 真出事也不致于在一两分钟内灌满异常.
+        # 2026-04-29: --skip-detail 移除. list-only 写库会写"付费内容提纲"作 stub
+        #   (用户反馈"黄金再次新高的逻辑及后市展望"卡片), 现在 dump_article 在
+        #   skip_detail 路径上强制不写, 配合这里去掉 flag 让 watcher 真正调 detail.
+        #   detail quota 烧光由 _tripwire_record_detail (15 连空 SessionDead 退出)
+        #   + SoftCooldown (10003/10040 自动 30min 静默) 兜住; SessionDead 现在会
+        #   让 watcher 直接 sys.exit(2), 不再继续轮询灌空数据.
         "articles": ("--watch", "--resume", "--since-hours", "24",
-                     "--interval", "180",
-                     "--throttle-base", "3.5", "--throttle-jitter", "2.5",
-                     "--burst-size", "15",
-                     "--burst-cooldown-min", "25",
-                     "--burst-cooldown-max", "60",
-                     "--type", "articles",
-                     "--skip-detail"),
+                     "--interval", "1800",
+                     "--throttle-base", "25.0", "--throttle-jitter", "15.0",
+                     "--burst-size", "3",
+                     "--burst-cooldown-min", "90",
+                     "--burst-cooldown-max", "180",
+                     "--daily-cap", "50",
+                     "--type", "articles"),
         "opinions": ("--watch", "--resume", "--since-hours", "24",
-                     "--interval", "240",
-                     "--throttle-base", "3.5", "--throttle-jitter", "2.5",
-                     "--burst-size", "15",
-                     "--burst-cooldown-min", "25",
-                     "--burst-cooldown-max", "60",
+                     "--interval", "2400",
+                     "--throttle-base", "25.0", "--throttle-jitter", "15.0",
+                     "--burst-size", "3",
+                     "--burst-cooldown-min", "90",
+                     "--burst-cooldown-max", "180",
+                     "--daily-cap", "50",
                      "--type", "opinions"),
     }),
     "alphaengine": CrawlerSpec("alphaengine", "alphaengine", {

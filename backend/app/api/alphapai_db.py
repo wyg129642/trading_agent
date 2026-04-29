@@ -406,7 +406,26 @@ async def list_items(
     db = _mongo_db()
     coll = db[CATEGORY_COLLECTION[category]]
 
-    match: dict[str, Any] = {}
+    # Visibility gates. Mirrors stock_hub's per-stock feed.
+    #   deleted=True — thin-clip tombstones (cleanup_alphapai_thin_clips.py).
+    #   content_truncated=True — detail RPC hit the daily 400000 quota and
+    #     only the ~136-220 char list-card preview made it into `content`.
+    #     For roadshows (which never have a PDF) this means there's literally
+    #     no body to show; suppress until retry_truncated_roadshows refills
+    #     it next-day. For reports the PDF often DID download (16k of 17k
+    #     truncated reports have pdf_text_md), so we only suppress the rare
+    #     truncated-AND-no-PDF case — otherwise we'd hide 16k useful reports.
+    match: dict[str, Any] = {"deleted": {"$ne": True}}
+    if category == "roadshow":
+        match["content_truncated"] = {"$ne": True}
+    elif category == "report":
+        match["$and"] = [{
+            "$or": [
+                {"content_truncated": {"$ne": True}},
+                {"pdf_text_md": {"$nin": [None, ""]}},
+                {"pdf_local_path": {"$nin": [None, ""]}},
+            ]
+        }]
     if q:
         match["$or"] = [
             {"title": {"$regex": q, "$options": "i"}},

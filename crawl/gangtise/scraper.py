@@ -346,6 +346,88 @@ def _safe_filename(name: str, max_len: int = 160) -> str:
     return cleaned[:max_len] or "untitled"
 
 
+# Cross-collection dedup: chief_opinions vs researches.
+# Gangtise pushes the same external broker report to both feeds (different
+# _id schemes — rptId vs c<msgId>), so within-collection dedup misses it.
+# `_norm_title` is written into both researches and chief_opinions docs and
+# matched on (organization, release_time_ms, _norm_title) — strict three-key.
+import unicodedata as _unicodedata
+
+_NORM_TITLE_PUNCT_RE = re.compile(r"[\s　\W_]+", re.UNICODE)
+
+
+def _normalize_chief_title(s: Any) -> str:
+    if not s:
+        return ""
+    s = _unicodedata.normalize("NFKC", str(s)).lower().strip()
+    return _NORM_TITLE_PUNCT_RE.sub("", s)
+
+
+def _is_quote_noise(text: str) -> bool:
+    """True if the OCR'd text looks like a stock-quote screen noise dump
+    rather than real article body. Heuristics tuned 2026-04-29 after finding
+    that ~86% of ``is_attachment=True`` chief_opinions actually carry
+    high-quality WeChat article OCR in ``parsed_msg.content`` (broker research
+    summaries, 数百字), with only a small minority being price-screen junk.
+
+    Considered noise if:
+      - very short (<60 chars), OR
+      - high digit + symbol density typical of K-line / quote captions
+        AND short enough to plausibly be a screenshot of a price panel.
+    """
+    if not text:
+        return True
+    s = text.strip()
+    if len(s) < 60:
+        return True
+    digit_ratio = sum(1 for ch in s if ch.isdigit()) / max(len(s), 1)
+    symbol_chars = "%¥$.,()[]+-/:"
+    symbol_ratio = sum(1 for ch in s if ch in symbol_chars) / max(len(s), 1)
+    if len(s) < 300 and digit_ratio > 0.25 and symbol_ratio > 0.05:
+        return True
+    if "成交量" in s and len(s) < 300 and digit_ratio > 0.2:
+        return True
+    return False
+
+
+def _is_title_echo(text: str, title: str) -> bool:
+    """True if `text` is just a (truncated/exact) echo of `title`, not a body.
+
+    Used by dump_chief's empty-content guard to drop "WeChat link-only" items
+    where parsed_msg.description repeats the title verbatim or is a strict
+    substring (~Sigma Lithium 2025Q4 季度报告 case). Real analyst bodies
+    are >80 chars and don't sit inside the title.
+    """
+    if not text:
+        return True
+    t_norm = _normalize_chief_title(text)
+    title_norm = _normalize_chief_title(title)
+    if not t_norm or not title_norm:
+        return False
+    if t_norm == title_norm:
+        return True
+    if len(text) <= 80 and (t_norm in title_norm or title_norm.startswith(t_norm)):
+        return True
+    return False
+
+
+def _find_dup_research(db, organization: str, release_time_ms: Optional[int],
+                       title: str) -> Optional[dict]:
+    if not (organization and release_time_ms and title):
+        return None
+    norm = _normalize_chief_title(title)
+    if not norm:
+        return None
+    return db["researches"].find_one(
+        {
+            "organization": organization,
+            "release_time_ms": release_time_ms,
+            "_norm_title": norm,
+        },
+        {"_id": 1},
+    )
+
+
 # ==================== 列表抓取 (每种类型一个) ====================
 
 def fetch_summary_list(session, page: int, size: int,
@@ -872,6 +954,7 @@ def dump_research(session, db, item: dict, pdf_dir: Path,
         "raw_id": item.get("id"),
         "rpt_id": item.get("rptId"),
         "title": item.get("title") or "",
+        "_norm_title": _normalize_chief_title(item.get("title") or ""),
         "release_time": release_time,
         "release_time_ms": int(release_ms) if release_ms else None,
         "rpt_date": item.get("rptDate"),
@@ -905,8 +988,34 @@ def dump_research(session, db, item: dict, pdf_dir: Path,
         },
         "crawled_at": datetime.now(timezone.utc),
     }
+    # Truncated guard: brief 空 + PDF 没下到 → 整条无内容. brief 是核心观点
+    # (研报 list 自带), 一般非空; 真到这里大多是平台数据缺失.
+    if (not brief.strip()) and pdf_size <= 0:
+        return "skipped_empty", doc["stats"]
     _stamp_ticker(doc, "gangtise", col)
     col.replace_one({"_id": did}, doc, upsert=True)
+    # Reverse cross-collection cleanup: if the matching chief_opinion was
+    # ingested earlier (chief feed dropped first; research arrived later),
+    # soft-delete it now so users only see one card per logical document.
+    # Soft delete (not hard) per user policy; sweep_deleted_docs picks the
+    # tombstone up on the next daily Milvus pass.
+    if doc.get("organization") and doc.get("release_time_ms") and doc.get("_norm_title"):
+        try:
+            db["chief_opinions"].update_many(
+                {
+                    "organization": doc["organization"],
+                    "release_time_ms": doc["release_time_ms"],
+                    "_norm_title": doc["_norm_title"],
+                    "deleted": {"$ne": True},
+                },
+                {"$set": {
+                    "deleted": True,
+                    "_deleted_at": datetime.now(timezone.utc),
+                    "_deleted_reason": f"dup_research:{did}",
+                }},
+            )
+        except PyMongoError:
+            pass  # best-effort; missing index just means slower query
     status = "added" if (pdf_size or not download_pdf) else "added_no_pdf"
     return status, doc["stats"]
 
@@ -969,25 +1078,34 @@ def dump_chief(session, db, item: dict, force: bool = False,
         ).strftime("%Y-%m-%d %H:%M") if release_ms else ""
         kind = "PDF" if ext == ".pdf" else "图片"
         title = f"[{kind}] {poster}" + (f" · {title_fmt}" if title_fmt else "")
-        # 有 description/translated 才留, OCR content 丢
+        # 2026-04-29: parsed.content 实际上 ~86% 是高质量微信文章 OCR
+        # (券商小作文 数百字), 只有少量是行情屏截图噪声 (价格/MA 数字). 之前
+        # 整段丢导致 1054/1056 attachment chief 的 content_md 为空, UI 全显示
+        # "[平台未提供文字摘要]". 改为只过滤明显的行情噪声 (_is_quote_noise),
+        # 真 OCR 正文进 content_md.
         description = _strip_html((parsed.get("description") or "").strip())
-        body = description  # 不带 OCR 噪声
+        ocr_raw = _strip_html((parsed.get("content") or "").strip())
+        ocr = "" if _is_quote_noise(ocr_raw) else ocr_raw
+        body = ocr or description
         attachment_url = parsed.get("url") or ""
         source_url = ""
     else:
         title = raw_title
         description = _strip_html((parsed.get("description") or "").strip())
         content = _strip_html((parsed.get("content") or "").strip())
-        body = content or description or title
+        # 2026-04-29: title fallback removed. Letting body fall back to title
+        # produced "empty" chief cards (content_md == title, no real body) that
+        # bypassed the empty-content guard below. Now: body stays empty when
+        # both content and description are missing, and the guard skips them.
+        body = content or description
         attachment_url = ""
-        # Some chief items are "external article pointers" — msgText carries
-        # only title + a WeChat/mp.weixin.qq.com url; content/description
-        # both null. Expose that url as source_url so the UI can render
-        # "阅读原文" deep-link and users can read the real body off-site.
+        # Link-only chief items (msgText carries only title + a WeChat URL,
+        # content/description both null) are now treated as garbage per user
+        # decision (2026-04-29) — skipped by the empty-content guard. The
+        # source_url is still captured for any non-empty chief that happens
+        # to also link out, but on its own it's not enough to keep the doc.
         raw_url = (parsed.get("url") or "").strip()
         source_url = raw_url if raw_url.startswith("http") else ""
-        # For these link-only items, body=title isn't a bug — it's the
-        # server's shape. Leave body as title so list views stay non-empty.
 
     release_ms = item.get("msgTime") or 0
     release_time = _ms_to_str(release_ms)
@@ -1004,6 +1122,7 @@ def dump_chief(session, db, item: dict, force: bool = False,
         "raw_id": item.get("id"),
         "msg_id": item.get("msgId"),
         "title": title,
+        "_norm_title": _normalize_chief_title(raw_title),
         "release_time": release_time,
         "release_time_ms": int(release_ms) if release_ms else None,
         "organization": item.get("partyName") or "",
@@ -1033,6 +1152,28 @@ def dump_chief(session, db, item: dict, force: bool = False,
         },
         "crawled_at": datetime.now(timezone.utc),
     }
+    # Empty-content guard. 2026-04-29 unified rule (replacing earlier
+    # attachment-exempt version):
+    #   - 任何条目, 不管 is_attachment, content_md / description_md 必须有
+    #     真实正文 (非 title-echo). attachment 现在也走 OCR 提取
+    #     (parsed.content), 行情噪声被 _is_quote_noise 过滤掉, 真 OCR 文章正文
+    #     会进 body — 所以 attachment 在这里和普通条目共用同一个判定.
+    #   - 没有真实正文的条目整条跳 (不入库). UI 上的 "[平台未提供文字摘要]"
+    #     就是这种条目造成的噪声.
+    body_real = bool((body or "").strip()) and not _is_title_echo(body, title)
+    desc_real = bool((description or "").strip()) and not _is_title_echo(description, title)
+    if not body_real and not desc_real:
+        return "skipped_empty", doc["stats"]
+    # Cross-collection dedup: drop chief that duplicates an existing research
+    # doc. Strict 3-key (organization, release_time_ms, _norm_title); see
+    # `_find_dup_research`. Attachments stay (raw_title is a hash filename
+    # so the lookup naturally returns nothing — but we early-exit anyway).
+    if not is_attachment:
+        dup = _find_dup_research(
+            db, doc["organization"], doc["release_time_ms"], raw_title,
+        )
+        if dup:
+            return "skipped_dup_research", {"dup_of": dup["_id"]}
     _stamp_ticker(doc, "gangtise", col)
     col.replace_one({"_id": did}, doc, upsert=True)
     return "added", doc["stats"]
@@ -1308,8 +1449,14 @@ def run_type_streaming(session, db, content_type: str, args) -> dict:
                 was_skip = False
                 try:
                     status, info = _DUMP_FUNC[content_type](session, db, it, args)
-                    if status == "skipped":
+                    # `status` ∈ {skipped, skipped_empty, skipped_dup_research,
+                    # added, added_no_pdf}. Anything starting with "skipped"
+                    # never hit Mongo and counts as skipped, not added.
+                    if status.startswith("skipped"):
                         skipped += 1; page_skipped += 1; was_skip = True
+                        if status != "skipped":
+                            tag = status.removeprefix("skipped_")
+                            print(f"  · [{did[:16]}] {title}  跳过({tag})")
                     else:
                         added += 1; page_added += 1
                         cap.bump(); _BUDGET.bump()
@@ -1414,10 +1561,16 @@ def run_type(session, db, content_type: str, args) -> dict:
         was_skip = False
         try:
             status, info = _DUMP_FUNC[content_type](session, db, it, args)
-            if status == "skipped":
+            # `status` ∈ {skipped, skipped_empty, skipped_dup_research, added,
+            # added_no_pdf}. Anything starting with "skipped" never hit Mongo.
+            if status.startswith("skipped"):
                 skipped += 1
                 was_skip = True
-                tqdm.write(f"  · [{did[:16]}] {title}  已存在")
+                if status == "skipped":
+                    tqdm.write(f"  · [{did[:16]}] {title}  已存在")
+                else:
+                    tag = status.removeprefix("skipped_")
+                    tqdm.write(f"  · [{did[:16]}] {title}  跳过({tag})")
             else:
                 added += 1
                 cap.bump(); _BUDGET.bump()
@@ -1654,6 +1807,16 @@ def connect_mongo(uri: str, dbname: str):
         col.create_index("release_time_ms")
         col.create_index("organization")
         col.create_index("crawled_at")
+    # Cross-collection dedup (chief_opinions ↔ researches): 严格三键
+    # (organization, release_time_ms, _norm_title) → compound + _norm_title
+    # indexes on both, plus a `deleted` index on chief_opinions for the
+    # soft-delete `$ne True` filter that every consumer uses.
+    for cname in ("researches", "chief_opinions"):
+        col = db[cname]
+        col.create_index([("organization", 1), ("release_time_ms", 1)],
+                         name="org_release_time_ms")
+        col.create_index("_norm_title")
+    db["chief_opinions"].create_index("deleted", sparse=True)
     print(f"[Mongo] 已连接 {uri} -> db: {dbname}")
     return db
 

@@ -55,6 +55,26 @@ CATEGORY_LABELS = {
     "breaking": "突发新闻",
 }
 
+# Sources whose scraper sets `content_truncated=True` when the doc only has
+# a list-card preview / stub and no full body or PDF fallback. Stock Hub
+# hides these from both list + detail endpoints (HTTP 410) so the per-stock
+# feed only surfaces high-signal items. 截断成因因平台而异:
+#   alphapai    — comments 撞 detail 配额 403000/400000
+#   acecamp     — articles detail 返空 (legacy summary→content fallback 污染)
+#   alphaengine — news 设计上不补全文 (额度让给纪要/研报);
+#                 china/foreign_reports/summaries 当 content_md == doc_introduce
+#                 且 < 1000 字 且无 PDF 时屏蔽, enrich 后清 flag 重新可见
+#   jinmen      — oversea_reports 海外原文仅 PDF / meetings staged AI summary 未生成
+#   gangtise    — chief_opinions 图片观点 / summaries+researches 平台缺数据
+#   meritco     — forum staged content / 专家未撰写纪要 (jiuqian-full)
+#   thirdbridge — interviews 付费墙 / 实录未出
+# 通用判定: body 候选全空 AND 无 PDF 兜底. 各爬虫 dump 入库时都会 early-return
+# 跳过这种 stub, 不再回头补抓; 已入库历史的也按同规则一次性回填 flag.
+TRUNCATION_FLAG_SOURCES = {
+    "alphapai", "acecamp", "alphaengine",
+    "jinmen", "gangtise", "meritco", "thirdbridge",
+}
+
 
 # --------------------------------------------------------------------------- #
 # Source registry — one row per (platform, collection) tagged with a category.
@@ -76,9 +96,17 @@ class _Source:
         org_field: str | None = None,
         pdf_route: str | None = None,
         pdf_gate: tuple[str, ...] = ("pdf_size", "pdf_size_bytes", "has_pdf", "pdf_flag", "pdf_local_path"),
-        body_sections: tuple[tuple[str, str], ...] = (),
+        body_sections: tuple[tuple[str, str | tuple[str, ...]], ...] = (),
         source_label: str,
         id_coerce: str = "str",
+        # Native Chinese translation paths the upstream platform itself
+        # provides. Maps a source field (e.g. ``content_md`` / ``brief_md``)
+        # to a dotted path on the same doc whose value is the native zh
+        # translation (e.g. ``parsed_msg.translatedDescription``). When set,
+        # the detail / list builders prefer this over our own LLM-written
+        # ``<field>_zh`` so we don't pay translation cost where the platform
+        # already supplies one. Tuple value = fallback chain.
+        native_zh_paths: dict[str, str | tuple[str, ...]] | None = None,
     ) -> None:
         # ``preview_field`` accepts either a single dotted path or a tuple of
         # fallback paths. The first non-empty string wins. Tuple form is for
@@ -86,9 +114,14 @@ class _Source:
         # AlphaPai 研报 stores the preview in `list_item.content` for some doc
         # types and `list_item.contentCn` / top-level `content` for others).
         # ``body_sections`` is an ordered list of (label, field_path) pairs.
-        # field_path can be dotted (nested). Empty / whitespace values are dropped
-        # at render time so platforms that sometimes populate one field and
-        # sometimes another (e.g. meetings: points_md vs transcript_md) all work.
+        # field_path can be a dotted string OR a tuple of dotted paths — for
+        # the tuple form the first non-empty path wins (used when one logical
+        # section has multiple candidate storage fields and we don't want
+        # near-duplicates rendered as parallel tabs, e.g. gangtise
+        # chief_opinions where brief_md is just a 500-char prefix of content_md).
+        # Empty / whitespace values are dropped at render time so platforms
+        # that sometimes populate one field and sometimes another (e.g.
+        # meetings: points_md vs transcript_md) all work.
         # ``pdf_gate`` is the list of Mongo fields that, when truthy, mean the
         # doc HAS a PDF — used at list time so we only emit ``pdf_url`` for
         # docs that actually resolve (otherwise the UI shows a broken button).
@@ -117,6 +150,10 @@ class _Source:
         self.body_sections = body_sections
         self.source_label = source_label
         self.id_coerce = id_coerce
+        self.native_zh_paths: dict[str, tuple[str, ...]] = {}
+        if native_zh_paths:
+            for k, v in native_zh_paths.items():
+                self.native_zh_paths[k] = (v,) if isinstance(v, str) else tuple(v)
 
 
 SOURCES: list[_Source] = [
@@ -147,6 +184,16 @@ SOURCES: list[_Source] = [
             ("摘要", "list_item.content"),
         ),
         source_label="AlphaPai · 研报",
+        # AlphaPai mirrors foreign-broker (JPM/MS/GS) reports verbatim — title
+        # / content stay English while list_item.titleCn / list_item.contentCn
+        # carry the platform-supplied translation (populated only for English
+        # originals; empty for Chinese-language reports). Use these as the
+        # native Chinese sources before falling back to LLM `<field>_zh`.
+        native_zh_paths={
+            "title":   ("list_item.titleCn", "detail.titleCn"),
+            "content": ("list_item.contentCn", "detail.contentCn"),
+            "list_item.content": ("list_item.contentCn",),
+        },
     ),
     _Source(
         source="alphapai", db_attr="alphapai_mongo_db", uri_attr="alphapai_mongo_uri",
@@ -243,6 +290,16 @@ SOURCES: list[_Source] = [
             ("正文", "content_md"),
         ),
         source_label="岗底斯 · 研报",
+        # Gangtise itself supplies a free Chinese translation on every foreign
+        # research note: detail_result.translatedBrief (≈1-2K chars, our
+        # "正文"/"摘要" body length); list_item.translatedBrief mirrors it on
+        # the list payload so we don't have to fetch the detail just for the
+        # preview. We prefer these over our LLM translation.
+        native_zh_paths={
+            "brief_md":   ("list_item.translatedBrief", "detail_result.translatedBrief"),
+            "content_md": ("detail_result.translatedBrief", "list_item.translatedBrief"),
+            "title":      ("list_item.translatedTitle", "detail_result.translatedTitle"),
+        },
     ),
     _Source(
         source="gangtise", db_attr="gangtise_mongo_db", uri_attr="gangtise_mongo_uri",
@@ -261,13 +318,37 @@ SOURCES: list[_Source] = [
         source="gangtise", db_attr="gangtise_mongo_db", uri_attr="gangtise_mongo_uri",
         collection="chief_opinions", category="commentary",
         time_field="release_time", time_ms_field="release_time_ms",
-        url_field="web_url", preview_field="description_md",
+        url_field="web_url",
+        # Field shape on this collection:
+        #   description_md — curated editorial lead-in, populated for ~85%
+        #                    (内资/外资 institutional analyst items only). Empty for
+        #                    most KOL/大V variants — that's where the original
+        #                    "[平台未提供文字摘要]" fallback was firing.
+        #   brief_md       — auto-extracted first ~500 chars of content_md;
+        #                    near-identical to it in 98% of docs sampled.
+        #   content_md     — full body, populated for ~99%.
+        # So preview falls back description_md → brief_md → content_md, and
+        # body_sections renders 简介 (description_md) + 正文 (content_md, or
+        # brief_md when content_md is missing) — never both, to avoid the
+        # duplicate-tab UX you'd get from listing brief_md and content_md
+        # side by side.
+        preview_field=("description_md", "brief_md", "content_md"),
         org_field="organization",
         body_sections=(
-            ("正文", "description_md"),
-            ("详情", "content_md"),
+            ("简介", "description_md"),
+            ("正文", ("content_md", "brief_md")),
         ),
         source_label="岗底斯 · 首席观点",
+        # chief_opinions stores the upstream translation in parsed_msg.
+        # 100% of foreign docs have translatedTitle; ~43% have
+        # translatedDescription. When translatedDescription is missing we
+        # fall through to the LLM-written `<field>_zh`.
+        native_zh_paths={
+            "description_md": "parsed_msg.translatedDescription",
+            "content_md":     "parsed_msg.translatedDescription",
+            "brief_md":       "parsed_msg.translatedDescription",
+            "title":          "parsed_msg.translatedTitle",
+        },
     ),
     # ── Funda (US) ─────────────────────────────────────────────────────────
     _Source(
@@ -452,7 +533,7 @@ _CACHE_TTL_SECONDS = 300
 def _preview(text: Any, limit: int = 320) -> str:
     if not isinstance(text, str):
         return ""
-    s = text.strip()
+    s = _strip_md_for_preview(text.strip())
     return s[:limit] + ("…" if len(s) > limit else "")
 
 
@@ -481,6 +562,59 @@ _BLOCK_HTML_RE = re.compile(
 # Invisible / zero-width chars that pad docs without rendering anything.
 # U+200B ZWSP, U+200C ZWNJ, U+200D ZWJ, U+2060 WORD JOINER, U+FEFF BOM.
 _INVISIBLE_CHARS_RE = re.compile(r"[​-‍⁠﻿]")
+
+# Markdown formatting characters that show up literally in StockHub preview
+# cards (frontend renders the field as plain text in a 2-line clamped div, so
+# `# 标题` / `**粗体**` / `- 列表` leak verbatim). Used by ``_strip_md_for_preview``.
+_MD_LINK_RE        = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+_MD_FENCE_RE       = re.compile(r"```[^\n]*\n?")
+_MD_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_BOLD_RE        = re.compile(r"\*\*([^\n]+?)\*\*|__([^\n]+?)__")
+_MD_ITALIC_RE      = re.compile(r"(?<![*\\])\*([^*\n]+?)\*(?!\*)|(?<![_\\\w])_([^_\n]+?)_(?!\w)")
+_MD_STRIKE_RE      = re.compile(r"~~([^~\n]+)~~")
+_MD_HEADING_RE     = re.compile(r"(?m)^\s{0,3}#{1,6}\s+")
+_MD_BLOCKQUOTE_RE  = re.compile(r"(?m)^\s{0,3}>+\s?")
+_MD_LIST_BULLET_RE = re.compile(r"(?m)^\s{0,3}[-*+]\s+")
+_MD_LIST_NUM_RE    = re.compile(r"(?m)^\s{0,3}\d+\.\s+")
+_MD_HRULE_RE       = re.compile(r"(?m)^\s*[-*_]{3,}\s*$")
+_MD_TABLE_SEP_RE   = re.compile(r"(?m)^\s*\|?[-:|\s]{3,}\|?\s*$")
+_HTML_TAG_RE       = re.compile(r"<[^>]+>")
+
+
+def _strip_md_for_preview(s: str) -> str:
+    """Render markdown-flavored text as plain prose for StockHub preview cards.
+
+    Different from ``_normalize_markdown`` (which preserves structure so the
+    detail drawer can render via ``MarkdownRenderer``). Preview cards on the
+    list show the field in a plain ``<div>`` with ``WebkitLineClamp: 2``, so
+    raw ``#`` / ``**`` / ``- `` / ``[…](…)`` characters show up verbatim.
+    This drops formatting characters and keeps only the visible text.
+    """
+    if not s:
+        return s
+    if _INVISIBLE_CHARS_RE.search(s):
+        s = _INVISIBLE_CHARS_RE.sub("", s)
+    if "&" in s and ";" in s:
+        s = html_lib.unescape(s)
+    if "<" in s and ">" in s:
+        s = _HTML_TAG_RE.sub(" ", s)
+    s = _MD_LINK_RE.sub(r"\1", s)
+    s = _MD_FENCE_RE.sub("", s).replace("```", "")
+    s = _MD_INLINE_CODE_RE.sub(r"\1", s)
+    s = _MD_BOLD_RE.sub(lambda m: m.group(1) or m.group(2) or "", s)
+    s = _MD_ITALIC_RE.sub(lambda m: m.group(1) or m.group(2) or "", s)
+    s = _MD_STRIKE_RE.sub(r"\1", s)
+    s = _MD_HEADING_RE.sub("", s)
+    s = _MD_BLOCKQUOTE_RE.sub("", s)
+    s = _MD_LIST_BULLET_RE.sub("", s)
+    s = _MD_LIST_NUM_RE.sub("", s)
+    s = _MD_HRULE_RE.sub("", s)
+    s = _MD_TABLE_SEP_RE.sub("", s)
+    if "|" in s:
+        s = s.replace("|", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n+", " ", s)
+    return s.strip()
 
 
 def _strip_block_html(body: str) -> str:
@@ -622,6 +756,31 @@ async def _query_spec(
 
     base_match: dict[str, Any] = {"_canonical_tickers": canonical_id}
 
+    # Truncation filter — sources that store a content_truncated=True flag
+    # when the upstream detail endpoint hit a per-account quota cap (so the
+    # only thing in Mongo is a ~50-200 char list-card preview, not the full
+    # body). Per the 2026-04-29 policy these entries are NOT shown on Stock
+    # Hub at all (counts + items both filtered) so the feed stays high-signal.
+    # The doc still lives in Mongo for ticker indexing / historical lookup;
+    # it's only the per-stock feed that hides it.
+    #   alphapai — comments hit detail quota 403000/400000 (~84% of corpus)
+    #   acecamp  — articles where detail returned empty + summary_md got
+    #              promoted to content_md via the legacy fallback (~65%)
+    if spec.source in TRUNCATION_FLAG_SOURCES:
+        base_match["content_truncated"] = {"$ne": True}
+
+    # Soft-delete gate. Originally chief_opinions; extended 2026-04-29 to
+    # cover thin third-party clips (alphapai/reports — see _is_thin_clip_item)
+    # AND content_truncated quota stubs (alphapai/roadshows + comments — see
+    # cleanup_alphapai_quota_stubs.py + dump_one's quota_exhausted gate).
+    if (spec.source, spec.collection) in {
+        ("gangtise", "chief_opinions"),
+        ("alphapai", "reports"),
+        ("alphapai", "roadshows"),
+        ("alphapai", "comments"),
+    }:
+        base_match["deleted"] = {"$ne": True}
+
     # Pagination: if caller passed before_ms and the collection has a *_ms
     # field, use it as a strict less-than; otherwise fall back to skip-less
     # pagination sorted by string time_field desc.
@@ -642,6 +801,10 @@ async def _query_spec(
         projection[spec.url_field] = 1
     if spec.org_field:
         projection[spec.org_field] = 1
+    # Title-translation projection (LLM `title_zh` + native upstream paths)
+    projection[f"{spec.title_field}_zh"] = 1
+    for native_path in spec.native_zh_paths.get(spec.title_field, ()):
+        projection[native_path.split(".")[0]] = 1
     # Preview projection supports nested dotted paths; drop the $substr
     # optimization because Mongo's $project on dotted paths with $substr
     # requires aggregation. We'll cap in Python post-fetch. preview_fields
@@ -649,6 +812,22 @@ async def _query_spec(
     # so the post-fetch picker can try them in order.
     for path in spec.preview_fields:
         projection[path.split(".")[0]] = 1
+        # Also project the `<field>_zh` translation sibling so list cards
+        # can show the Chinese preview when one has been written by the
+        # offline backfill (`scripts/translate_portfolio_research.py`).
+        # Only flat (non-nested) preview fields participate — nested
+        # paths like `list_item.content` don't have a translation sibling.
+        if "." not in path:
+            projection[f"{path}_zh"] = 1
+        # Native upstream-translation paths (e.g. parsed_msg.translatedDescription).
+        # Project the root segment so _pick_nested can walk in.
+        for native_path in spec.native_zh_paths.get(path, ()):
+            projection[native_path.split(".")[0]] = 1
+    # local_ai_summary holds the qwen-plus card-preview tldr (and bullets)
+    # written by the crawl/local_ai_summary runner. Always project it so the
+    # preview-precedence loop in the items section can read tldr — without
+    # this Mongo strips it and the card falls back to the raw body head.
+    projection["local_ai_summary"] = 1
 
     # pdf indicators (cheap) — project exactly the fields the spec gates on
     # so the list response can show/hide the PDF button accurately.
@@ -688,16 +867,60 @@ async def _query_spec(
     try:
         for doc in docs:
             title = doc.get(spec.title_field) or ""
+            # Title translation: native upstream path first, then our
+            # `<title_field>_zh` LLM backfill. Same precedence as body/preview.
+            title_zh: str | None = None
+            for native_path in spec.native_zh_paths.get(spec.title_field, ()):
+                cand = _pick_nested(doc, native_path)
+                if isinstance(cand, str) and cand.strip():
+                    title_zh = str(cand).strip()[:400]
+                    break
+            if title_zh is None:
+                cached = doc.get(f"{spec.title_field}_zh")
+                if isinstance(cached, str) and cached.strip():
+                    title_zh = cached.strip()[:400]
             url = doc.get(spec.url_field) if spec.url_field else None
             # Third-bridge URL reconstruction
             if spec.source == "thirdbridge" and not url:
                 url = f"https://forum.thirdbridge.com/zh/interview/{doc.get('_id')}"
+            # Preview precedence:
+            #   1. local_ai_summary.tldr  — LLM-generated card-optimized summary
+            #      written by the crawl/local_ai_summary runner for portfolio
+            #      holdings. Highest priority because it's specifically shaped
+            #      for the 2-line clamped card preview (filtering out sales
+            #      disclaimers, headers, etc).
+            #   2. spec.preview_fields    — native preview/summary chain. For
+            #      collections that already store a real summary
+            #      (jinmen.summary_md, gangtise.brief_md, acecamp.summary_md),
+            #      this is good content. For collections where preview_field
+            #      is the article body head, this is what gets clamped.
+            #   3. PDF / placeholder hint (below).
             preview = ""
-            for path in spec.preview_fields:
-                candidate = _preview(_pick_nested(doc, path))
-                if candidate:
-                    preview = candidate
-                    break
+            preview_zh: str | None = None
+            ai_tldr = _pick_nested(doc, "local_ai_summary.tldr")
+            if isinstance(ai_tldr, str) and ai_tldr.strip():
+                preview = _preview(ai_tldr)
+                # local_ai_summary.tldr is already qwen-plus-generated Chinese,
+                # so reuse it for both views — toggling 原文 just shows the
+                # native preview (if a non-zh fallback exists below).
+                preview_zh = preview
+            if not preview:
+                for path in spec.preview_fields:
+                    candidate = _preview(_pick_nested(doc, path))
+                    if candidate:
+                        preview = candidate
+                        # Translation resolution: native upstream paths first
+                        # (free), then our LLM-written `<field>_zh` sibling.
+                        for native_path in spec.native_zh_paths.get(path, ()):
+                            zh_cand = _pick_nested(doc, native_path)
+                            if isinstance(zh_cand, str) and zh_cand.strip():
+                                preview_zh = _preview(zh_cand)
+                                break
+                        if preview_zh is None and "." not in path:
+                            zh_raw = _pick_nested(doc, f"{path}_zh")
+                            if isinstance(zh_raw, str) and zh_raw.strip():
+                                preview_zh = _preview(zh_raw)
+                        break
             pdf_url = None
             if spec.pdf_route:
                 has_pdf = False
@@ -780,11 +1003,13 @@ async def _query_spec(
                     "category": spec.category,
                     "category_label": CATEGORY_LABELS[spec.category],
                     "title": str(title)[:400],
+                    "title_zh": title_zh,
                     "release_time": rt,
                     "release_time_ms": rt_ms,
                     "url": url,
                     "pdf_url": pdf_url,
                     "preview": preview,
+                    "preview_zh": preview_zh,
                     "organization": org,
                     "tickers": doc.get("_canonical_tickers") or [],
                 }
@@ -868,6 +1093,14 @@ async def _query_breaking_news(
         rt_str = pub.strftime("%Y-%m-%d %H:%M") if pub else None
         rt_ms = int(pub.timestamp() * 1000) if pub else None
         summary = (a.summary if a else "") or ""
+        # EN→ZH translations stashed in metadata_ JSONB by the
+        # ``news_translator`` lifespan worker. The frontend StockHub.tsx
+        # already swaps title/preview for title_zh/preview_zh when
+        # lang === 'zh' (default), so we just need to surface them.
+        md = n.metadata_ or {}
+        title_zh = (md.get("title_zh") or "").strip() or None
+        summary_zh = (md.get("summary_zh") or "").strip()
+        preview_zh = _preview(summary_zh) if summary_zh else None
         items.append(
             {
                 "id": n.id,
@@ -877,11 +1110,13 @@ async def _query_breaking_news(
                 "category": "breaking",
                 "category_label": CATEGORY_LABELS["breaking"],
                 "title": (n.title or "")[:400],
+                "title_zh": title_zh,
                 "release_time": rt_str,
                 "release_time_ms": rt_ms,
                 "url": n.url,
                 "pdf_url": None,
                 "preview": _preview(summary or (n.content or "")),
+                "preview_zh": preview_zh,
                 "organization": n.source_name,
                 "sentiment": (a.sentiment if a else None),
                 "impact_magnitude": (a.impact_magnitude if a else None),
@@ -902,11 +1137,19 @@ class HubItem(BaseModel):
     category: str
     category_label: str
     title: str
+    # Chinese title — same precedence as preview_zh: native upstream path
+    # first (e.g. gangtise's parsed_msg.translatedTitle), then our LLM
+    # backfill `title_zh`, else null. Frontend swaps on 中文/原文 toggle.
+    title_zh: str | None = None
     release_time: str | None = None
     release_time_ms: int | None = None
     url: str | None = None
     pdf_url: str | None = None
     preview: str = ""
+    # Chinese preview, if a `<preview_field>_zh` translation exists. Mirrors
+    # the DocSection.markdown_zh pattern — frontend swaps based on the
+    # 中文/原文 toggle (defaults to zh when present).
+    preview_zh: str | None = None
     organization: str = ""
     sentiment: str | None = None
     impact_magnitude: str | None = None
@@ -1073,6 +1316,24 @@ async def stock_hub(
 class DocSection(BaseModel):
     label: str
     markdown: str
+    # Chinese translation (populated when the source field has a `<field>_zh`
+    # sibling — written by `scripts/translate_portfolio_research.py`). The
+    # frontend uses presence of `markdown_zh` to surface a 中文/原文 toggle.
+    markdown_zh: str | None = None
+
+
+class LocalAiSummary(BaseModel):
+    """qwen-plus card-preview summary written by crawl/local_ai_summary runner.
+
+    `tldr` is what the StockHub list card uses for `preview` (precedence over
+    raw body head); `bullets` is the 3-5 condensed key points the detail
+    drawer renders as the first/top section so users see "the takeaway"
+    without scrolling through disclaimers.
+    """
+    tldr: str = ""
+    bullets: list[str] = []
+    model: str = ""
+    generated_at: str | None = None
 
 
 class DocDetailResponse(BaseModel):
@@ -1083,6 +1344,7 @@ class DocDetailResponse(BaseModel):
     category_label: str
     id: str
     title: str
+    title_zh: str | None = None
     release_time: str | None = None
     release_time_ms: int | None = None
     organization: str = ""
@@ -1091,6 +1353,7 @@ class DocDetailResponse(BaseModel):
     pdf_urls: list[dict] = []  # multi-attachment case (meritco forum)
     tickers: list[str] = []
     sections: list[DocSection] = []
+    local_ai_summary: LocalAiSummary | None = None
     sentiment: str | None = None
     impact_magnitude: str | None = None
 
@@ -1141,18 +1404,69 @@ async def stock_hub_doc(
     if doc is None:
         raise HTTPException(404, f"{source}.{collection}/{item_id} not found")
 
-    # Assemble body sections
+    # content_truncated docs are hidden from Stock Hub by policy (see
+    # _query_spec + TRUNCATION_FLAG_SOURCES). Block direct detail access too
+    # so a stale link from a cached list response can't bypass the filter.
+    if spec.source in TRUNCATION_FLAG_SOURCES and doc.get("content_truncated"):
+        raise HTTPException(
+            410,
+            f"{source}.{collection}/{item_id} is a quota-truncated entry; "
+            "hidden from Stock Hub per the 2026-04-29 truncation policy",
+        )
+    # Soft-deleted chief_opinions (cleanup_gangtise_chief.py /
+    # dump_research reverse-dedup hook) are hidden from list responses; mirror
+    # that for direct detail too so a cached card can't bypass the filter.
+    if spec.collection == "chief_opinions" and doc.get("deleted"):
+        raise HTTPException(
+            410,
+            f"{source}.{collection}/{item_id} was soft-deleted "
+            f"(reason={doc.get('_deleted_reason') or 'unknown'})",
+        )
+
+    # Assemble body sections. Each entry's field_path is either a string or
+    # a tuple of strings — the tuple form picks the first non-empty path
+    # (e.g. chief_opinions 正文 prefers content_md but accepts brief_md
+    # when content_md is missing).
     sections: list[dict] = []
     seen_bodies: set[str] = set()
     for label, field_path in spec.body_sections:
-        raw = _pick_nested(doc, field_path)
+        paths = (field_path,) if isinstance(field_path, str) else tuple(field_path)
+        raw: Any = None
+        picked_path: str | None = None
+        for fp in paths:
+            cand = _pick_nested(doc, fp)
+            if isinstance(cand, str) and cand.strip():
+                raw = cand
+                picked_path = fp
+                break
         if not isinstance(raw, str):
             continue
         body = _normalize_markdown(raw.strip())
         if not body or body in seen_bodies:
             continue
         seen_bodies.add(body)
-        sections.append({"label": label, "markdown": body})
+        # Surface Chinese translation. Resolution order:
+        #   1. spec.native_zh_paths[field] — upstream-provided translation
+        #      (gangtise's parsed_msg.translatedDescription, etc). Free, so
+        #      always preferred when available.
+        #   2. `<field>_zh` — written by our offline backfill script
+        #      (scripts/translate_portfolio_research.py).
+        zh_body: str | None = None
+        if picked_path:
+            for native_path in spec.native_zh_paths.get(picked_path, ()):
+                cand = _pick_nested(doc, native_path)
+                if isinstance(cand, str) and cand.strip():
+                    zh_body = _normalize_markdown(cand.strip())
+                    break
+            if zh_body is None:
+                zh_raw = _pick_nested(doc, f"{picked_path}_zh")
+                if isinstance(zh_raw, str) and zh_raw.strip():
+                    zh_body = _normalize_markdown(zh_raw.strip())
+        sections.append({
+            "label": label,
+            "markdown": body,
+            "markdown_zh": zh_body,
+        })
 
     # pdf_url (single) + pdf_urls (multi-attachment). For meritco we also expose
     # the per-attachment list so the UI can render tabs when a forum has >1 PDF.
@@ -1215,6 +1529,32 @@ async def stock_hub_doc(
     rt = doc.get(spec.time_field)
     rt_ms = doc.get(spec.time_ms_field) if spec.time_ms_field else None
 
+    # Surface the qwen-plus card summary on the detail response too. The
+    # frontend renders this as a highlighted "AI 摘要" block above the
+    # body sections so the takeaway is visible without scrolling.
+    ai_summary_obj: LocalAiSummary | None = None
+    ai = doc.get("local_ai_summary")
+    if isinstance(ai, dict) and (ai.get("tldr") or ai.get("bullets")):
+        gen_at = ai.get("generated_at")
+        ai_summary_obj = LocalAiSummary(
+            tldr=str(ai.get("tldr") or "").strip(),
+            bullets=[str(b).strip() for b in (ai.get("bullets") or []) if str(b).strip()],
+            model=str(ai.get("model") or ""),
+            generated_at=gen_at.isoformat() if hasattr(gen_at, "isoformat") else (str(gen_at) if gen_at else None),
+        )
+
+    title_text = str(doc.get(spec.title_field) or "")[:400]
+    title_zh: str | None = None
+    for native_path in spec.native_zh_paths.get(spec.title_field, ()):
+        cand = _pick_nested(doc, native_path)
+        if isinstance(cand, str) and cand.strip():
+            title_zh = cand.strip()[:400]
+            break
+    if title_zh is None:
+        cached = doc.get(f"{spec.title_field}_zh")
+        if isinstance(cached, str) and cached.strip():
+            title_zh = cached.strip()[:400]
+
     return DocDetailResponse(
         source=spec.source,
         source_label=spec.source_label,
@@ -1222,7 +1562,8 @@ async def stock_hub_doc(
         category=spec.category,
         category_label=CATEGORY_LABELS[spec.category],
         id=str(doc.get("_id")),
-        title=str(doc.get(spec.title_field) or "")[:400],
+        title=title_text,
+        title_zh=title_zh,
         release_time=rt if isinstance(rt, str) else None,
         release_time_ms=rt_ms if isinstance(rt_ms, int) else None,
         organization=_extract_org(spec, doc),
@@ -1231,6 +1572,7 @@ async def stock_hub_doc(
         pdf_urls=pdf_urls,
         tickers=doc.get("_canonical_tickers") or [],
         sections=[DocSection(**s) for s in sections],
+        local_ai_summary=ai_summary_obj,
     )
 
 

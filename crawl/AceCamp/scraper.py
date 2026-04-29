@@ -79,11 +79,11 @@ def _upsert_preserve_crawled_at(col, did: str, doc: dict) -> None:
 # 模块级 throttle — main() 会用 CLI 覆盖
 # 默认值 2026-04-24 从 (3.0, 2.0, 40) 收紧到 (4.0, 2.5, 20) — AceCamp 账号封控
 # 事故后的新基线, 跟 ANTIBOT.md backfill v1 表 (3.5, 2.0, 30) 再保守一档.
+# 2026-04-28 (二次): 用户要求 1/10 事故速率重启, fallback 同步降到 25.0/15.0/3.
 # AceCamp API 的 detail 端点有独立 quota (10003/10040), 模块级 fallback 用在
-# 任何没走 throttle_from_args 的路径; 默认 4s 间隔 + 20 burst 能保证即使脚本
-# 以老方式启动也不会一分钟烧掉当日全部 quota.
-_THROTTLE: AdaptiveThrottle = AdaptiveThrottle(base_delay=4.5, jitter=3.0,
-                                                burst_size=15,
+# 任何没走 throttle_from_args 的路径.
+_THROTTLE: AdaptiveThrottle = AdaptiveThrottle(base_delay=25.0, jitter=15.0,
+                                                burst_size=3,
                                                 platform="acecamp")
 _BUDGET: AccountBudget = AccountBudget("acecamp", "default", 0)
 _PLATFORM = "acecamp"
@@ -484,6 +484,25 @@ def _transcribe_to_md(transcribe: Any) -> str:
     return "\n\n".join(lines)
 
 
+# AceCamp 列表 API 在文章只有音频/AI 摘要/数据指标三块没有正文时, 会把这三个
+# UI 占位标签 (`🎧 音频回放 \n🎯 AI纪要 \n📊 数据指标`) 当 summary 返回. 没有正文.
+# --skip-detail 模式 (realtime / daily_catchup) 不拉 detail, 之前的 content_md
+# 兜底到 summary_md 会把这串 UI 标签当作内容入库, Stock Hub 因 content_md
+# 非空 → content_truncated=False → 屏蔽规则失效, 用户在卡片上看到一片 emoji.
+# 这里把 placeholder summary 视同空, 让 dump_article 的"全空 → stub + truncated"
+# 路径接管.
+_PLACEHOLDER_TOKENS = ("🎧 音频回放", "🎯 AI纪要", "📊 数据指标")
+
+
+def _is_ui_placeholder_summary(s: str) -> bool:
+    if not s:
+        return False
+    stripped = s.strip()
+    if len(stripped) > 80:
+        return False
+    return any(tok in stripped for tok in _PLACEHOLDER_TOKENS)
+
+
 def _pick_article_content(detail: dict, list_item: dict) -> tuple[str, str, str]:
     """从详情提取正文. 优先: content > transcribe > summary.
 
@@ -491,7 +510,10 @@ def _pick_article_content(detail: dict, list_item: dict) -> tuple[str, str, str]
     """
     content = _strip_html(str(detail.get("content") or "").strip())
     transcribe = _transcribe_to_md(detail.get("transcribe"))
-    summary = _strip_html(str(detail.get("summary") or list_item.get("summary") or "").strip())
+    summary_raw = (detail.get("summary") or list_item.get("summary") or "")
+    summary = _strip_html(str(summary_raw).strip())
+    if _is_ui_placeholder_summary(summary):
+        summary = ""
 
     # article_speech 是语音转写, 作为 content 兜底
     if not content:
@@ -505,33 +527,64 @@ def _pick_article_content(detail: dict, list_item: dict) -> tuple[str, str, str]
     return content, transcribe, summary
 
 
+def _is_paywalled(item: dict) -> bool:
+    """list_item 标记付费且未购买且非免费 → detail 接口必返空 content.
+
+    AceCamp 对未付费内容: detail HTTP 200 + ret=true, 但 data.content="" / null,
+    summary 字段是平台给的"提纲式 teaser" (短行号目录, 看着像目录大纲).
+    skip_detail 模式之前会把 list 给的 summary 当 content_md 写库, 触发 StockHub
+    截断卡; not skip_detail 模式 detail 全空也走 line 556 的 skipped_empty.
+    我们直接在入口拦掉, 两条路径都不写, 保持 ticker 索引上"只索引能读的内容".
+    """
+    return (
+        bool(item.get("need_to_pay"))
+        and not bool(item.get("has_paid"))
+        and not bool(item.get("free"))
+    )
+
+
 def dump_article(session, db, item: dict, force: bool = False,
                  skip_detail: bool = False) -> tuple[str, dict]:
     """文章入库. collection=articles, _id=a<id>."""
     col = db["articles"]
     did = dedup_id_article(item)
 
+    # Paywall 闸 (2026-04-29): list_item 标记 need_to_pay 且未支付且非免费 →
+    # detail 必返空 content. 不论 skip_detail 都不写 (现状 list 接口字段多为 None,
+    # 这条主要给未来字段恢复留 fast-path; 实际 paywall 拦截靠 line 556 detail 路径).
+    if _is_paywalled(item):
+        return "skipped_paywall", {"content_chars": 0}
+
+    # skip_detail 闸 (2026-04-29): list_item 不含 content 字段, --skip-detail 模式
+    # 写出来必然是 stub (content_md = list summary, content_truncated=True). StockHub
+    # 卡片"信息不全"的源头, 用户明确要求停掉. 已有 doc 也不更新 — list 元数据已经
+    # 在第一次 detail 写入时同步过, 后续没新信息可补. backfill_6months / realtime
+    # watcher 的 --skip-detail 已经移除, 这里作硬保险.
+    if skip_detail:
+        return "skipped_no_detail", {"content_chars": 0}
+
     if not force:
         ex = col.find_one({"_id": did}, {"_id": 1, "content_md": 1, "stats": 1})
         if ex and (ex.get("content_md") or ""):
             return "skipped", ex.get("stats") or {"content_chars": len(ex.get("content_md") or "")}
 
-    # 拉详情 (含正文). skip_detail=True 时只存列表元数据.
-    detail = {} if skip_detail else fetch_article_detail(session, item.get("id"))
+    # 拉详情 (含正文).
+    detail = fetch_article_detail(session, item.get("id"))
+
+    # Detail 路径上的 paywall: 平台对未付费内容返 200 + content="" + summary=teaser.
+    # 区分于真正的 quota / detail 权限失败 (后者用 tripwire 的 _err 路径处理).
+    # paywall 跳过单条但**不计 tripwire streak** — 账号没买内容不等于账号失效.
+    if _is_paywalled(detail):
+        return "skipped_paywall", {"content_chars": 0}
 
     content_md, transcribe_md, summary_md = _pick_article_content(detail, item)
-    # list_item 自身有 summary 字段; 详情拉不到时兜底
-    if not summary_md:
-        summary_md = _strip_html(str(item.get("summary") or "").strip())
+    # _pick_article_content 已经按 detail.summary > list_item.summary 兜底, 并
+    # 把 UI 占位 (🎧/🎯/📊) 视同空.
 
-    # Detail 真返回空 (paywall 锁住 / quota 10003-10040 / detail.get('content')
-    # 是 "" / null) 时不入库. 之前的 content_md or summary_md 兜底会写入 outline,
-    # 18375 篇 article + 7 篇 opinion 历史污染就来自这里 — list 只给一个 1-2-3
-    # 题纲, dashboard 看着每篇都"有内容"实际全是空壳, 删除时只能按
-    # content_md == summary_md 反推. 直接早返回, 让 dashboard 的 today 统计
-    # 也不再把 paywall 锁住的条目算进去. skip_detail 模式不在这条规则内 —
-    # 那是用户主动只要 list 元数据.
-    if not skip_detail and not content_md and not transcribe_md:
+    # Detail 真空 (quota 10003/10040 / 账号 detail 权限丢) 时不入库. 跟付费墙不同,
+    # 这条会计 tripwire — 连续 15 次抛 SessionDead 让 watcher 退出, 避免登录态
+    # 失效后还在轮询. 跑到这一行时 skip_detail 必然 False (上面已早返回).
+    if not content_md and not transcribe_md:
         _tripwire_record_detail("article", resp=detail, content_len=0)
         return "skipped_empty", {"content_chars": 0, "transcribe_chars": 0,
                                   "summary_chars": len(summary_md)}
@@ -608,6 +661,13 @@ def dump_article(session, db, item: dict, force: bool = False,
             "summary_chars": len(summary_md),
         },
         "crawled_at": datetime.now(timezone.utc),
+        # 截断标记: detail 没拿到真正文 (空 / quota / paywall), content_md
+        # 是兜底的 summary_md, transcribe_md 也空 — 入库当 stub 仅供 ticker
+        # 索引, 但 Stock Hub 按 TRUNCATION_FLAG_SOURCES 规则屏蔽显示.
+        # 真正拿到 content 或 transcribe 时清掉旧标记.
+        "content_truncated": bool(
+            (not content_md) and (not transcribe_md)
+        ),
     }
     _stamp_ticker(doc, "acecamp", col)
     _upsert_preserve_crawled_at(col, did, doc)
@@ -633,6 +693,12 @@ def dump_opinion(session, db, item: dict, force: bool = False,
     """
     col = db["opinions"]
     did = dedup_id_opinion(item)
+
+    # Paywall 闸 (同 dump_article); 观点多数免费, 偶发收费短评仍跳过.
+    if _is_paywalled(item):
+        return "skipped_paywall", {"content_chars": 0}
+    # 观点 list 已经携带 content 字段 (HTML), skip_detail 模式可以写库;
+    # 跟 article 不同, 不在这里强拦.
 
     if not force:
         ex = col.find_one({"_id": did}, {"_id": 1, "content_md": 1, "stats": 1})
@@ -932,9 +998,10 @@ def run_type(session, db, content_type: str, args) -> dict:
             title = (it.get("title") or it.get("name") or "")[:60]
             try:
                 status, info = _DUMP_FUNC[content_type](session, db, it, args)
-                if status == "skipped":
+                if status.startswith("skipped"):
                     skipped += 1; page_skipped += 1
-                    # 首轮全量时大量已入库 => 安静跳过, 避免日志爆炸
+                    # skipped (已入库) + skipped_paywall (付费未购) + skipped_empty
+                    # (detail 全空) 都不走网络/quota, 也不算"今日新增"; 安静跳过.
                 else:
                     added += 1; page_added += 1
                     cap.bump(); _BUDGET.bump()
@@ -1005,15 +1072,20 @@ def run_type(session, db, content_type: str, args) -> dict:
 def run_once(session, db, args) -> dict:
     types = TYPE_ORDER if args.type == "all" else [args.type]
     summary: dict = {}
+    fatal: SessionDead | None = None
     for t in types:
         try:
             summary[t] = run_type(session, db, t, args)
         except KeyboardInterrupt:
             raise
         except SessionDead as e:
+            # 不再吞: cookie 失效 / 登录态丢 / detail 配额连烧 → 必须退出, 否则
+            # watch 还会 sleep+轮询继续灌空数据. 用户 2026-04-29 明确要求"未登录
+            # 立刻停". 把汇总打完后由调用方 (watch / main) 决定 sys.exit.
             print(f"\n[致命] 会话失效: {e}")
             print(f"  → 浏览器重登 {WEB_BASE}, 更新 credentials.json 里的 cookie.")
             summary[t] = {"added": 0, "skipped": 0, "failed": -1, "error": "SessionDead"}
+            fatal = e
             break
         except Exception as e:
             tqdm.write(f"\n[{t}] 异常: {type(e).__name__}: {e}")
@@ -1023,6 +1095,8 @@ def run_once(session, db, args) -> dict:
         f"{t}+{s.get('added',0)}/={s.get('skipped',0)}/✗{s.get('failed',0)}"
         for t, s in summary.items()))
     print(f"{'═' * 60}")
+    if fatal is not None:
+        raise fatal
     return summary
 
 
@@ -1175,10 +1249,11 @@ def parse_args():
     # 导致 detail quota 几分钟烧光). 新默认跟 ANTIBOT.md backfill 默认 (3.5/2.0/30/400)
     # 对齐偏保守: 4.0/2.5/20/300. 实际调用方 (crawler_manager.SPECS / daily_catchup /
     # backfill_6months) 会再覆盖成 variant-specific 值, 这里是 CLI 裸跑兜底.
-    # 2026-04-25 default_cap 300→0: realtime --skip-detail 根本不碰 detail quota 池,
-    # 数量闸价值低; 真出事靠 SoftCooldown (10003/10040 自动 30min 静默).
-    add_antibot_args(p, default_base=4.0, default_jitter=2.5,
-                     default_burst=20, default_cap=0, platform="acecamp")
+    # 2026-04-25 default_cap 300→0: realtime --skip-detail 根本不碰 detail quota 池.
+    # 2026-04-28 (二次): 用户要求 1/10 事故速率重启 — CLI 裸跑默认也降到 25.0/15.0/3,
+    # cap 0→50 保留兜底 (1/10 of 500).
+    add_antibot_args(p, default_base=25.0, default_jitter=15.0,
+                     default_burst=3, default_cap=50, platform="acecamp")
     return p.parse_args()
 
 
@@ -1267,6 +1342,19 @@ def main():
             print("=" * 60)
             sys.exit(0)
 
+    # 2026-04-29: --skip-detail 在 articles 上被弃用. list 接口不返回 content 字段,
+    # skip_detail 路径以前会把 list 给的"提纲式 summary" 当 content_md 写库 (StockHub
+    # 上一堆"信息不全"截断卡), dump_article 现在直接 noop 跳过. 启动时拦截以免父进程
+    # (backfill_6months / cron daily_catchup) 老 args 反复 spawn noop scraper 浪费 CPU.
+    # 不影响 --type opinions: opinions list 自带 content 字段, skip_detail 仍能正常写库.
+    if args.skip_detail and args.type in ("articles", "all"):
+        print(
+            "[ERROR] --skip-detail 已弃用 (--type articles, 2026-04-29). "
+            "list 接口不返 content, skip_detail 路径只能写无正文 stub, "
+            "用户已禁止. 请去掉 --skip-detail 或仅用 --type opinions."
+        )
+        sys.exit(2)
+
     if not args.auth:
         print("错误: 未提供 Cookie. 用 --auth / env ACECAMP_AUTH 传入, "
               "或编辑 credentials.json 的 {\"cookie\": \"...\"}.")
@@ -1339,6 +1427,11 @@ def main():
                 run_once(session, db, args)
             except KeyboardInterrupt:
                 print("\n[实时模式] Ctrl+C 退出"); break
+            except SessionDead as e:
+                # 登录失效 → 直接退出 watcher, 由 systemd / crawler_monitor / 人工
+                # 重登后再启. 不再 sleep+轮询继续打 401.
+                print(f"\n[实时模式] 会话失效, watcher 退出: {e}")
+                sys.exit(2)
             except Exception as e:
                 print(f"[轮次 {round_num}] 异常: {type(e).__name__}: {e}")
             _THROTTLE.reset()
@@ -1347,7 +1440,11 @@ def main():
             except KeyboardInterrupt:
                 print("\n[实时模式] Ctrl+C 退出"); break
     else:
-        run_once(session, db, args)
+        try:
+            run_once(session, db, args)
+        except SessionDead as e:
+            print(f"\n[一次性 run] 会话失效, 退出: {e}")
+            sys.exit(2)
 
 
 if __name__ == "__main__":

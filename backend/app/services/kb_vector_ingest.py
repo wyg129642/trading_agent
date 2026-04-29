@@ -778,8 +778,12 @@ async def ingest_collection(
     # Exclude crawler-internal docs: legacy `crawler_*`/`daily_*` checkpoints
     # from the pre-migration local Mongo, plus the remote Mongo's `_state`,
     # `_probe`, `account`, `test` meta docs.
+    # Soft-delete: chief_opinions writes `deleted=True` on cleanup / cross-coll
+    # dedup (see crawl/gangtise/scraper.py + scripts/cleanup_gangtise_chief.py).
+    # `$ne True` is a no-op on collections that don't soft-delete (field absent).
     query: dict[str, Any] = {
         "_id": {"$not": {"$regex": r"^(crawler_|daily_|_probe$|_state$|account$|test$)"}},
+        "deleted": {"$ne": True},
     }
     # Build watermark clauses. For has_pdf specs we OR the date-watermark with
     # a separate pdf_text_extracted_at watermark — old docs that just got their
@@ -1082,9 +1086,14 @@ async def sweep_deleted_docs(
 
     try:
         # Mongo IDs — drain on worker thread so the loop stays responsive over
-        # large collections (some have 40k+ docs).
+        # large collections (some have 40k+ docs). Soft-deleted docs (chief_opinions
+        # cleanup / cross-coll dedup) are excluded so the diff treats their
+        # Milvus chunks as tombstones to sweep.
         mongo_cursor = mc[mongo_db_name_for(spec)][spec.collection].find(
-            {"_id": {"$not": {"$regex": r"^(crawler_|daily_|_probe$|_state$|account$|test$)"}}},
+            {
+                "_id": {"$not": {"$regex": r"^(crawler_|daily_|_probe$|_state$|account$|test$)"}},
+                "deleted": {"$ne": True},
+            },
             projection={"_id": 1},
         )
         mongo_ids: set[str] = set()

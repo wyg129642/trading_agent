@@ -401,6 +401,20 @@ async def lifespan(app: FastAPI):
 
     app.state.consensus_warmer_task = _aio.create_task(_consensus_warmer())
 
+    # ── Portfolio research/news LLM-translation worker ───────────────────
+    # Every 10 min, scan crawler collections for new portfolio-ticker docs
+    # in the last 48h and translate any English body/title via qwen-plus.
+    # Idempotent (`<field>_zh_src_hash` check), skip-on-cache-hit; stock_hub
+    # already prefers native upstream translations (parsed_msg.translatedXxx /
+    # list_item.titleCn / etc) over LLM, so this only fills gaps.
+    from backend.app.services.portfolio_translation_worker import (
+        worker_loop as _portfolio_translation_loop,
+    )
+    app.state.portfolio_translation_task = _aio.create_task(
+        _portfolio_translation_loop(settings=settings, interval_sec=600, window_hours=48),
+        name="portfolio_translation_worker",
+    )
+
     # ── Citation audit daily sampler + weekly review ─────────────────────
     # Daily: pick ~8 ready models, sample 5% of their citations, write audit
     # logs. Weekly (Mon 08:00): aggregate the log + push Feishu alert + auto-
@@ -580,6 +594,21 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Failed to start pdf_text_extract loop (non-fatal)")
 
+    # News EN→ZH translator — fills news_items.metadata_.title_zh/summary_zh
+    # so StockHub 突发新闻 cards render in Chinese by default. Mirrors the
+    # local_ai_summary daemon (poll → qwen-plus → hash-keyed dedup).
+    if getattr(settings, "news_translator_enabled", True):
+        try:
+            from backend.app.services.news_translator import news_translator_loop
+            import asyncio as _aio_news
+            app.state.news_translator_task = _aio_news.create_task(
+                news_translator_loop(settings),
+                name="news_translator",
+            )
+            logger.info("news_translator task scheduled")
+        except Exception:
+            logger.exception("Failed to start news_translator loop (non-fatal)")
+
     yield
 
     # Shutdown
@@ -611,6 +640,9 @@ async def lifespan(app: FastAPI):
     if task:
         task.cancel()
     task = getattr(app.state, "pdf_text_extract_task", None)
+    if task:
+        task.cancel()
+    task = getattr(app.state, "news_translator_task", None)
     if task:
         task.cancel()
     if kb_vector_sync_svc is not None:
@@ -792,6 +824,7 @@ def create_app() -> FastAPI:
     from backend.app.api.cost_governance import router as cost_governance_router
     from backend.app.api.kb_doc_viewer import router as kb_doc_viewer_router
     from backend.app.api.revenue_snapshot import router as revenue_snapshot_router
+    from backend.app.api.risk_detection import router as risk_detection_router
 
     app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
     app.include_router(news_router, prefix="/api/news", tags=["News"])
@@ -823,6 +856,7 @@ def create_app() -> FastAPI:
     app.include_router(chat_audit_router, prefix="/api/chat-audit", tags=["AI Chat Audit"])
     app.include_router(chat_memory_router, prefix="/api/chat-memory", tags=["AI Chat Memory"])
     app.include_router(predictions_router, prefix="/api/predictions", tags=["Predictions"])
+    app.include_router(risk_detection_router, prefix="/api/risk-detection", tags=["Risk Detection (Admin)"])
     app.include_router(open_router, prefix="/api/open", tags=["Open API"])
     app.include_router(portfolio_news_router, prefix="/api/portfolio", tags=["Portfolio"])
     app.include_router(sentimentrader_router, prefix="/api/sentimentrader", tags=["SentimenTrader"])
