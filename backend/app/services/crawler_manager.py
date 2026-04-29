@@ -28,6 +28,18 @@ _CRAWL_DIR = _REPO_ROOT / "crawl"
 _LOGS_DIR = _REPO_ROOT / "logs"
 _LOGS_DIR.mkdir(exist_ok=True)
 
+# web_research/ 已迁到 proposal-agent 独立项目 (2026-04-29 二次)。
+# WEB_RESEARCH_DIR env var 可覆盖默认路径(用于 dev/CI 切换)。
+_RESEARCH_DIR = Path(
+    os.environ.get("WEB_RESEARCH_DIR")
+    or "/home/ygwang/proposal-agent/web_research"
+)
+
+# 已迁出 crawl/ 的平台:platform_key → 实际目录根。新增需在这里注册。
+_EXTERNAL_DIR: dict[str, Path] = {
+    "wechat_mp": _RESEARCH_DIR,   # proposal-agent/web_research/wechat_mp
+}
+
 
 @dataclass(frozen=True)
 class CrawlerSpec:
@@ -291,7 +303,8 @@ def _state_key(platform: str) -> str:
 
 
 def _dir_path(platform: str) -> Path:
-    return _CRAWL_DIR / SPECS[platform].dir_name
+    parent = _EXTERNAL_DIR.get(platform, _CRAWL_DIR)
+    return parent / SPECS[platform].dir_name
 
 
 _VARIANT_LOG_NAME = {

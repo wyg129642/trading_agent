@@ -741,9 +741,15 @@ export default function StockHub() {
                           <div
                             style={{
                               fontSize: 13, color: '#475569', lineHeight: 1.55,
+                              // 2026-04-29: 之前 LineClamp=2 把 320 字 preview
+                              // 砍到 2 行 (~80 字) 才能可见, 用户以为数据被
+                              // 截断了. 放宽到 8 行 (~ 250-300 字) 配合后端
+                              // _preview limit=320, 卡片能展示完整 preview;
+                              // 真要看全文用"查看详情"打开 drawer.
                               display: '-webkit-box',
-                              WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+                              WebkitLineClamp: 8, WebkitBoxOrient: 'vertical',
                               overflow: 'hidden',
+                              whiteSpace: 'pre-wrap',
                             }}
                           >
                             {body}

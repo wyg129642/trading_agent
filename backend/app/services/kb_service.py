@@ -404,8 +404,11 @@ def _build_specs() -> list[CollectionSpec]:
         # 直采+白名单, 起步只放机器之心. low_quality=False (与旧的
         # alphapai-full.wechat_articles 二手聚合源对比, 这是用户精选信源).
         # milvus_indexed=True → kb_vector_sync 5min 轮询自动捞起入向量库.
+        # spec.db="wechat_mp" 永远不变 (Milvus chunks 字段已写入此 key);
+        # 2026-04-29 实际 Mongo DB 改名 web-research, 经 MONGO_DB_ALIASES 映射;
+        # collection 从 articles 改 wechat_articles, 同库给雪球/知乎留 namespace。
         CollectionSpec(
-            db="wechat_mp", collection="articles",
+            db="wechat_mp", collection="wechat_articles",
             doc_type="wechat_mp_article", doc_type_cn="微信公众号文章",
             title_field="title",
             text_fields=("content_md", "digest"),
@@ -456,9 +459,9 @@ MONGO_DB_ALIASES: dict[str, str] = {
     # funda, acecamp unchanged — no entry means "use spec.db verbatim".
     # semianalysis lives in its own foreign-website DB (2026-04-24 迁出 funda).
     "semianalysis": "foreign-website",
-    # 2026-04-29: 微信公众号 spec.db 用下划线 wechat_mp (Milvus 友好), Mongo
-    # DB 名是连字符 wechat-mp.
-    "wechat_mp":   "wechat-mp",
+    # 2026-04-29: 微信公众号 spec.db 用下划线 wechat_mp (Milvus 友好);
+    # 同日 Mongo DB 从 wechat-mp 改为 web-research (将来同库容纳雪球/知乎/博客)。
+    "wechat_mp":   "web-research",
 }
 
 
@@ -855,14 +858,15 @@ def _build_filter(
     # scripts/cleanup_alphapai_thin_clips.py). The filter is harmless on
     # collections without a `deleted` field, but adding it conditionally
     # keeps queries clean elsewhere.
-    if (spec.db, spec.collection) in {
-        ("gangtise", "chief_opinions"),
-        ("alphapai", "reports"),
-        ("alphapai", "roadshows"),
-        ("alphapai", "comments"),
-        ("thirdbridge", "interviews"),
-    }:
-        q["deleted"] = {"$ne": True}
+    # Universal soft-delete gate (broadened 2026-04-29). Was per-collection;
+    # cleanup_low_value_b_class.py now writes `deleted=True` across many more
+    # collections (gangtise/summaries, jiuqian/forum, alphaengine/{news_items,
+    # china_reports,summaries}, funda/earnings_reports), so we filter
+    # universally. Field is harmless when absent.
+    q["deleted"] = {"$ne": True}
+    # Mirror stock_hub.py: hide quota-truncated docs from LLM search too
+    # (jinmen/meetings 1260 paywalled stubs were leaking into kb_search).
+    q["content_truncated"] = {"$ne": True}
 
     return q
 
@@ -1753,16 +1757,12 @@ async def fetch_document(
         return {"found": False, "doc_id": doc_id, "error": f"unknown source/collection {source}/{collection}"}
     coll = _coll(spec)
     # String _id is standard across our crawlers; some collections use ObjectId though
-    # Soft-delete gate: mirror _build_filter so a tombstoned doc never
-    # reaches the LLM via fetch_document. chief_opinions + alphapai.reports.
-    extra_q: dict = {}
-    if (spec.db, spec.collection) in {
-        ("gangtise", "chief_opinions"),
-        ("alphapai", "reports"),
-        ("alphapai", "roadshows"),
-        ("alphapai", "comments"),
-    }:
-        extra_q["deleted"] = {"$ne": True}
+    # Soft-delete + content_truncated gate: mirror _build_filter so a tombstoned
+    # doc never reaches the LLM via fetch_document. Universal as of 2026-04-29.
+    extra_q: dict = {
+        "deleted": {"$ne": True},
+        "content_truncated": {"$ne": True},
+    }
     doc: dict | None = None
     try:
         doc = await coll.find_one({"_id": raw_id, **extra_q})

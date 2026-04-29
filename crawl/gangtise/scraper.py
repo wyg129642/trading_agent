@@ -297,6 +297,45 @@ def _strip_html(s: str) -> str:
     return s.strip()
 
 
+def _build_essence_md(essence: list | None) -> str:
+    """Render gangtise 的 ``list_item.essence`` 结构化要点为 markdown bullet list.
+
+    每条 essence dict 形如 {brief, content, sentiment, sort}, 这是 gangtise
+    自己 AI 生成的 per-topic 摘要 (e.g. "半导体订单与产能" → "2026年Q1收入
+    3300万元, 同比增20%, ..."). 本字段在 22.6% 的纪要中存在, 之前只埋在
+    list_item 里, 现在拍平到顶层 ``essence_md`` 供 stock_hub 直接读取.
+
+    输出格式 (按 sort 排序, 缺 sort 排末):
+        - **brief**: content
+        - **brief**: content
+    """
+    if not essence or not isinstance(essence, list):
+        return ""
+    items: list[tuple[int, str, str]] = []
+    for x in essence:
+        if not isinstance(x, dict):
+            continue
+        brief = (x.get("brief") or "").strip()
+        content = (x.get("content") or "").strip()
+        if not brief and not content:
+            continue
+        sort = x.get("sort")
+        sort_n = int(sort) if isinstance(sort, (int, float)) else 9999
+        items.append((sort_n, brief, content))
+    if not items:
+        return ""
+    items.sort(key=lambda t: t[0])
+    lines: list[str] = []
+    for _, brief, content in items:
+        if brief and content:
+            lines.append(f"- **{brief}**: {content}")
+        elif brief:
+            lines.append(f"- **{brief}**")
+        else:
+            lines.append(f"- {content}")
+    return "\n".join(lines)
+
+
 try:
     from markdownify import markdownify as _markdownify
     _HAS_MARKDOWNIFY = True
@@ -386,6 +425,32 @@ def _is_quote_noise(text: str) -> bool:
     if len(s) < 300 and digit_ratio > 0.25 and symbol_ratio > 0.05:
         return True
     if "成交量" in s and len(s) < 300 and digit_ratio > 0.2:
+        return True
+    return False
+
+
+_URL_ONLY_RE = re.compile(r'^\s*https?://\S+\s*$', re.IGNORECASE)
+_DOMAIN_ONLY_RE = re.compile(
+    r'^\s*[\w.-]+\.(com|cn|net|org|io|app|co|me|info|xyz|hk|jp|kr|us|edu)(/\S*)?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _looks_like_url_or_domain(text: str) -> bool:
+    """True if text is just a URL or bare domain (e.g. "note.youdao.com",
+    "https://mp.weixin.qq.com/s?..."). gangtise chief items occasionally have
+    parsed_msg.description set to nothing more than the click-through URL's
+    domain — that's not a real body, it's a teaser pointing to an external
+    page. Treat as no-content.
+    """
+    if not text:
+        return False
+    s = text.strip()
+    if len(s) > 200:
+        return False
+    if _URL_ONLY_RE.match(s):
+        return True
+    if _DOMAIN_ONLY_RE.match(s):
         return True
     return False
 
@@ -822,6 +887,11 @@ def dump_summary(session, db, item: dict, force: bool = False,
 
     # 列表项 brief 是截断版; 通过 msgText.url 拉完整正文 txt
     brief = _strip_html(item.get("brief") or "")
+    # `essence` 是 gangtise 自己生成的结构化要点 (per-topic brief+content
+    # 列表), 22.6% 的纪要有此字段, 平均 5-6 条. 之前一直只塞进 list_item
+    # 没拍平到顶层, stock_hub 也就读不到. 现在显式 build essence_md 当作
+    # "要点" section 渲染.
+    essence_md = _build_essence_md(item.get("essence"))
     full_text = ""
     msg_texts = item.get("msgText") or []
     if isinstance(msg_texts, list):
@@ -830,7 +900,11 @@ def dump_summary(session, db, item: dict, force: bool = False,
                 continue
             url = mt.get("url")
             ext = (mt.get("extension") or "").lower()
-            if url and ext in ("", ".txt"):
+            # `.html` covers the prs/ research_data_s3 attachment shape
+            # used by the bulk of legacy summaries; `.txt` is the newer
+            # ai_summary_*.txt format. Both are decoded by
+            # `_summary_text_to_md` (markdownify + block-tag gate).
+            if url and ext in ("", ".txt", ".html", ".htm"):
                 full_text = fetch_summary_text(session, item.get("id"), url, token=token)
                 break
     content = _summary_text_to_md(full_text or brief)
@@ -869,11 +943,13 @@ def dump_summary(session, db, item: dict, force: bool = False,
         "duration_ms": item.get("duration"),
         "brief_md": brief,
         "content_md": content,
+        "essence_md": essence_md,
         "content_truncated": truncated,
         "msg_text": msg_texts,
         "list_item": item,
         "web_url": f"https://open.gangtise.com/summary/?id={item.get('id')}#/detail",
         "stats": {"content_chars": len(content), "brief_chars": len(brief),
+                  "essence_chars": len(essence_md),
                   "truncated": truncated},
         "crawled_at": datetime.now(timezone.utc),
     }
@@ -1159,18 +1235,36 @@ def dump_chief(session, db, item: dict, force: bool = False,
         },
         "crawled_at": datetime.now(timezone.utc),
     }
-    # Empty-content guard. 2026-04-29 unified rule (replacing earlier
-    # attachment-exempt version):
+    # Empty-content guard. 2026-04-29 unified rule:
     #   - 任何条目, 不管 is_attachment, content_md / description_md 必须有
-    #     真实正文 (非 title-echo). attachment 现在也走 OCR 提取
-    #     (parsed.content), 行情噪声被 _is_quote_noise 过滤掉, 真 OCR 文章正文
-    #     会进 body — 所以 attachment 在这里和普通条目共用同一个判定.
-    #   - 没有真实正文的条目整条跳 (不入库). UI 上的 "[平台未提供文字摘要]"
-    #     就是这种条目造成的噪声.
-    body_real = bool((body or "").strip()) and not _is_title_echo(body, title)
-    desc_real = bool((description or "").strip()) and not _is_title_echo(description, title)
-    if not body_real and not desc_real:
+    #     真实正文. 真实 = 非空, 非 title-echo, 非纯 URL/域名 echo.
+    #   - "纯外链 chief" (description 只塞个 "note.youdao.com" / mp.weixin
+    #     URL 这种"点这里看原文"型条目) 也算 skipped_empty — 平台 list 接口
+    #     给的就这么点信息, 没 detail 端点能补, 用户在 UI 上点开也只能看到
+    #     一个跳转链接, 浪费列表位置.
+    def _has_real_body(s: str) -> bool:
+        if not s or not s.strip():
+            return False
+        if _is_title_echo(s, title):
+            return False
+        if _looks_like_url_or_domain(s):
+            return False
+        return True
+
+    if not _has_real_body(body) and not _has_real_body(description):
         return "skipped_empty", doc["stats"]
+
+    # 2026-04-29: tighter gate for "external-link-only teaser" chief items.
+    # Chief with parsed_msg.url pointing to mp.weixin.qq.com / youdao note /
+    # 95579.com but body < 100 chars is a click-through stub — the real text
+    # lives on the external platform we can't anonymously fetch (wechat
+    # 环境异常 wall, etc.). Skip insertion. Backfill cleanup at
+    # scripts/cleanup_low_value_b_class.py:chief_opinions_weixin_only.
+    EXTERNAL_TEASER_HOSTS = ("mp.weixin.qq.com", "share.note.youdao.com",
+                             "research.95579.com")
+    src_url = (parsed.get("url") or "").strip()
+    if (len(body) < 100 and any(h in src_url for h in EXTERNAL_TEASER_HOSTS)):
+        return "skipped_external_teaser", doc["stats"]
     # Cross-collection dedup: drop chief that duplicates an existing research
     # doc. Strict 3-key (organization, release_time_ms, _norm_title); see
     # `_find_dup_research`. Attachments stay (raw_title is a hash filename

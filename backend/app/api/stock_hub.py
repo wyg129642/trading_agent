@@ -40,9 +40,134 @@ from backend.app.config import Settings, get_settings
 from backend.app.deps import get_current_user, get_db
 from backend.app.models.news import AnalysisResult, NewsItem
 from backend.app.models.user import User
+from backend.app.services.long_translator import (
+    LongTranslator as _LongTranslator,
+    TranslatorConfig as _TranslatorConfig,
+    looks_foreign as _looks_foreign,
+    src_hash as _src_hash,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ─── On-demand translation (fire-and-forget) ────────────────────────────────
+# When stock_hub_doc serves a foreign body that has no `<field>_zh` yet, we
+# kick off a background asyncio.Task to LLM-translate it and write back. The
+# user's first detail-open returns immediately with English; their next
+# refresh (or the parent list reload) shows the Chinese cache. This covers
+# foreign docs whose tickers fall OUTSIDE the portfolio set (the lifespan
+# `portfolio_translation_worker` only translates portfolio-tagged docs).
+#
+# Dedup: in-flight (db, coll, doc_id, field) keys are kept in a process-wide
+# set so concurrent requests for the same doc don't spawn parallel API calls.
+
+_ONDEMAND_INFLIGHT: set[tuple[str, str, str, str]] = set()
+_ONDEMAND_TRANSLATOR: _LongTranslator | None = None
+
+
+def _get_ondemand_translator() -> _LongTranslator | None:
+    """Lazy-init the shared LongTranslator on first use. Returns None when
+    LLM_ENRICHMENT_API_KEY is unset (tests / dev without DashScope creds)."""
+    global _ONDEMAND_TRANSLATOR
+    if _ONDEMAND_TRANSLATOR is not None:
+        return _ONDEMAND_TRANSLATOR
+    s = get_settings()
+    if not s.llm_enrichment_api_key:
+        return None
+    cfg = _TranslatorConfig(
+        api_key=s.llm_enrichment_api_key,
+        base_url=s.llm_enrichment_base_url,
+        model=s.llm_enrichment_model,
+    )
+    _ONDEMAND_TRANSLATOR = _LongTranslator(cfg)
+    return _ONDEMAND_TRANSLATOR
+
+
+async def _translate_and_persist(
+    *,
+    db_name: str,
+    coll_name: str,
+    doc_id: Any,
+    src_field: str,
+    src_text: str,
+    uri: str,
+) -> None:
+    """Background task — translate one (doc, field) and write `<field>_zh`."""
+    key = (db_name, coll_name, str(doc_id), src_field)
+    if key in _ONDEMAND_INFLIGHT:
+        return
+    _ONDEMAND_INFLIGHT.add(key)
+    try:
+        if not _looks_foreign(src_text):
+            return
+        tr = _get_ondemand_translator()
+        if tr is None:
+            return
+        out = await tr.translate(src_text)
+        if not out:
+            return
+        coll = _client(uri)[db_name][coll_name]
+        await coll.update_one(
+            {"_id": doc_id},
+            {"$set": {
+                f"{src_field}_zh": out,
+                f"{src_field}_zh_src_hash": _src_hash(src_text),
+            }},
+        )
+        logger.info(
+            "stock_hub on-demand translated %s.%s/%s.%s (%d→%d chars)",
+            db_name, coll_name, doc_id, src_field, len(src_text), len(out),
+        )
+    except Exception:
+        logger.exception(
+            "stock_hub on-demand translate failed: %s.%s/%s.%s",
+            db_name, coll_name, doc_id, src_field,
+        )
+    finally:
+        _ONDEMAND_INFLIGHT.discard(key)
+
+
+def _schedule_ondemand_translation(
+    *,
+    spec: "_Source",
+    doc: dict,
+    picked_path: str | None,
+    src_text: str,
+    uri: str,
+    db_name: str,
+) -> None:
+    """Fire-and-forget translation if the picked source field is foreign,
+    not nested (no native zh path), and has no LLM zh yet. Skipped when:
+    - native_zh_paths covers this field (upstream already provides zh)
+    - `<field>_zh` already populated
+    - source text fails the foreign-content gate
+    - field path is nested (e.g. parsed_msg.translatedDescription) — those
+      can't be written back as flat `<field>_zh`
+    """
+    if not picked_path or not src_text:
+        return
+    if "." in picked_path:
+        return
+    if spec.native_zh_paths.get(picked_path):
+        # Native upstream translation is already used at read-time;
+        # no benefit from LLM-writing a parallel `_zh`.
+        return
+    cached = doc.get(f"{picked_path}_zh")
+    if isinstance(cached, str) and cached.strip():
+        return
+    if not _looks_foreign(src_text):
+        return
+    if len(src_text) < 80 or len(src_text) > 400_000:
+        return
+    asyncio.create_task(_translate_and_persist(
+        db_name=db_name,
+        coll_name=spec.collection,
+        doc_id=doc.get("_id"),
+        src_field=picked_path,
+        src_text=src_text,
+        uri=uri,
+    ))
 
 
 # Categories — label ordering matches the UI chip order
@@ -326,12 +451,25 @@ SOURCES: list[_Source] = [
         source="gangtise", db_attr="gangtise_mongo_db", uri_attr="gangtise_mongo_uri",
         collection="summaries", category="minutes",
         time_field="release_time", time_ms_field="release_time_ms",
-        url_field="web_url", preview_field="content_md",
+        url_field="web_url", preview_field=("essence_md", "content_md"),
         org_field="organization",
         # summaries has no PDF endpoint in gangtise_db.py — drop pdf_route
+        # 2026-04-29 schema:
+        #   要点 — essence_md, gangtise's native AI-generated structured
+        #          per-topic key takeaways (`list_item.essence`, ~22% of
+        #          docs have it; backfilled 2026-04-29 from raw payload).
+        #          Format: bullet list `- **brief**: content`.
+        #   正文 — content_md from S3 full-text fetch (~50% of docs have
+        #          it; ~50% fall back to brief_md because /summary/download
+        #          daily quota was exhausted at crawl time —
+        #          content_truncated=True flag, hidden from list anyway).
+        #   We DON'T expose brief_md as its own section: it's gangtise's
+        #   500-char native preview ("试读"), upstream-truncated by the
+        #   platform — duplicating the head of content_md and ending mid-
+        #   sentence makes the doc look broken to users.
         body_sections=(
-            ("正文", "content_md"),
-            ("摘要", "brief_md"),
+            ("要点", "essence_md"),
+            ("正文", ("content_md", "brief_md")),
         ),
         source_label="岗底斯 · 会议纪要",
     ),
@@ -808,18 +946,12 @@ async def _query_spec(
     if spec.source in TRUNCATION_FLAG_SOURCES:
         base_match["content_truncated"] = {"$ne": True}
 
-    # Soft-delete gate. Originally chief_opinions; extended 2026-04-29 to
-    # cover thin third-party clips (alphapai/reports — see _is_thin_clip_item)
-    # AND content_truncated quota stubs (alphapai/roadshows + comments — see
-    # cleanup_alphapai_quota_stubs.py + dump_one's quota_exhausted gate).
-    if (spec.source, spec.collection) in {
-        ("gangtise", "chief_opinions"),
-        ("alphapai", "reports"),
-        ("alphapai", "roadshows"),
-        ("alphapai", "comments"),
-        ("thirdbridge", "interviews"),
-    }:
-        base_match["deleted"] = {"$ne": True}
+    # Soft-delete gate — universal across all sources (was per-collection
+    # historically; broadened 2026-04-29 because cleanup_low_value_b_class.py
+    # writes `deleted=True` across 6+ collections — gangtise/summaries,
+    # jiuqian/forum, alphaengine/{news_items,china_reports,summaries},
+    # funda/earnings_reports — and we want them all hidden uniformly).
+    base_match["deleted"] = {"$ne": True}
 
     # Low-value gate: docs whose body_sections + pdf_text_md sum to <100 chars
     # (set by scripts/mark_low_value_docs.py; idempotent with self-heal). Always
@@ -1466,10 +1598,11 @@ async def stock_hub_doc(
             f"{source}.{collection}/{item_id} is a quota-truncated entry; "
             "hidden from Stock Hub per the 2026-04-29 truncation policy",
         )
-    # Soft-deleted chief_opinions (cleanup_gangtise_chief.py /
-    # dump_research reverse-dedup hook) are hidden from list responses; mirror
-    # that for direct detail too so a cached card can't bypass the filter.
-    if spec.collection == "chief_opinions" and doc.get("deleted"):
+    # Soft-deleted docs (cleanup_low_value_b_class.py + per-source cleanups)
+    # are hidden from list responses; mirror for direct detail so cached cards
+    # can't bypass the filter. Universal across all sources (was per-collection
+    # before 2026-04-29).
+    if doc.get("deleted"):
         raise HTTPException(
             410,
             f"{source}.{collection}/{item_id} was soft-deleted "
@@ -1575,6 +1708,21 @@ async def stock_hub_doc(
             "markdown": body,
             "markdown_zh": zh_body,
         })
+
+        # On-demand fire-and-forget LLM translation. Covers foreign docs
+        # whose tickers fall outside the portfolio set and so are skipped
+        # by the lifespan worker. Skipped if zh_body already resolved
+        # (native or cached) or if the picked path is a nested dotted
+        # path (can't be written back flat as `<field>_zh`).
+        if zh_body is None:
+            _schedule_ondemand_translation(
+                spec=spec,
+                doc=doc,
+                picked_path=picked_path,
+                src_text=raw,
+                uri=uri,
+                db_name=db_name,
+            )
 
     # pdf_url (single) + pdf_urls (multi-attachment). For meritco we also expose
     # the per-attachment list so the UI can render tabs when a forum has >1 PDF.
@@ -1704,9 +1852,25 @@ async def stock_hub_newsfeed_doc(
     # Flatten AnalysisResult into readable markdown blocks. Doing it here
     # keeps the frontend dumb — it just renders whatever sections come back
     # and doesn't have to know about bull_case / bear_case / key_facts etc.
+    #
+    # EN→ZH translations are stashed in ``news_items.metadata_`` (JSONB) by
+    # the ``news_translator`` lifespan worker:
+    #   metadata.title_zh    → response.title_zh
+    #   metadata.summary_zh  → "摘要" section's markdown_zh
+    #   metadata.content_zh  → "正文" section's markdown_zh
+    # Frontend toggles 中文/原文 based on markdown_zh presence.
+    md = n.metadata_ or {}
+    title_zh = (md.get("title_zh") or "").strip() or None
+    summary_zh = (md.get("summary_zh") or "").strip() or None
+    content_zh = (md.get("content_zh") or "").strip() or None
+
     sections: list[dict] = []
     if a and a.summary:
-        sections.append({"label": "摘要", "markdown": a.summary})
+        sections.append({
+            "label": "摘要",
+            "markdown": a.summary,
+            "markdown_zh": summary_zh,
+        })
     if a:
         if getattr(a, "market_expectation", ""):
             sections.append({"label": "市场预期", "markdown": a.market_expectation})
@@ -1720,7 +1884,18 @@ async def stock_hub_newsfeed_doc(
             if lines:
                 sections.append({"label": "关键事实", "markdown": "\n".join(lines)})
     if n.content:
-        sections.append({"label": "正文", "markdown": n.content})
+        body_zh = content_zh
+        # Fallback: when the body itself wasn't translated (under
+        # CONTENT_MIN_CHARS or filtered out) but a summary translation
+        # exists, still hand the frontend something Chinese to render so
+        # the toggle works.
+        if not body_zh and summary_zh and not (a and a.summary):
+            body_zh = summary_zh
+        sections.append({
+            "label": "正文",
+            "markdown": n.content,
+            "markdown_zh": body_zh,
+        })
 
     pub = n.published_at
     return DocDetailResponse(
@@ -1731,6 +1906,7 @@ async def stock_hub_newsfeed_doc(
         category_label=CATEGORY_LABELS["breaking"],
         id=str(n.id),
         title=(n.title or "")[:400],
+        title_zh=title_zh,
         release_time=pub.strftime("%Y-%m-%d %H:%M") if pub else None,
         release_time_ms=int(pub.timestamp() * 1000) if pub else None,
         organization=n.source_name or "",

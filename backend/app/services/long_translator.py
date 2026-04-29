@@ -28,6 +28,15 @@ def looks_foreign(text: str, *, min_signal: int = 100) -> bool:
     ``min_signal`` is the minimum (cjk + ascii_letter) sum we require before
     judging — body fields use 100, titles use 20 (a single short headline can
     still be decisive).
+
+    2026-04-29: jinmen.oversea_reports stores titles like
+    "杰富瑞 - 2026年美国临床肿瘤学会年会标题：Ideaya Biosciences, Karyopharm
+    Therapeutics, Black Diamond Therapeutics, ..." — already Chinese, but
+    full of US ticker / company-name English. The 3:1 ASCII heuristic
+    flagged it as foreign; the LLM then "translated" the Chinese title back
+    to English. To prevent that, treat any text with ≥5 CJK characters as
+    Chinese-with-embedded-English-names (not foreign), regardless of the
+    ASCII tail of company lists.
     """
     if not text:
         return False
@@ -35,6 +44,8 @@ def looks_foreign(text: str, *, min_signal: int = 100) -> bool:
     cjk = len(CJK_RE.findall(sample))
     ascii_letters = sum(1 for c in sample if c.isascii() and c.isalpha())
     if (cjk + ascii_letters) < min_signal:
+        return False
+    if cjk >= 5:
         return False
     return cjk * 3 < ascii_letters
 

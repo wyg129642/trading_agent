@@ -74,6 +74,28 @@ def _strip_html(s: str) -> str:
     return s.strip()
 
 
+_URL_ONLY_RE = re.compile(r'^\s*https?://\S+\s*$', re.IGNORECASE)
+_DOMAIN_ONLY_RE = re.compile(
+    r'^\s*[\w.-]+\.(com|cn|net|org|io|app|co|me|info|xyz|hk|jp|kr|us|edu)(/\S*)?\s*$',
+    re.IGNORECASE,
+)
+
+
+def _looks_like_url_or_domain(text: str) -> bool:
+    """Mirror of crawl/gangtise/scraper.py::_looks_like_url_or_domain.
+
+    True if text is just a URL or bare domain (e.g. "note.youdao.com",
+    "https://share.note.youdao.com/...") — chief items where description
+    is set to a click-through teaser instead of real body.
+    """
+    if not text:
+        return False
+    s = text.strip()
+    if len(s) > 200:
+        return False
+    return bool(_URL_ONLY_RE.match(s) or _DOMAIN_ONLY_RE.match(s))
+
+
 def _is_title_echo(text: str, title: str) -> bool:
     """Detect "description is just a title-echo" (no real body).
 
@@ -107,22 +129,29 @@ def _is_title_echo(text: str, title: str) -> bool:
 def _is_empty_chief(doc: dict) -> bool:
     """Return True if this chief_opinion has no real text body.
 
-    2026-04-29 unified rule (replacing the earlier attachment-exempt version):
-    attachments are NOT free passes anymore — after the OCR backfill step,
-    attachments with empty content_md AND empty description_md are confirmed
-    junk and get soft-deleted alongside non-attachment empties.
+    2026-04-29 unified rule:
+      - attachments share the same gate (after OCR backfill step they have
+        real content_md if anything useful was OCR'd);
+      - description / content must be substantive: non-empty, non title-echo,
+        and not a bare URL/domain (e.g. "note.youdao.com" — pure click-through
+        teaser).
     """
     title = (doc.get("title") or "").strip()
     content = (doc.get("content_md") or "").strip()
     description = (doc.get("description_md") or "").strip()
-    # If there's a real description body (not a title echo), keep.
-    if description and not _is_title_echo(description, title):
-        return False
-    # No real description; only keep if content_md has substantive text
-    # other than the title-fallback bug residue.
-    if content and content != title and not _is_title_echo(content, title):
-        return False
-    return True
+
+    def _has_real_body(s: str) -> bool:
+        if not s:
+            return False
+        if _is_title_echo(s, title):
+            return False
+        if _looks_like_url_or_domain(s):
+            return False
+        if s == title:
+            return False
+        return True
+
+    return not (_has_real_body(description) or _has_real_body(content))
 
 
 def phase0_backfill_attachment_ocr(db, *, apply: bool) -> dict:

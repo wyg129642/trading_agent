@@ -24,8 +24,10 @@ from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+import asyncio
+import httpx
 
 from backend.app.config import get_settings
 from backend.app.deps import get_current_user
@@ -44,11 +46,11 @@ def _db() -> AsyncIOMotorDatabase:
 
 
 def _articles():
-    return _db()["articles"]
+    return _db()["wechat_articles"]
 
 
 def _accounts():
-    return _db()["account"]
+    return _db()["wechat_account"]
 
 
 def _image_root() -> Path:
@@ -172,6 +174,79 @@ async def get_article_image(doc_id: str, idx: int,
     if suffix in {"png", "gif", "webp", "svg", "bmp"}:
         media_type = f"image/{'svg+xml' if suffix == 'svg' else suffix}"
     return FileResponse(str(abs_path), media_type=media_type)
+
+
+# ── Cover 代理 ────────────────────────────────────────────────────────────
+#
+# 微信封面图在 mmbiz.qlogo.cn / mmbiz.qpic.cn,服务端必须带
+# `Referer: https://mp.weixin.qq.com/`。前端直连若 referer 不对会 403,
+# 即便 referrerPolicy=no-referrer 能蒙过去,客户端本机网络 + 出口 IP
+# 仍可能让单张图卡 5-30s,导致 list 页一堆 cover 并发拖慢整页。
+#
+# 走这条路由后:
+#   - 服务端用 LAN 网络 + 正确 Referer 拉一次 (~100-300ms)
+#   - 进程内 LRU 命中后客户端 ~10ms
+#   - 客户端只需 1 个 axios call,不需要管防盗链
+
+_COVER_CACHE: dict[str, tuple[bytes, str, float]] = {}  # url → (bytes, content-type, t)
+_COVER_CACHE_LOCK = asyncio.Lock()
+_COVER_CACHE_MAX = 1024
+_COVER_CACHE_TTL = 6 * 3600  # 6h
+
+
+def _cover_evict() -> None:
+    """LRU-ish: 时间戳最早的若干条踢掉,简单高效."""
+    if len(_COVER_CACHE) <= _COVER_CACHE_MAX:
+        return
+    items = sorted(_COVER_CACHE.items(), key=lambda x: x[1][2])
+    for k, _ in items[: max(1, len(items) // 4)]:
+        _COVER_CACHE.pop(k, None)
+
+
+@router.get("/cover")
+async def proxy_cover(
+    url: str = Query(..., description="mmbiz.qpic.cn / mmbiz.qlogo.cn 封面 URL"),
+    _user: User = Depends(get_current_user),
+):
+    """代理拉取微信封面图 - 服务端带正确 Referer + 进程内 6h 缓存."""
+    if not url.startswith(("https://mmbiz.qpic.cn/", "https://mmbiz.qlogo.cn/",
+                           "http://mmbiz.qpic.cn/", "http://mmbiz.qlogo.cn/")):
+        raise HTTPException(400, "only mmbiz.qpic.cn / mmbiz.qlogo.cn allowed")
+    import time as _t
+    now = _t.time()
+    cached = _COVER_CACHE.get(url)
+    if cached and (now - cached[2]) < _COVER_CACHE_TTL:
+        return Response(content=cached[0], media_type=cached[1],
+                        headers={"Cache-Control": "public, max-age=21600",
+                                 "X-Cache": "HIT"})
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://mp.weixin.qq.com/",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    }
+    # trust_env=False 关键: 仓库 .env 把 HTTP_PROXY 设为 LAN 代理 192.168.31.97:30801,
+    # 该代理对 mmbiz.qpic.cn / mmbiz.qlogo.cn 不通,会 15s 超时拖死整个列表页加载。
+    # 我们必须直连 mmbiz CDN (与 image_dl.py / scraper.fetch_article_html 一致)。
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True,
+                                      trust_env=False) as client:
+            resp = await client.get(url, headers=headers)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"upstream fetch failed: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, f"upstream HTTP {resp.status_code}")
+    ct = resp.headers.get("content-type", "image/jpeg").split(";", 1)[0].strip()
+    body = resp.content
+    async with _COVER_CACHE_LOCK:
+        _COVER_CACHE[url] = (body, ct, now)
+        _cover_evict()
+    return Response(content=body, media_type=ct,
+                    headers={"Cache-Control": "public, max-age=21600",
+                             "X-Cache": "MISS"})
 
 
 @router.get("/accounts")

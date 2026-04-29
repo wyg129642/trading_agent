@@ -13,11 +13,18 @@ migration is needed. Keys written:
     summary_zh          : str (translation of analysis_results.summary or
                                news_items.content[:600] when summary empty)
     summary_zh_src_hash : sha1(src_text)[:16]
+    content_zh          : str (translation of full news_items.content body —
+                               feeds the detail-drawer 正文 section's
+                               markdown_zh; capped at CONTENT_MAX_CHARS so
+                               outlier 50K+ HTML dumps don't run away)
+    content_zh_src_hash : sha1(content)[:16]
     zh_translated_at    : ISO timestamp
     zh_model            : str (e.g. "qwen-plus")
 
 The list endpoint (``_query_breaking_news``) reads these fields and surfaces
-``title_zh``/``preview_zh`` so the existing frontend toggle just works.
+``title_zh``/``preview_zh`` so the existing frontend toggle just works. The
+detail endpoint (``stock_hub_newsfeed_doc``) wires ``content_zh`` into the
+正文 section's ``markdown_zh``.
 """
 from __future__ import annotations
 
@@ -39,6 +46,15 @@ from backend.app.services.long_translator import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Cap so a runaway 100KB scrape (e.g. an entire HTML page accidentally
+# stored as content) doesn't burn tokens. 60K covers Semiconductor
+# Engineering's longest weekly digest (~13K) plus headroom.
+CONTENT_MAX_CHARS = 60_000
+# Skip below this — RSS items shorter than this are already covered by
+# the summary translation and translating both is wasted spend.
+CONTENT_MIN_CHARS = 400
 
 
 def _summary_source(summary: str | None, content: str | None) -> str:
@@ -91,13 +107,15 @@ async def _scan_and_translate(
             .where(
                 ~NewsItem.metadata_.has_key("title_zh")  # noqa: W601
                 | ~NewsItem.metadata_.has_key("summary_zh")  # noqa: W601
+                | ~NewsItem.metadata_.has_key("content_zh")  # noqa: W601
             )
             .order_by(desc(NewsItem.fetched_at))
             .limit(per_cycle_max * 4)
         )
         rows = (await db.execute(stmt)).all()
 
-    pending: list[tuple[str, str, str, str, str, str]] = []  # (id, title, title_hash, src_text, src_hash, src_field)
+    # (id, title, title_h, summary_src, summary_h, content_src, content_h)
+    pending: list[tuple[str, str, str, str, str, str, str]] = []
     seen = 0
     cached = 0
     for n, a in rows:
@@ -121,14 +139,37 @@ async def _scan_and_translate(
         summary_h = src_hash(summary_src) if summary_src else ""
         summary_zh_cached = (md.get("summary_zh") or "").strip()
         summary_hash_cached = md.get("summary_zh_src_hash") or ""
+        # min_signal=30: RSS feeds (CNBC Top News, WSJ, MarketWatch) routinely
+        # ship 50–120 char summaries with ~40–90 ASCII letters. The default
+        # min_signal=100 silently gated those out — `title_zh` would land but
+        # `summary_zh` would not, so cards rendered "中文标题 + English preview".
+        # `len(summary_src) >= 40` already filters out tiny snippets.
         summary_needs = bool(
             summary_src
             and len(summary_src) >= 40
-            and looks_foreign(summary_src)
+            and looks_foreign(summary_src, min_signal=30)
             and (summary_hash_cached != summary_h or not summary_zh_cached)
         )
 
-        if not title_needs and not summary_needs:
+        # Full-body translation feeds the detail-drawer 正文 markdown_zh.
+        # Without this, sources like Semiconductor Engineering's weekly digest
+        # (~13K chars) showed Chinese title+summary but English body. Skip
+        # short bodies (already covered by summary) and outlier dumps to keep
+        # spend bounded.
+        content_src = (n.content or "").strip()
+        if len(content_src) > CONTENT_MAX_CHARS:
+            content_src = content_src[:CONTENT_MAX_CHARS]
+        content_h = src_hash(content_src) if content_src else ""
+        content_zh_cached = (md.get("content_zh") or "").strip()
+        content_hash_cached = md.get("content_zh_src_hash") or ""
+        content_needs = bool(
+            content_src
+            and len(content_src) >= CONTENT_MIN_CHARS
+            and looks_foreign(content_src, min_signal=50)
+            and (content_hash_cached != content_h or not content_zh_cached)
+        )
+
+        if not title_needs and not summary_needs and not content_needs:
             cached += 1
             continue
 
@@ -138,7 +179,8 @@ async def _scan_and_translate(
             title_h if title_needs else "",
             summary_src if summary_needs else "",
             summary_h if summary_needs else "",
-            "",
+            content_src if content_needs else "",
+            content_h if content_needs else "",
         ))
         if len(pending) >= per_cycle_max:
             break
@@ -149,10 +191,11 @@ async def _scan_and_translate(
     # Translate concurrently; the translator's internal semaphore keeps real
     # API concurrency at cfg.max_concurrency.
     async def _do(item):
-        _id, t, th, s, sh, _ = item
+        _id, t, th, s, sh, c, ch = item
         t_zh = await translator.translate(t) if t else ""
         s_zh = await translator.translate(s) if s else ""
-        return _id, t_zh, th, s_zh, sh
+        c_zh = await translator.translate(c) if c else ""
+        return _id, t_zh, th, s_zh, sh, c_zh, ch
 
     translated_count = 0
     BATCH = 24
@@ -161,7 +204,7 @@ async def _scan_and_translate(
         for i in range(0, len(pending), BATCH):
             batch = pending[i:i + BATCH]
             results = await asyncio.gather(*(_do(it) for it in batch))
-            for nid, title_zh, title_h, summary_zh, summary_h in results:
+            for nid, title_zh, title_h, summary_zh, summary_h, content_zh, content_h in results:
                 updates: dict = {}
                 if title_zh:
                     updates["title_zh"] = title_zh
@@ -169,6 +212,9 @@ async def _scan_and_translate(
                 if summary_zh:
                     updates["summary_zh"] = summary_zh
                     updates["summary_zh_src_hash"] = summary_h
+                if content_zh:
+                    updates["content_zh"] = content_zh
+                    updates["content_zh_src_hash"] = content_h
                 if not updates:
                     continue
                 updates["zh_translated_at"] = now_iso

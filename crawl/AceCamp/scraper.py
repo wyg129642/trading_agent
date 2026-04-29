@@ -1368,14 +1368,23 @@ def main():
                     reason = _DISABLE_FILE.read_text(encoding="utf-8").strip()[:500]
                 except Exception:
                     pass
+            is_banned = "AUTO-BANNED" in reason or "账号被封控" in reason
+            tag = "[AceCamp 账号被封控]" if is_banned else "[AceCamp]"
             print("=" * 60)
-            print("[AceCamp] 抓取已被全局关闭 — 拒绝启动任何抓取任务")
+            print(f"{tag} 抓取已被全局关闭 — 拒绝启动任何抓取任务")
             print(f"  闸门文件: {_DISABLE_FILE}")
             if reason:
-                print(f"  原因: {reason}")
-            print("  恢复: 删除 DISABLED 文件后重新启动")
+                print(f"  原因:\n{reason}")
+            if is_banned:
+                print("  → 解封: DataSources 实时查看登录新账号 →")
+                print(f"        rm {_DISABLE_FILE} → scraper 自动恢复")
+            else:
+                print("  恢复: 删除 DISABLED 文件后重新启动")
             print("=" * 60)
-            sys.exit(0)
+            # 退出码用 2 (被封控) 让 backfill_6months 把它当 fail 计数, 10 次后
+            # advance 跳过 acecamp target, 不再每分钟 spawn 一次. 老的手动 DISABLED
+            # 也走 rc=2, 行为一致.
+            sys.exit(2)
 
     # 2026-04-29: --skip-detail 在 articles 上被弃用. list 接口不返回 content 字段,
     # skip_detail 路径以前会把 list 给的"提纲式 summary" 当 content_md 写库 (StockHub
@@ -1448,16 +1457,37 @@ def main():
         count_today(session, db, args)
         return
 
-    # 启动期登录态硬拦 (2026-04-29): users/me data:null = 匿名 session →
-    # detail 全 paywall, 继续跑只会 skipped_empty 浪费 CPU. 直接退出, 让运维
-    # 在 DataSources 实时查看里重登. show_state/today/clean/reset_state 等
-    # 管理路径已在上面 return, 不会跑到这里.
+    # 启动期登录态硬拦 (2026-04-29 v2): users/me data:null = 账号被封控
+    # (Rails session 持续返 null + JWT 仍在但服务器拒识别 = 平台主动封控信号).
+    # 自动 touch DISABLED 闸门, 让 _DISABLE_FILE 路径接管以后所有启动尝试 —
+    # 不再每次启动 5-10s 后才 exit 浪费 CPU + 让监控/UI 把状态升级到红色"已封号".
+    # 解封后流程: 1) 在 DataSources 实时查看里登录新账号, cdp 写回 cookie;
+    # 2) rm crawl/AceCamp/DISABLED; 3) scraper 自动开始抓.
     alive, msg = probe_session_alive(session)
     if not alive:
-        print(f"\n[ERROR] 登录态失效 — {msg}")
-        print(f"  → cookie 仍能调 list 但 detail 全部 paywall, 继续抓只会写 skipped_empty.")
-        print(f"  → 修复: 在 DataSources 页面点 acecamp 实时查看, 浏览器内完成登录,")
-        print(f"     cdp_screencast 会自动写回 credentials.json, 之后重启 scraper.")
+        from datetime import timezone as _tz
+        ban_reason = (
+            f"AUTO-BANNED at {datetime.now(_tz.utc).isoformat()}\n"
+            f"reason: 账号被封控 — users/me 持续返 data=null\n"
+            f"detail: {msg}\n"
+            f"acct: {_account_id}\n"
+            f"fix: 1) 在 DataSources 页面点 acecamp 实时查看, 浏览器登录\n"
+            f"     2) rm {_DISABLE_FILE}\n"
+            f"     3) 等 watcher 自动恢复 (or kill 残留 scraper, monitor 会 respawn)\n"
+        )
+        try:
+            _DISABLE_FILE.write_text(ban_reason, encoding="utf-8")
+            wrote_gate = True
+        except Exception as e:
+            wrote_gate = False
+            print(f"[警告] DISABLED 闸门写入失败: {e}")
+        print(f"\n[ERROR] 账号被封控 — {msg}")
+        print(f"  → cookie 仍能调 list 但 users/me data=null + detail 全 paywall.")
+        if wrote_gate:
+            print(f"  → 已写入 DISABLED 闸门 ({_DISABLE_FILE}), 后续 scraper 启动一律拒绝.")
+        print(f"  → 解封步骤: 1) 在 DataSources 实时查看登录新账号")
+        print(f"            2) rm {_DISABLE_FILE}")
+        print(f"            3) 重启 scraper (monitor 会自动 respawn)")
         sys.exit(2)
     print(f"[auth] 登录态 OK ({msg})")
 

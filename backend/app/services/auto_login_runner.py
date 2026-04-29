@@ -59,6 +59,20 @@ def _clean_env() -> dict[str, str]:
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _CRAWL_DIR = _REPO_ROOT / "crawl"
+# 已迁出 crawl/ 的平台目录 (2026-04-29: wechat_mp 在 proposal-agent)。
+# WEB_RESEARCH_DIR env var 可覆盖。
+_RESEARCH_DIR = Path(
+    os.environ.get("WEB_RESEARCH_DIR")
+    or "/home/ygwang/proposal-agent/web_research"
+)
+
+
+def _resolve_script_path(rel: str) -> Path:
+    """AUTO_LOGIN_SCRIPTS 值以 ``__EXTERNAL__/`` 开头表示已迁出 crawl/,
+    剩余部分相对 _RESEARCH_DIR 拼接;否则按老路径相对 _CRAWL_DIR 拼接。"""
+    if rel.startswith("__EXTERNAL__/"):
+        return _RESEARCH_DIR / rel[len("__EXTERNAL__/"):]
+    return _CRAWL_DIR / rel
 
 # Map platform key → relative path of the Playwright script. Scripts not yet
 # implemented simply aren't listed; the API surfaces that as "unsupported".
@@ -71,7 +85,10 @@ AUTO_LOGIN_SCRIPTS: dict[str, str] = {
     "alphaengine": "alphaengine/auto_login.py",
     "funda": "funda/auto_login.py",
     "thirdbridge": "third_bridge/auto_login.py",
-    "wechat_mp": "wechat_mp/auto_login.py",
+    # 2026-04-29 二次迁移:wechat_mp 已从 crawl/ → web_research/ → proposal-agent.
+    # 这里给 _CRAWL_DIR 相对的"虚路径";launch() 拿到后再做 _resolve_script_path
+    # 真实查找 (按 _RESEARCH_DIR 重定向)。
+    "wechat_mp": "__EXTERNAL__/wechat_mp/auto_login.py",
 }
 
 SESSION_TTL_SECONDS = 600  # keep status around for 10 min after completion
@@ -101,7 +118,7 @@ async def launch(
         raise ValueError(f"Auto-login not supported for platform: {platform}")
 
     script_rel = AUTO_LOGIN_SCRIPTS[platform]
-    script_path = _CRAWL_DIR / script_rel
+    script_path = _resolve_script_path(script_rel)
     if not script_path.exists():
         raise FileNotFoundError(f"Auto-login script missing: {script_path}")
 

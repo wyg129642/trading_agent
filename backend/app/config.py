@@ -186,10 +186,13 @@ class Settings(BaseSettings):
     alphaengine_mongo_db: str = "alphaengine"
     alphaengine_pdf_dir: str = "/home/ygwang/crawl_data/alphaengine_pdfs"
 
-    # 微信公众号 (mp.weixin.qq.com) 直采 (2026-04-29 上线)
+    # Web research corpus (mp.weixin.qq.com 公众号直采 + 后续雪球/知乎/博客等)
+    # 2026-04-29 把目录从 crawl/wechat_mp 迁到 web_research/wechat_mp,
+    # Mongo DB 从 wechat-mp 改成 web-research,collection 用 wechat_articles
+    # / wechat_account / _state_wechat,留出 namespace 给后续源。
     wechat_mp_mongo_uri: str = REMOTE_CRAWL_MONGO_URI
-    wechat_mp_mongo_db: str = "wechat-mp"
-    wechat_mp_image_root: str = "/home/ygwang/crawl_data/wechat_mp_images"
+    wechat_mp_mongo_db: str = "web-research"
+    wechat_mp_image_root: str = "/home/ygwang/web_research_data/wechat_mp_images"
 
     # AceCamp 内容字段直接从 API 拿到 markdown 全文, 绝大多数无独立 PDF —
     # 仅 can_download 的少数文章会写入此目录 (/articles/download_url 返回 S3 URL)

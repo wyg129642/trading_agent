@@ -1105,6 +1105,14 @@ async def screencast_ws(
     await websocket.accept()
 
     async def _pump_frames():
+        # Fast path: ship JPEG frames as raw binary WS messages instead of
+        # JSON-wrapped base64. Three wins:
+        #  1. ~33% fewer bytes (no base64 inflation)
+        #  2. zero JSON serialise on server / zero parse on client per frame
+        #  3. browser can pipe Blob → <img.src> with one URL.createObjectURL
+        # Status/heartbeat/non-frame messages still go via send_json for
+        # backwards-compat with the existing client-side dispatcher.
+        import base64
         while sess.status != "CLOSED":
             try:
                 msg = await asyncio.wait_for(sess.frame_queue.get(), timeout=1.0)
@@ -1118,7 +1126,21 @@ async def screencast_ws(
                     return
                 continue
             try:
-                await websocket.send_json(msg)
+                if msg.get("type") == "frame":
+                    raw = msg.get("data")
+                    if isinstance(raw, str):
+                        try:
+                            jpeg_bytes = base64.b64decode(raw)
+                        except Exception:
+                            # Malformed data — fall back to JSON path so the
+                            # client at least sees the original payload.
+                            await websocket.send_json(msg)
+                            continue
+                        await websocket.send_bytes(jpeg_bytes)
+                    else:
+                        await websocket.send_json(msg)
+                else:
+                    await websocket.send_json(msg)
             except Exception:
                 return
             if msg.get("type") == "status" and msg.get("status") in ("SUCCESS", "FAILED"):

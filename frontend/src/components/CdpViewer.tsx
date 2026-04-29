@@ -103,10 +103,32 @@ export default function CdpViewer({ platformKey, onSuccess, onCancel, mode = 'lo
         const ws = new WebSocket(url)
         ws.binaryType = 'arraybuffer'
         wsRef.current = ws
+        // Track the previous Blob URL so we can revoke it after the next
+        // frame paints — otherwise a long session leaks dozens of MB of
+        // Blob references into the DOM cache.
+        let prevBlobUrl: string | null = null
         ws.onmessage = (ev) => {
+          // Binary WS message = raw JPEG bytes (server fast-path). Wrap in
+          // a Blob URL and let <img> decode on the GPU. ~3-5× faster than
+          // the data:image/jpeg;base64,... path which forces a CPU base64
+          // decode + the browser's data-URL parser on every frame.
+          if (ev.data instanceof ArrayBuffer) {
+            const blob = new Blob([ev.data], { type: 'image/jpeg' })
+            const url = URL.createObjectURL(blob)
+            setFrame(url)
+            // Revoke the previous frame's blob URL on the next macrotask so
+            // the <img> has time to swap before the GC reclaims memory.
+            if (prevBlobUrl) {
+              const stale = prevBlobUrl
+              setTimeout(() => URL.revokeObjectURL(stale), 0)
+            }
+            prevBlobUrl = url
+            return
+          }
           try {
             const msg = JSON.parse(ev.data)
             if (msg.type === 'frame') {
+              // Legacy JSON-wrapped base64 fallback (heartbeat / older server).
               setFrame(`data:image/jpeg;base64,${msg.data}`)
             } else if (msg.type === 'status') {
               setStatus(msg.status)
@@ -162,9 +184,26 @@ export default function CdpViewer({ platformKey, onSuccess, onCancel, mode = 'lo
     return { x: relX, y: relY }
   }
 
+  // mousemove fires at the pointer's native sample rate (~120Hz on
+  // high-DPI touchpads), but Chromium only renders frames at
+  // ~15-30fps so most of those events are wasted bandwidth and just
+  // backlog the input_queue. Coalesce via requestAnimationFrame so we
+  // ship at most one mousemove per browser paint (~60fps cap; usually
+  // matches the screencast rate). The latest coords always win.
+  const moveCoordsRef = useRef<{ x: number; y: number } | null>(null)
+  const moveRafRef = useRef<number | null>(null)
+  const flushMove = () => {
+    moveRafRef.current = null
+    const c = moveCoordsRef.current
+    moveCoordsRef.current = null
+    if (!c) return
+    sendInput({ type: 'mouse', action: 'move', x: c.x, y: c.y })
+  }
   const onMouseMove = (e: React.MouseEvent) => {
-    const { x, y } = mapCoords(e.clientX, e.clientY)
-    sendInput({ type: 'mouse', action: 'move', x, y })
+    moveCoordsRef.current = mapCoords(e.clientX, e.clientY)
+    if (moveRafRef.current === null) {
+      moveRafRef.current = requestAnimationFrame(flushMove)
+    }
   }
   const onMouseDown = (e: React.MouseEvent) => {
     imgRef.current?.focus()

@@ -485,16 +485,21 @@ SOURCES = [
     # --- 微信公众号 (mp.weixin.qq.com) — 2026-04-29 ---
     # MP 后台路径直采, 白名单起步只 1 号 (机器之心). state_id 在 scraper.py 是
     # `crawler_account_<name>` 格式, 这里取机器之心一条做指标主面;
-    # 后续如果 accounts.yaml 加号, 这里也要并行加新条目 (像 alphapai 那样).
+    # 2026-04-29 (二次): 目录从 crawl/wechat_mp 迁到 web_research/wechat_mp,
+    # DB 从 wechat-mp 改为 web-research, collection 从 articles 改 wechat_articles。
     {
         "platform": "wechat_mp",
         "key": "wechat_mp_default",
         "label": "公众号文章",
-        "db": "wechat-mp",
-        "collection": "articles",
+        "db": "web-research",
+        "collection": "wechat_articles",
         "state_id": "crawler_account_机器之心",
         "doc_filter": {},
-        "log": ROOT / "wechat_mp" / "logs" / "watch.log",
+        "state_collection": "_state_wechat",
+        # 2026-04-29 二次迁移: web_research 已迁到独立 proposal-agent 项目
+        "log": Path(os.environ.get("WEB_RESEARCH_DIR")
+                    or "/home/ygwang/proposal-agent/web_research"
+                    ) / "wechat_mp" / "logs" / "watch.log",
         "proc_match": r"wechat_mp.*scraper\.py",
         "item_fields": ["title", "account_name", "release_time"],
         "time_field": "release_time",
@@ -2800,6 +2805,12 @@ def render_html(snap: dict) -> str:
                 f"<span class='auth-pill auth-bad' title='{esc(reason)}'>"
                 f"✗ 已过期</span>"
             )
+        elif auth_state == "banned":
+            reason = auth_detail[:160] or "账号被封控"
+            auth_badge = (
+                f"<span class='auth-pill auth-bad' title='{esc(reason)}'>"
+                f"⚓ 已封号</span>"
+            )
         elif auth_state == "anonymous":
             reason = auth_detail[:120] or "匿名 session"
             auth_badge = (
@@ -2921,6 +2932,11 @@ def render_html(snap: dict) -> str:
             detail_auth_badge = (
                 f" <span class='auth-pill auth-bad' title='{esc(auth_detail)}'>"
                 f"✗ 已过期 · {esc(auth_detail[:80])}</span>"
+            )
+        elif auth_state == "banned":
+            detail_auth_badge = (
+                f" <span class='auth-pill auth-bad' title='{esc(auth_detail)}'>"
+                f"⚓ 已封号 · {esc(auth_detail[:120])}</span>"
             )
         elif auth_state == "anonymous":
             detail_auth_badge = (

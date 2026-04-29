@@ -1,0 +1,7 @@
+AUTO-BANNED at 2026-04-29T09:02:52.729419+00:00
+reason: 账号被封控 — users/me 持续返 data=null
+detail: users/me data=null — Rails session 已失效 (匿名 session)
+acct: u_50522192
+fix: 1) 在 DataSources 页面点 acecamp 实时查看, 浏览器登录
+     2) rm /home/ygwang/trading_agent_staging/crawl/AceCamp/DISABLED
+     3) 等 watcher 自动恢复 (or kill 残留 scraper, monitor 会 respawn)

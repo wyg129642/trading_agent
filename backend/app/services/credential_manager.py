@@ -25,6 +25,12 @@ from typing import Any
 # Repo root: backend/app/services/credential_manager.py → up 4 levels.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _CRAWL_DIR = _REPO_ROOT / "crawl"
+# web_research/ 已迁到独立项目 proposal-agent (2026-04-29 二次)。
+# WEB_RESEARCH_DIR env var 可覆盖默认路径。
+_RESEARCH_DIR = Path(
+    os.environ.get("WEB_RESEARCH_DIR")
+    or "/home/ygwang/proposal-agent/web_research"
+)
 
 
 @dataclass(frozen=True)
@@ -47,9 +53,14 @@ class PlatformSpec:
     # Whether QR-scan (e.g. WeChat scan) is an option for this platform —
     # surfaced as an extra tab in the UI even when login_mode is "password".
     supports_qr_login: bool = False
+    # 多数平台的 dir_name 解析在 _CRAWL_DIR 下;少数 (wechat_mp 等) 已迁出
+    # crawl/, parent="web_research" 改用 _RESEARCH_DIR.
+    parent: str = "crawl"  # "crawl" | "web_research"
 
     @property
     def dir_path(self) -> Path:
+        if self.parent == "web_research":
+            return _RESEARCH_DIR / self.dir_name
         return _CRAWL_DIR / self.dir_name
 
     @property
@@ -171,6 +182,7 @@ PLATFORMS: dict[str, PlatformSpec] = {
         key="wechat_mp",
         display_name="微信公众号 (mp.weixin.qq.com)",
         dir_name="wechat_mp",
+        parent="web_research",  # 已迁出 crawl/, 现住 web_research/wechat_mp
         token_fields=("token",),
         supports_auto_login=True,
         login_hint="扫码登录公众号管理员后台 (需已注册公众号的微信号). "
@@ -211,6 +223,9 @@ class PlatformStatus:
     #                                → must refresh token / re-login
     #   anonymous   ⚠ 匿名访问       HTTP 200 but session NOT bound to a user
     #                                (visitor cookie or aged-out user session)
+    #   banned      ⚓ 已封号          users/me 持续返 data=null 但 JWT 仍在 →
+    #                                平台主动封控. scraper 自动 touch DISABLED
+    #                                闸门停止抓取, 直到运维登录新账号 + rm DISABLED.
     #                                → still gets preview content; re-login for full
     #   ratelimited ⚠ 额度用尽       HTTP 200 but daily quota burnt (e.g. AlphaEngine 450)
     #                                → token fine; resets at platform midnight
@@ -537,7 +552,8 @@ def _build_data_sources() -> dict[str, tuple[str, tuple[str, ...]]]:
         "semianalysis": (getattr(s, "semianalysis_mongo_db", "foreign-website"),
                         (getattr(s, "semianalysis_collection", "semianalysis_posts"),)),
         # 微信公众号 (mp.weixin.qq.com) — 2026-04-29 直采
-        "wechat_mp":   (getattr(s, "wechat_mp_mongo_db", "wechat-mp"), ("articles",)),
+        "wechat_mp":   (getattr(s, "wechat_mp_mongo_db", "web-research"),
+                        ("wechat_articles",)),
     }
 
 
@@ -1094,6 +1110,29 @@ def _decode_acecamp_user_token(cookie: str) -> tuple[str | None, str]:
 
 
 async def _probe_acecamp(creds: dict, timeout: float = 10.0) -> tuple[str, str]:
+    # DISABLED 闸门优先 — 由 scraper.py 启动 guard 自动 touch 或运维手动 touch.
+    # 2026-04-29 v3: 统一返 "expired" (而非新 "banned") — 前端 HEALTH_META 字典只
+    # 收 ok/expired/anonymous/degraded/ratelimited/unknown 6 个键; 新增 banned 会
+    # 触发未知键 fallback 误显示成绿色"已登陆". 用户明确要求: 账号掉了就显示已过期.
+    # banned 是 expired 的一个亚型, 把封号细节放进 detail 字段里区分即可.
+    _disable_file = _CRAWL_DIR / "AceCamp" / "DISABLED"
+    if _disable_file.exists():
+        try:
+            reason_text = _disable_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            reason_text = ""
+        if "AUTO-BANNED" in reason_text or "账号被封控" in reason_text:
+            short = ""
+            for line in reason_text.splitlines():
+                if line.startswith("reason:"):
+                    short = line.split(":", 1)[1].strip()[:120]
+                    break
+            return "expired", (
+                f"账号被封控 (DISABLED 闸门已激活). "
+                f"{short or 'users/me 持续返 data=null'} "
+                f"— 解封: DataSources 实时查看登录新账号 → rm AceCamp/DISABLED."
+            )
+        return "expired", f"DISABLED 闸门已激活 (手动): {reason_text[:200]}"
     """JWT decode + users/me + list 端点 + content 质量, 三层判.
 
     2026-04-22 → 04-29 → 04-29 (二次修正): 健康判据收敛.
@@ -1175,10 +1214,14 @@ async def _probe_acecamp(creds: dict, timeout: float = 10.0) -> tuple[str, str]:
         return "ok", base_msg
 
     if user is None and isinstance(data, dict) and data.get("ret") is True:
-        return "anonymous", (
-            f"匿名 session · 服务端 Rails session 已失效 (users/me data=null). "
-            f"JWT user_id={user_id} 仍存但服务器不认, list 端点仍开放但 detail "
-            f"全部 paywall — 请在实时查看里重登捕获新 session cookie."
+        # 2026-04-29 v3: 直接返 "expired" (前端 expired = 红色"已过期"已存在).
+        # 用户视角: 账号掉了就显示已过期; banned/anonymous 都属于"账号已不可用",
+        # 没必要在 UI 上加新分类. 封号细节放 detail 字段里, hover tooltip 可看.
+        return "expired", (
+            f"账号被封控 — users/me 持续返 data=null 但 JWT user_id={user_id} 仍在. "
+            f"list 端点对匿名仍开放但 detail 全部 paywall, scraper 已自动 touch "
+            f"DISABLED 闸门停止抓取. 解封: DataSources 实时查看登录新账号 → "
+            f"rm crawl/AceCamp/DISABLED."
         )
     code = (data or {}).get("code")
     msg = str((data or {}).get("msg") or "")
