@@ -37,8 +37,9 @@ CRAWL_DIR = Path(__file__).resolve().parent
 PLAYWRIGHT_DATA = CRAWL_DIR / "playwright_data"
 PLAYWRIGHT_DATA.mkdir(exist_ok=True)
 STORAGE_STATE = PLAYWRIGHT_DATA / "storage_state.json"
-LOG_DIR = CRAWL_DIR.parent / "logs"
+LOG_DIR = CRAWL_DIR.parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+PROJECT_ROOT = CRAWL_DIR.parent.parent
 # Screenshots of the Highcharts container go here — large-ish PNGs (~50-150KB
 # each) kept outside the repo. Matches the alphapai/jinmen/gangtise PDF pattern.
 IMG_DIR = Path(os.environ.get("SENTIMENTRADER_IMAGE_DIR", "/home/ygwang/crawl_data/sentimentrader_images"))
@@ -94,6 +95,89 @@ def _log(msg: str) -> None:
         (LOG_DIR / "sentimentrader.log").open("a", encoding="utf-8").write(line + "\n")
     except Exception:
         pass
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Proxy resolution & preflight
+# ──────────────────────────────────────────────────────────────────────────
+#
+# The host is GFW-bound and SentimenTrader's login + chart pages embed
+# www.google.com/recaptcha/api.js. Without a working forward proxy the page
+# never resolves and every goto times out at the wall-clock deadline.
+#
+# We don't trust the inherited env blindly — cron historically hardcoded a
+# now-dead Clash forward (127.0.0.1:7890). Instead we (a) read the project
+# `.env` file when env vars are missing, (b) actively probe the resolved
+# proxy URL, (c) refuse to launch Chromium against a dead proxy.
+
+_DOTENV_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY")
+
+
+def _load_env_proxy_from_dotenv() -> None:
+    """If proxy env vars aren't already set, copy them from the project's .env.
+
+    `start_web.sh::_load_env_var` does the same thing for the web service;
+    cron has historically `export`ed proxy explicitly, but the proxy URL
+    changes faster than crontabs do, so the .env is now the single source of
+    truth. Only sets keys that are *missing*; existing env values win.
+    """
+    if any(os.environ.get(k) or os.environ.get(k.lower()) for k in ("HTTPS_PROXY", "HTTP_PROXY")):
+        return
+    env_file = PROJECT_ROOT / ".env"
+    if not env_file.exists():
+        return
+    try:
+        for raw in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key in _DOTENV_KEYS and val:
+                os.environ.setdefault(key, val)
+                os.environ.setdefault(key.lower(), val)
+    except Exception as e:
+        _log(f"WARN: failed to read .env for proxy: {e}")
+
+
+def _resolve_proxy() -> str | None:
+    return (
+        os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+        or os.environ.get("https_proxy") or os.environ.get("http_proxy")
+        or None
+    )
+
+
+def _proxy_alive(proxy_url: str, timeout: float = 6.0) -> tuple[bool, str]:
+    """Verify the proxy can actually reach SentimenTrader.
+
+    A "listening but dead" forward (e.g. retired Clash on 127.0.0.1:7890 — TCP
+    accepts the connect, the upstream is gone) returns success on a socket
+    probe but hangs on real traffic. So we issue an HTTPS request through the
+    proxy with a hard timeout and only treat 2xx/3xx/4xx as alive.
+
+    Probe target is sentimentrader's own login page — minimal payload, the
+    only host we actually care about. Returns (alive, detail_message).
+    """
+    try:
+        import urllib.request
+        import urllib.error
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+        req = urllib.request.Request(
+            "https://sentimentrader.com/login",
+            headers={"User-Agent": USER_AGENT},
+        )
+        with opener.open(req, timeout=timeout) as resp:
+            code = resp.status
+            return (200 <= code < 500), f"probe {proxy_url} → HTTP {code}"
+    except urllib.error.HTTPError as e:
+        # 4xx still means the proxy works — the upstream just rejected us.
+        return (e.code < 500), f"probe {proxy_url} → HTTP {e.code}"
+    except Exception as e:
+        return False, f"probe {proxy_url} → {type(e).__name__}: {e}"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -208,6 +292,54 @@ async def _do_login(page: Page, email: str, password: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Subscription-state detection
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class SubscriptionInactive(Exception):
+    """Raised when the chart/users page is the "Subscription not active" landing.
+
+    SentimenTrader serves a 403 page with a generic "Your Subscription is not
+    Active" body when an account is expired or cancelled — the URL doesn't
+    redirect, the chart container simply isn't present. Without explicit
+    detection, our retry loop wastes 3×60 s per chart slugging away at a page
+    that will never render Highcharts. We detect early and bail the run with
+    a status that the credential probe can surface as
+    "❌ 订阅已过期 / 账户已取消 — 需续订".
+    """
+
+
+_SUBSCRIPTION_DEAD_MARKERS: tuple[str, ...] = (
+    "your subscription is not active",
+    "your account has either expired or has been canceled",
+    "your account has been canceled",
+    "your account has expired",
+    "subscription has expired",
+    "subscription is not active",
+)
+
+
+async def _detect_subscription_expired(page: Page) -> tuple[bool, str]:
+    """Probe the current page for the subscription-dead landing.
+
+    Returns (is_expired, evidence). The evidence string is the matched marker
+    truncated to a reasonable length so it's safe to drop into a Mongo doc /
+    operator-facing badge without leaking the whole 17 KB landing page.
+    """
+    try:
+        text = await page.evaluate("document.body && document.body.innerText || ''")
+    except Exception:
+        return False, ""
+    if not text:
+        return False, ""
+    text_lc = text.lower()
+    for marker in _SUBSCRIPTION_DEAD_MARKERS:
+        if marker in text_lc:
+            return True, marker
+    return False, ""
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Chart extraction
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -244,26 +376,67 @@ _EXTRACT_JS = r"""
 """
 
 
-async def _extract_chart(page: Page, slug: str, url: str) -> dict:
+async def _extract_chart(page: Page, slug: str, url: str,
+                          max_attempts: int = 3,
+                          hydration_deadline_s: float = 60.0) -> dict:
     """Navigate to chart, read the full Highcharts series, and screenshot the
     rendered chart container so we can show the official image on the UI.
+
+    Retries up to ``max_attempts`` times on hydration failures. Each attempt
+    does a fresh goto with ``hydration_deadline_s`` worth of polling.
+    Highcharts on this site has been observed taking 30-50 s to hydrate when
+    the proxy is slow; the previous 25 s hard deadline was the silent root
+    cause of the 04-28→04-29 wave of "no Highcharts.charts found" failures.
     """
-    _log(f"[{slug}] goto {url}")
-    await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
-    # Highcharts hydrates after XHR fetch — poll until series[0] has data.
-    deadline = time.time() + 25
-    probe = None
-    while time.time() < deadline:
-        probe = await page.evaluate(_EXTRACT_JS)
-        if probe and probe.get("charts"):
-            charts = probe["charts"]
-            if charts and charts[0].get("series"):
-                # Need at least one series with >0 data points
-                if any((s.get("data") or []) for s in charts[0]["series"]):
-                    break
-        await page.wait_for_timeout(500)
-    if not probe or not probe.get("charts"):
-        raise RuntimeError(f"[{slug}] no Highcharts.charts found on page")
+    probe: dict | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            _log(f"[{slug}] goto {url} (attempt {attempt}/{max_attempts})")
+            await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+
+            # Cheap subscription-dead check before we burn 60 s polling for
+            # Highcharts that will never appear. If the page is the "your
+            # subscription is not active" landing, abort the entire run —
+            # no slug-level retry will help.
+            expired, marker = await _detect_subscription_expired(page)
+            if expired:
+                raise SubscriptionInactive(
+                    f"[{slug}] subscription not active (matched: '{marker}')"
+                )
+
+            deadline = time.time() + hydration_deadline_s
+            probe = None
+            while time.time() < deadline:
+                probe = await page.evaluate(_EXTRACT_JS)
+                if probe and probe.get("charts"):
+                    charts = probe["charts"]
+                    if charts and charts[0].get("series"):
+                        if any((s.get("data") or []) for s in charts[0]["series"]):
+                            break
+                await page.wait_for_timeout(500)
+            if not probe or not probe.get("charts"):
+                # Re-check at hydration deadline: SPA could have rendered the
+                # subscription-dead landing client-side after a delay.
+                expired, marker = await _detect_subscription_expired(page)
+                if expired:
+                    raise SubscriptionInactive(
+                        f"[{slug}] subscription not active (matched: '{marker}')"
+                    )
+                raise RuntimeError(f"[{slug}] no Highcharts.charts found on page")
+            charts = probe.get("charts") or []
+            if not charts or not charts[0].get("series"):
+                raise RuntimeError(f"[{slug}] charts present but empty series")
+            break
+        except SubscriptionInactive:
+            # Don't retry — the entire run is doomed; bubble up so run_once
+            # can write a clear health doc and skip remaining slugs.
+            raise
+        except Exception as e:
+            _log(f"[{slug}] attempt {attempt} failed: {e}")
+            if attempt >= max_attempts:
+                raise
+            await page.wait_for_timeout(2000 + 1000 * attempt)
+            continue
 
     # Let the chart finish rendering (legend, navigator, Bollinger bands).
     # Highcharts hydrates data first, then polishes the layout — 1s is enough
@@ -418,6 +591,45 @@ def _mongo_collection(uri: str, db_name: str):
     return MongoClient(uri, serverSelectionTimeoutMS=5000)[db_name][coll_name]
 
 
+def _write_health(col, status: str, ok_count: int, fail_count: int,
+                  error: str | None = None,
+                  proxy_used: str | None = None) -> None:
+    """Persist a single ``_id="_health"`` doc summarising the latest run.
+
+    Drives the dashboard's "Last success / 疑似失败" badge via
+    `_probe_sentimentrader` in credential_manager. Always written, even when
+    the scrape fails outright — silent failures were what made the original
+    storage_state-mtime-only probe so deceptive (the file got refreshed even
+    when the site never returned valid data).
+    """
+    now = datetime.now(timezone.utc)
+    full_success = (fail_count == 0 and ok_count > 0)
+    update: dict[str, Any] = {
+        "$set": {
+            "_id": "_health",
+            "kind": "health",
+            "last_attempt_at": now,
+            "last_status": status,
+            "last_ok_count": ok_count,
+            "last_fail_count": fail_count,
+            "last_error": error,
+            "last_proxy": proxy_used,
+        },
+    }
+    if full_success:
+        update["$set"]["last_success_at"] = now
+        update["$set"]["consecutive_failures"] = 0
+    else:
+        # Increment failure streak so credential_manager can reason about
+        # "1-off blip vs sustained outage" without scanning logs.
+        update["$inc"] = {"consecutive_failures": 1}
+        update["$set"]["last_failure_at"] = now
+    try:
+        col.update_one({"_id": "_health"}, update, upsert=True)
+    except Exception as e:
+        _log(f"WARN: could not write health doc: {e}")
+
+
 def _upsert_indicator(col, slug: str, name: str, url: str, shaped: dict,
                       screenshot_path: str | None = None) -> None:
     now = datetime.now(timezone.utc)
@@ -457,10 +669,57 @@ def _upsert_indicator(col, slug: str, name: str, url: str, shaped: dict,
 
 async def run_once(email: str, password: str, mongo_uri: str, mongo_db: str,
                    headless: bool = True, force_login: bool = False) -> dict:
-    """Do a single full refresh of all indicators. Returns a summary dict."""
-    col = _mongo_collection(mongo_uri, mongo_db)
-    summary: dict[str, Any] = {"ok": [], "failed": [], "started_at": datetime.now(timezone.utc).isoformat()}
+    """Do a single full refresh of all indicators. Returns a summary dict.
 
+    Stability guarantees written into this function:
+
+    1. **Proxy preflight.** Resolves the forward proxy from env (or .env if
+       env is bare), then hits sentimentrader's login URL through it with a
+       6 s timeout. If dead — no Chromium is launched, a health doc records
+       the reason, and the function exits early. Saves ~3 minutes per
+       attempt vs. discovering the dead proxy via Chromium's full goto
+       timeout chain.
+    2. **Force-relogin recovery.** If the warm-up goto fails to land us on
+       the user dashboard *and* a stored session exists, we wipe the
+       session and re-login fresh. Saved sessions go stale silently
+       (Cloudflare cookie rotation, JWT TTL).
+    3. **Per-chart retry.** ``_extract_chart`` does up to 3 reload attempts
+       with 60 s hydration deadline each — see its docstring for context.
+    4. **Health doc.** Writes ``_id="_health"`` to the indicators
+       collection with success/failure counts every run.
+    """
+    col = _mongo_collection(mongo_uri, mongo_db)
+    summary: dict[str, Any] = {
+        "ok": [],
+        "failed": [],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # ── Step 1: Proxy resolution + preflight ─────────────────────────────
+    _load_env_proxy_from_dotenv()
+    proxy_url = _resolve_proxy()
+    if not proxy_url:
+        msg = "no HTTPS_PROXY configured (env or .env) — refusing to launch (recaptcha is GFW-blocked)"
+        _log(f"FATAL: {msg}")
+        _write_health(col, "no_proxy", 0, len(TARGETS), error=msg, proxy_used=None)
+        summary["failed"] = [{"slug": s[0], "error": "no_proxy"} for s in TARGETS]
+        summary["fatal"] = msg
+        summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+        return summary
+
+    alive, detail = _proxy_alive(proxy_url, timeout=6.0)
+    _log(f"proxy preflight: {detail} → {'ALIVE' if alive else 'DEAD'}")
+    if not alive:
+        msg = f"proxy {proxy_url} is dead: {detail}"
+        _log(f"FATAL: {msg}")
+        _write_health(col, "proxy_dead", 0, len(TARGETS), error=msg, proxy_used=proxy_url)
+        summary["failed"] = [{"slug": s[0], "error": "proxy_dead"} for s in TARGETS]
+        summary["fatal"] = msg
+        summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+        return summary
+
+    # ── Step 2: Drive Playwright ─────────────────────────────────────────
+    crash_err: str | None = None
     async with async_playwright() as pw:
         if force_login and STORAGE_STATE.exists():
             STORAGE_STATE.unlink()
@@ -470,11 +729,27 @@ async def run_once(email: str, password: str, mongo_uri: str, mongo_db: str,
             page = await ctx.new_page()
 
             # Warm-up: see if the saved session is still valid. If not, log in.
-            await page.goto(USERS_HOME, wait_until="domcontentloaded", timeout=45_000)
-            await page.wait_for_timeout(2000)
-            if not await _is_logged_in(page):
+            warmup_ok = False
+            try:
+                await page.goto(USERS_HOME, wait_until="domcontentloaded", timeout=60_000)
+                await page.wait_for_timeout(2000)
+                warmup_ok = True
+            except Exception as e:
+                _log(f"warm-up goto failed: {e} — will force relogin")
+
+            need_login = (not warmup_ok) or (not await _is_logged_in(page))
+            if need_login:
+                # Stored session may be silently stale; wipe and login fresh.
+                if STORAGE_STATE.exists():
+                    try:
+                        STORAGE_STATE.unlink()
+                        _log("wiped stale storage_state for fresh login")
+                    except Exception:
+                        pass
                 await _do_login(page, email, password)
 
+            subscription_dead = False
+            subscription_marker = ""
             for slug, url, human, bench, secondary in TARGETS:
                 try:
                     dump = await _extract_chart(page, slug, url)
@@ -495,20 +770,110 @@ async def run_once(email: str, password: str, mongo_uri: str, mongo_db: str,
                         "latest_value": shaped["latest_value"],
                         "latest_date": latest_iso,
                     })
+                except SubscriptionInactive as e:
+                    _log(f"FATAL: {e} — aborting remaining slugs (no point retrying)")
+                    subscription_dead = True
+                    subscription_marker = str(e)
+                    # Mark the current slug failed AND every remaining slug,
+                    # so the dashboard sees a clean "all 4 failed" picture.
+                    summary["failed"].append({"slug": slug, "error": "subscription_inactive"})
+                    remaining = [t[0] for t in TARGETS if t[0] != slug
+                                 and t[0] not in {f["slug"] for f in summary["failed"]}
+                                 and t[0] not in {o["slug"] for o in summary["ok"]}]
+                    for r in remaining:
+                        summary["failed"].append({"slug": r, "error": "subscription_inactive"})
+                    break
                 except Exception as e:
                     _log(f"[{slug}] FAIL: {e}")
                     summary["failed"].append({"slug": slug, "error": str(e)})
+
+            if subscription_dead:
+                # Bubble out before relogin tries. Stash on summary for the
+                # health-doc write below.
+                summary["subscription_inactive"] = True
+                summary["subscription_marker"] = subscription_marker
+
+            # If every chart failed but we hadn't tried a fresh login this
+            # round, give it one more shot with a clean session — the
+            # warm-up dashboard may have been served from a cached
+            # auth cookie that wasn't actually authoritative for the chart
+            # XHRs. (Observed once on 2026-04-25 after CF cookie rotation.)
+            # Skip when subscription is inactive: a fresh login still lands
+            # on the same 403 page, just wastes 30 s.
+            if (len(summary["failed"]) == len(TARGETS) and not need_login
+                    and not subscription_dead):
+                _log("all 4 charts failed on cached session — retrying with fresh login")
+                try:
+                    if STORAGE_STATE.exists():
+                        STORAGE_STATE.unlink()
+                    await _do_login(page, email, password)
+                except Exception as e:
+                    _log(f"fresh-login retry failed: {e}")
+                else:
+                    retry_ok: list = []
+                    retry_fail: list = []
+                    for slug, url, human, bench, secondary in TARGETS:
+                        try:
+                            dump = await _extract_chart(page, slug, url)
+                            shaped = _pick_indicator_and_benchmark(dump["charts"][0], bench, secondary)
+                            _upsert_indicator(col, slug, human, url, shaped,
+                                               screenshot_path=dump.get("screenshot_path"))
+                            latest_iso = datetime.fromtimestamp(shaped["latest_ts_ms"] / 1000, tz=timezone.utc).date().isoformat()
+                            _log(f"[{slug}] OK (after relogin) latest={shaped['latest_value']} on {latest_iso}")
+                            retry_ok.append({"slug": slug, "latest_value": shaped["latest_value"], "latest_date": latest_iso})
+                        except Exception as e:
+                            _log(f"[{slug}] FAIL after relogin: {e}")
+                            retry_fail.append({"slug": slug, "error": str(e)})
+                    summary["ok"] = retry_ok
+                    summary["failed"] = retry_fail
+                    summary["recovered_via_relogin"] = bool(retry_ok)
 
             # Persist session for next run.
             try:
                 await ctx.storage_state(path=str(STORAGE_STATE))
             except Exception as e:
                 _log(f"could not save storage_state: {e}")
+        except Exception as e:
+            crash_err = f"{type(e).__name__}: {e}"
+            _log(f"run_once playwright crash: {crash_err}")
         finally:
-            await ctx.close()
-            await browser.close()
+            try:
+                await ctx.close()
+            finally:
+                await browser.close()
 
+    # ── Step 3: write health regardless of outcome ───────────────────────
+    ok_count = len(summary["ok"])
+    fail_count = len(summary["failed"])
+    if crash_err:
+        status = "playwright_crash"
+        # If we crashed before any chart finished, mark every target failed.
+        if fail_count + ok_count == 0:
+            summary["failed"] = [{"slug": s[0], "error": crash_err} for s in TARGETS]
+            fail_count = len(summary["failed"])
+    elif summary.get("subscription_inactive"):
+        status = "subscription_inactive"
+    elif fail_count == 0:
+        status = "ok"
+    elif ok_count == 0:
+        status = "all_failed"
+    else:
+        status = "partial"
+
+    if status == "subscription_inactive":
+        # Distinct, action-oriented message — operator must renew the
+        # SentimenTrader plan; no code-side fix is possible.
+        error_msg = (
+            "订阅已过期 / 账户已取消 — 请登录 sentimentrader.com 续订后再启动爬虫 "
+            f"(检测匹配: {summary.get('subscription_marker') or 'subscription not active'})"
+        )
+    else:
+        error_msg = crash_err or (
+            "; ".join(f"{f['slug']}={f['error'][:80]}" for f in summary["failed"][:3]) if fail_count else None
+        )
+    _write_health(col, status, ok_count, fail_count, error=error_msg, proxy_used=proxy_url)
     summary["finished_at"] = datetime.now(timezone.utc).isoformat()
+    summary["status"] = status
     return summary
 
 
@@ -532,8 +897,9 @@ async def run_until_fresh(email: str, password: str, mongo_uri: str, mongo_db: s
     col = _mongo_collection(mongo_uri, mongo_db)
 
     def _snapshot() -> dict[str, int | None]:
+        # Skip the `_health` sentinel — it doesn't carry indicator data.
         return {r["slug"]: r.get("latest_ts_ms")
-                for r in col.find({}, {"slug": 1, "latest_ts_ms": 1})}
+                for r in col.find({"slug": {"$exists": True}}, {"slug": 1, "latest_ts_ms": 1})}
 
     before = _snapshot()
     _log(f"pre-scrape latest_ts_ms: {before or '(empty — first run)'}")
@@ -561,6 +927,15 @@ async def run_until_fresh(email: str, password: str, mongo_uri: str, mongo_db: s
 
         if fresh:
             _log(f"fresh data on attempt #{attempt}")
+            return last_summary
+
+        # Terminal failure modes — sleeping won't change the outcome. Bail
+        # immediately so we don't burn ~3 hours of retry-until-fresh on a
+        # dead proxy or an expired subscription.
+        terminal = (last_summary.get("status") in
+                    ("subscription_inactive", "no_proxy", "proxy_dead"))
+        if terminal:
+            _log(f"terminal status={last_summary.get('status')} — skipping further retries")
             return last_summary
 
         if attempt > max_retries:
@@ -660,9 +1035,21 @@ async def _amain(args: argparse.Namespace) -> int:
             return 1
         _log(f"retry-until-fresh: attempts={summary.get('attempts')} "
              f"advanced={summary.get('advanced')} "
+             f"status={summary.get('status')} "
              f"ok={len(summary.get('ok') or [])} failed={len(summary.get('failed') or [])}")
-        return 0 if summary.get("advanced") else 3
+        if summary.get("advanced"):
+            return 0
+        # Surface the same exit-code taxonomy as the --once path so cron /
+        # monitoring can distinguish "still no fresh data" (3) from
+        # "subscription dead" (6) without parsing the log.
+        st = summary.get("status")
+        if st == "subscription_inactive":
+            return 6
+        if st in ("no_proxy", "proxy_dead"):
+            return 3
+        return 3
 
+    last_status = "unknown"
     while True:
         try:
             summary = await run_once(
@@ -673,14 +1060,30 @@ async def _amain(args: argparse.Namespace) -> int:
                 headless=not args.headful,
                 force_login=args.force_login,
             )
-            _log(f"summary: ok={len(summary['ok'])} failed={len(summary['failed'])}")
+            last_status = summary.get("status", "unknown")
+            _log(f"summary: status={last_status} ok={len(summary['ok'])} failed={len(summary['failed'])}")
             # Subsequent runs in watch mode shouldn't re-try to clobber the session
             args.force_login = False
         except Exception as e:
+            last_status = "crash"
             _log(f"run_once crashed: {e}")
 
         if not args.watch:
-            return 0
+            # Non-zero on hard failure so cron / flock / dashboards can tell.
+            #   0 = at least one indicator updated this run
+            #   3 = no_proxy / proxy_dead — operator must fix the env
+            #   4 = all_failed — site likely changed or session truly stuck
+            #   5 = playwright_crash / unknown crash
+            #   6 = subscription_inactive — operator must renew the plan
+            if last_status == "ok" or last_status == "partial":
+                return 0
+            if last_status in ("no_proxy", "proxy_dead"):
+                return 3
+            if last_status == "subscription_inactive":
+                return 6
+            if last_status == "all_failed":
+                return 4
+            return 5
         _log(f"sleeping {args.interval}s before next run…")
         await asyncio.sleep(args.interval)
 

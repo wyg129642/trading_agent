@@ -1332,38 +1332,98 @@ async def _probe_jinmen(creds: dict, timeout: float = 10.0) -> tuple[str, str]:
 
 
 async def _probe_sentimentrader(creds: dict, timeout: float = 10.0) -> tuple[str, str]:
-    """Health = can the scraper likely succeed without re-logging-in?
+    """Health = did the scraper actually succeed recently?
 
-    The scraper doesn't use an API token — it keeps a Playwright storage_state
-    (cookies + localStorage) that auto-refreshes on every successful scrape.
-    As long as the stored session has been exercised recently (≤14 days),
-    the next scrape should reuse it without a password login. Beyond that,
-    Playwright will transparently log in again using the credentials file.
+    History (2026-04-30): the original probe only looked at storage_state.json
+    mtime. That file gets refreshed at the *end* of every run — including runs
+    where every chart fetch failed — so the badge stayed green for 2+ days
+    while the cron loop was bricked by a dead proxy. We now read the
+    ``_id="_health"`` doc the scraper writes after each run (success or
+    failure) and reason from real outcomes.
 
-    We intentionally do not make a real HTTP request here — the scrape itself
-    is the definitive health check, and it's already running daily via cron.
-    Doing a Playwright boot for every status refresh would be too slow.
+    Status mapping (priority order):
+      - ``last_success_at`` within 36 h → ``ok``   (one missed daily run is fine)
+      - last attempt within 6 h but no recent success → ``expired`` (script is
+        running but failing — operator should look at logs)
+      - no successful run in 36 h AND no recent attempts → ``expired``
+      - no health doc yet → fall back to the storage_state heuristic
     """
     email = (creds or {}).get("email", "")
     password = (creds or {}).get("password", "")
     if not email or not password:
         return "expired", "缺少 email / password（需要重新填写登录凭据）"
 
+    # ── Try the new health-doc path first ────────────────────────────────
+    try:
+        from pymongo import MongoClient
+        s = _get_settings_for_dbmap()
+        uri = getattr(s, "sentimentrader_mongo_uri", None) or s.mongo_uri
+        db_name = getattr(s, "sentimentrader_mongo_db", "funda")
+        coll_name = getattr(s, "sentimentrader_collection", "sentimentrader_indicators")
+        cli = MongoClient(uri, serverSelectionTimeoutMS=int(timeout * 1000))
+        try:
+            doc = cli[db_name][coll_name].find_one({"_id": "_health"})
+        finally:
+            cli.close()
+    except Exception:
+        # Mongo unreachable from probe? Fall through to storage_state heuristic.
+        doc = None
+
+    if doc:
+        from datetime import datetime as _dt, timezone as _tz
+        now_utc = _dt.now(_tz.utc)
+
+        def _hours_since(key: str) -> float | None:
+            v = doc.get(key)
+            if not hasattr(v, "tzinfo"):
+                return None
+            v_utc = v if v.tzinfo else v.replace(tzinfo=_tz.utc)
+            return (now_utc - v_utc).total_seconds() / 3600.0
+
+        success_h = _hours_since("last_success_at")
+        attempt_h = _hours_since("last_attempt_at")
+        streak = int(doc.get("consecutive_failures") or 0)
+        last_err = (doc.get("last_error") or "").strip()
+        last_status = (doc.get("last_status") or "").strip()
+
+        if success_h is not None and success_h <= 36:
+            return "ok", f"最近一次成功 {success_h:.1f} 小时前"
+        # Subscription-inactive is a special case — the credentials are fine,
+        # the plan itself is the problem. Use a distinct status so the UI
+        # can render it differently from "session expired" (which would
+        # otherwise prompt the user to re-enter the password — useless).
+        if last_status == "subscription_inactive":
+            return "expired", (
+                "❌ 订阅已过期 / 账户已取消 — 请登录 sentimentrader.com 续订后再启动爬虫"
+            )
+        if last_status == "proxy_dead" or last_status == "no_proxy":
+            return "expired", f"❌ 代理不通: {last_err[:120] if last_err else last_status}"
+        # No fresh success — surface why.
+        why_bits: list[str] = []
+        if success_h is not None:
+            why_bits.append(f"最近一次成功 {success_h:.1f} 小时前")
+        else:
+            why_bits.append("从未成功过")
+        if last_status:
+            why_bits.append(f"上次状态={last_status}")
+        if streak:
+            why_bits.append(f"连续失败 {streak} 次")
+        if attempt_h is not None and attempt_h <= 6:
+            why_bits.append(f"{attempt_h:.1f} 小时前仍在重试")
+        if last_err:
+            why_bits.append(f"错误: {last_err[:120]}")
+        return "expired", "; ".join(why_bits)
+
+    # ── Fallback: pre-2026-04-30 storage_state heuristic ─────────────────
     storage = _CRAWL_DIR / "sentimentrader" / "playwright_data" / "storage_state.json"
     if not storage.exists():
-        # Credentials are on file so auto-login will still work on next run —
-        # but we haven't had a successful scrape yet, so the session is unknown.
         return "unknown", "尚无浏览器会话，首次运行时将自动登录"
-
-    # `time.time()` and `st_mtime` are both Unix epoch seconds in UTC — safe
-    # to subtract directly. `datetime.utcnow().timestamp()` treats the naive
-    # datetime as LOCAL time, which introduced an 8-hour skew on CST hosts.
     import time as _time
     age_s = max(0.0, _time.time() - storage.stat().st_mtime)
     age_days = age_s / 86400
-    if age_days <= 14:
-        return "ok", f"浏览器会话 {age_days:.1f} 天前刷新过，可直接复用"
-    return "expired", f"浏览器会话已 {age_days:.0f} 天未刷新，下次运行可能需要重新登录"
+    if age_days <= 1:
+        return "ok", f"浏览器会话 {age_days*24:.1f} 小时前刷新过 (尚无 _health 文档,首次运行后将切换到精确探测)"
+    return "expired", f"浏览器会话已 {age_days:.0f} 天未刷新且无 _health 文档"
 
 
 async def _probe_alphaengine(creds: dict, timeout: float = 10.0) -> tuple[str, str]:
