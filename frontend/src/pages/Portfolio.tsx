@@ -1,13 +1,15 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
+  Button,
   Card, Row, Col, Tag, Typography, Spin, Segmented, Empty, Select, Badge, Tooltip,
-  Timeline, Collapse, Space, Divider,
+  Timeline, Collapse, Space, Divider, message,
 } from 'antd'
 import {
   FundOutlined, RightOutlined, BellOutlined, SyncOutlined,
   ThunderboltOutlined, FireOutlined, AlertOutlined, RiseOutlined, FallOutlined,
   ClockCircleOutlined, SearchOutlined, ExperimentOutlined,
+  EyeOutlined,
 } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
 import api from '../services/api'
@@ -196,7 +198,7 @@ function formatReturn(val: number | undefined | null): React.ReactNode {
 
 // ── Components ───────────────────────────────────────────
 
-function BreakingNewsCard({ item }: { item: BreakingNewsItem }) {
+function BreakingNewsCard({ item, onDismiss }: { item: BreakingNewsItem; onDismiss: (id: string) => void }) {
   const matCfg = MATERIALITY_CONFIG[item.news_materiality] || MATERIALITY_CONFIG.none
   const sentCfg = SENTIMENT_CONFIG[item.sentiment] || SENTIMENT_CONFIG.neutral
 
@@ -327,22 +329,35 @@ function BreakingNewsCard({ item }: { item: BreakingNewsItem }) {
             )}
           </Space>
         </div>
-        <div style={{ textAlign: 'right', marginLeft: 8, lineHeight: '14px' }}>
-          <Tooltip title="事件首次被报道距今 | 本次分析生成距今">
-            <Text
-              type="secondary"
-              style={{
-                fontSize: 11,
-                whiteSpace: 'nowrap',
-                color: isStale ? '#cf1322' : undefined,
-                fontWeight: isStale ? 600 : undefined,
-              }}
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 4, marginLeft: 8 }}>
+          <div style={{ textAlign: 'right', lineHeight: '14px' }}>
+            <Tooltip title="事件首次被报道距今 | 本次分析生成距今">
+              <Text
+                type="secondary"
+                style={{
+                  fontSize: 11,
+                  whiteSpace: 'nowrap',
+                  color: isStale ? '#cf1322' : undefined,
+                  fontWeight: isStale ? 600 : undefined,
+                }}
+              >
+                事件 {hoursAgo(eventAgeHours)}
+              </Text>
+              <div style={{ fontSize: 10, color: '#bfbfbf', whiteSpace: 'nowrap', marginTop: 2 }}>
+                分析 {timeAgo(item.scan_time)}
+              </div>
+            </Tooltip>
+          </div>
+          <Tooltip title="标记为已阅，今后不再显示">
+            <Button
+              size="small"
+              type="text"
+              icon={<EyeOutlined />}
+              onClick={() => onDismiss(item.id)}
+              style={{ color: '#8c8c8c', fontSize: 11, padding: '0 6px', height: 22 }}
             >
-              事件 {hoursAgo(eventAgeHours)}
-            </Text>
-            <div style={{ fontSize: 10, color: '#bfbfbf', whiteSpace: 'nowrap', marginTop: 2 }}>
-              分析 {timeAgo(item.scan_time)}
-            </div>
+              已阅
+            </Button>
           </Tooltip>
         </div>
       </div>
@@ -466,6 +481,21 @@ export default function Portfolio() {
       .catch(() => setNewsSummary({}))
   }, [])
 
+  // Mark a breaking-news signal as 已阅 — optimistic remove + rollback on error.
+  const dismissNews = useCallback((signalId: string) => {
+    setBreakingNews((prev) => {
+      const before = prev
+      const next = prev.filter((it) => it.id !== signalId)
+      api.post(`/portfolio/breaking-news/${encodeURIComponent(signalId)}/dismiss`)
+        .catch((err) => {
+          console.warn('[dismiss] failed', err)
+          message.error('标记已阅失败，已恢复')
+          setBreakingNews(before)
+        })
+      return next
+    })
+  }, [])
+
   useEffect(() => {
     fetchCounts(holdings, hours)
     fetchBreakingNews(hours, marketFilter)
@@ -553,7 +583,7 @@ export default function Portfolio() {
           <Row gutter={[12, 12]}>
             {breakingNews.map((item) => (
               <Col xs={24} lg={12} key={item.id}>
-                <BreakingNewsCard item={item} />
+                <BreakingNewsCard item={item} onDismiss={dismissNews} />
               </Col>
             ))}
           </Row>

@@ -1354,7 +1354,9 @@ RESTART_CONFIG: dict[str, dict] = {
         "dir": ROOT / "alphapai_crawl",
         "log": ROOT / "alphapai_crawl" / "logs" / "watch.log",
         "proc_match": r"alphapai_crawl.*scraper\.py",
-        "args": ["--watch", "--resume", "--since-hours", "24", "--interval", "30", "--throttle-base", "1.5", "--throttle-jitter", "1.0", "--burst-size", "0", "--daily-cap", "0"],
+        # --strict-today (2026-04-30): 配额完全留给当日 ≥ 北京 00:00 的新增,
+        # 不再扫昨夜 23:xx 残留. 跨午夜后 watch tick 自动重算 cutoff.
+        "args": ["--watch", "--resume", "--strict-today", "--interval", "30", "--throttle-base", "1.5", "--throttle-jitter", "1.0", "--burst-size", "0", "--daily-cap", "0"],
         "creds_file": ROOT / "alphapai_crawl" / "credentials.json",
         "token_field": "token",
         "token_check": lambda s: s.startswith("eyJ") and s.count(".") >= 2,
@@ -1863,7 +1865,22 @@ def start_all(mode: str) -> list[dict]:
             full_args = [sys.executable, "-u", script] + list(extra)
         else:
             clean_extra = _source_args_clean(cfg) + extra
-            full_args = [sys.executable, "-u", "scraper.py"] + _mode_args(mode) + clean_extra
+            mode_args = _mode_args(mode)
+            # alphapai (2026-04-30): 严格只爬北京当天的内容, 配额留给当日新增.
+            # 删 _mode_args 里的 --since-hours <N> 对, 改用 --strict-today.
+            if source_key == "alphapai":
+                cleaned = []
+                skip_next = False
+                for a in mode_args:
+                    if skip_next:
+                        skip_next = False
+                        continue
+                    if a == "--since-hours":
+                        skip_next = True
+                        continue
+                    cleaned.append(a)
+                mode_args = cleaned + ["--strict-today"]
+            full_args = [sys.executable, "-u", "scraper.py"] + mode_args + clean_extra
         log_path = cfg["dir"] / "logs" / (log_name or cfg["log"].name)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         planned.append((source_key, cfg, extra, str(log_path), full_args))

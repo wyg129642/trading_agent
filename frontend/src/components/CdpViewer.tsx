@@ -133,7 +133,10 @@ export default function CdpViewer({ platformKey, onSuccess, onCancel, mode = 'lo
             } else if (msg.type === 'status') {
               setStatus(msg.status)
               setMessage(msg.message || '')
-              if (msg.status === 'SUCCESS') setTimeout(onSuccess, 1200)
+              // Don't auto-collapse the drawer on SUCCESS — keep the live
+              // browser visible so the user can verify the logged-in state,
+              // click around, etc. They close it explicitly with the
+              // "完成并保存" button below (which fires onSuccess).
             } else if (msg.type === 'heartbeat') {
               setStatus(msg.status)
               setMessage(msg.message || '')
@@ -342,12 +345,21 @@ export default function CdpViewer({ platformKey, onSuccess, onCancel, mode = 'lo
   return (
     <div>
       <Alert
-        type="info"
+        type={status === 'SUCCESS' && !isViewer ? 'success' : 'info'}
         showIcon
         style={{ marginBottom: 8 }}
-        message={isViewer ? '实时平台查看' : '远程浏览器'}
+        message={
+          status === 'SUCCESS' && !isViewer
+            ? '✅ 登录成功 — 浏览器已保持开启'
+            : isViewer ? '实时平台查看' : '远程浏览器'
+        }
         description={
-          isViewer ? (
+          status === 'SUCCESS' && !isViewer ? (
+            <>
+              凭证已写入,后台爬虫已自动启动。浏览器**不会自动关闭**,
+              你可以继续点页面、查行情、复制数据,做完点右下角【完成并保存】关掉。
+            </>
+          ) : isViewer ? (
             <>
               已注入本地凭证, 直接进入已登录状态. 可以在右侧对着我们的库做数据比对;
               鼠标 / 键盘 / Ctrl+C / Ctrl+V 都可以用.
@@ -454,8 +466,12 @@ export default function CdpViewer({ platformKey, onSuccess, onCancel, mode = 'lo
           >
             🔧 Network {netEntries.length > 0 ? `(${netEntries.length})` : ''}
           </Button>
-          <Button onClick={onCancel} size="small">
-            关闭
+          <Button
+            onClick={status === 'SUCCESS' ? onSuccess : onCancel}
+            size="small"
+            type={status === 'SUCCESS' ? 'primary' : 'default'}
+          >
+            {status === 'SUCCESS' ? '完成并保存' : '关闭'}
           </Button>
         </div>
         {netOpen && (

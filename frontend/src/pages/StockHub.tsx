@@ -716,12 +716,18 @@ export default function StockHub() {
                           const zh = (it.title_zh || '').trim()
                           return lang === 'zh' && zh.length > 0 ? zh : it.title
                         })()}
-                        {it.sentiment && it.sentiment !== 'neutral' && (
+                        {it.sentiment && (
                           <Tag
                             color={it.sentiment === 'bullish' ? 'green' : it.sentiment === 'bearish' ? 'red' : 'default'}
                             style={{ marginLeft: 8, fontSize: 10, lineHeight: '16px' }}
                           >
-                            {it.sentiment === 'bullish' ? '利好' : it.sentiment === 'bearish' ? '利空' : it.sentiment}
+                            {it.sentiment === 'bullish'
+                              ? '看多'
+                              : it.sentiment === 'bearish'
+                                ? '看空'
+                                : it.sentiment === 'neutral'
+                                  ? '中性'
+                                  : it.sentiment}
                           </Tag>
                         )}
                         {it.impact_magnitude === 'critical' && (

@@ -1143,7 +1143,13 @@ async def screencast_ws(
                     await websocket.send_json(msg)
             except Exception:
                 return
-            if msg.get("type") == "status" and msg.get("status") in ("SUCCESS", "FAILED"):
+            # FAILED is terminal — close the pump so the client surfaces the
+            # error and tears down. SUCCESS used to also close here, but we now
+            # keep the WS alive so the user can keep watching the logged-in
+            # browser (verify state, click around, copy data) until they
+            # explicitly hit "完成 / 关闭" in the UI. The CDP screencast is
+            # still emitting frames; _on_frame doesn't gate on status.
+            if msg.get("type") == "status" and msg.get("status") == "FAILED":
                 return
 
     pump_task = asyncio.create_task(_pump_frames())

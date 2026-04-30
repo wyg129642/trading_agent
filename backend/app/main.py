@@ -402,16 +402,18 @@ async def lifespan(app: FastAPI):
     app.state.consensus_warmer_task = _aio.create_task(_consensus_warmer())
 
     # ── Portfolio research/news LLM-translation worker ───────────────────
-    # Every 10 min, scan crawler collections for new portfolio-ticker docs
-    # in the last 48h and translate any English body/title via qwen-plus.
-    # Idempotent (`<field>_zh_src_hash` check), skip-on-cache-hit; stock_hub
-    # already prefers native upstream translations (parsed_msg.translatedXxx /
-    # list_item.titleCn / etc) over LLM, so this only fills gaps.
+    # Every 10 min, scan crawler collections for portfolio-ticker docs in
+    # the last 90 days (StockHub display window) and translate any English
+    # body/title via qwen-plus. Idempotent (`<field>_zh_src_hash` check),
+    # skip-on-cache-hit; stock_hub already prefers native upstream
+    # translations (parsed_msg.translatedXxx / list_item.titleCn / etc) over
+    # LLM, so this only fills gaps. Window widened from 48h → 90d so
+    # quarterly earnings reports / older filings still get translated.
     from backend.app.services.portfolio_translation_worker import (
         worker_loop as _portfolio_translation_loop,
     )
     app.state.portfolio_translation_task = _aio.create_task(
-        _portfolio_translation_loop(settings=settings, interval_sec=600, window_hours=48),
+        _portfolio_translation_loop(settings=settings, interval_sec=600, window_hours=24 * 90),
         name="portfolio_translation_worker",
     )
 
@@ -826,6 +828,7 @@ def create_app() -> FastAPI:
     from backend.app.api.kb_doc_viewer import router as kb_doc_viewer_router
     from backend.app.api.revenue_snapshot import router as revenue_snapshot_router
     from backend.app.api.risk_detection import router as risk_detection_router
+    from backend.app.api.screener import router as screener_router
 
     app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
     app.include_router(news_router, prefix="/api/news", tags=["News"])
@@ -876,6 +879,7 @@ def create_app() -> FastAPI:
     app.include_router(cost_governance_router, prefix="/api", tags=["Cost Governance"])
     app.include_router(kb_doc_viewer_router, prefix="/api/kb-viewer", tags=["KB Doc Viewer"])
     app.include_router(revenue_snapshot_router, prefix="/api/snapshot", tags=["Revenue Snapshot"])
+    app.include_router(screener_router, prefix="/api/screener", tags=["Multi-Bagger Screener"])
 
     # WebSocket
     from backend.app.ws.feed import router as ws_router
@@ -890,15 +894,30 @@ def create_app() -> FastAPI:
         # Mount static assets (JS, CSS, images)
         app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"), name="assets")
 
-        # Catch-all: serve index.html for SPA client-side routing
+        # Catch-all: serve index.html for SPA client-side routing.
+        # IMPORTANT: index.html must NOT be browser-cached, otherwise after a
+        # frontend rebuild clients keep loading dead bundle hashes (e.g.
+        # /assets/index-xRl-Aqef.js → 404 → white screen). Hashed assets/
+        # files under /assets stay long-cacheable (their hash IS the
+        # cache-buster), but index.html itself flips on every build.
+        _NO_STORE = {
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+
         @app.get("/{full_path:path}")
         async def serve_spa(full_path: str):
             # If a real file exists (favicon, etc.), serve it
             file_path = _FRONTEND_DIST / full_path
             if file_path.is_file():
+                # Only index.html (and any other top-level html) needs no-store;
+                # /assets/* is already content-hashed by Vite.
+                if file_path.suffix == ".html":
+                    return FileResponse(file_path, headers=_NO_STORE)
                 return FileResponse(file_path)
             # Otherwise serve index.html for React Router
-            return FileResponse(_FRONTEND_DIST / "index.html")
+            return FileResponse(_FRONTEND_DIST / "index.html", headers=_NO_STORE)
 
         logger.info("Serving frontend from %s", _FRONTEND_DIST)
 

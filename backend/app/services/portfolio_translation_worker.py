@@ -110,16 +110,21 @@ def _hash_key(dest_field: str) -> str:
 async def run_one_pass(
     *,
     settings: Settings,
-    window_hours: int = 48,
+    window_hours: int = 24 * 90,
     skip_min_chars: int = 80,
     skip_max_chars: int = 400_000,
-    max_docs_per_collection: int | None = 500,
+    max_docs_per_collection: int | None = 200,
 ) -> dict[str, Any]:
     """Run a single translation pass over the configured targets.
 
     Returns a stats dict. ``max_docs_per_collection`` caps per-collection
     work to protect the event loop on the rare case a backfill window
     explodes (e.g. after a long outage); set to ``None`` to disable.
+
+    Default window matches the StockHub display window (3 months / 90 days)
+    so every portfolio doc the user can see has its English body/title
+    translated. The hash-gate inside the loop makes subsequent passes cheap
+    (only newly-arrived or hash-changed bodies hit the LLM).
     """
     if not settings.llm_enrichment_api_key:
         logger.warning("portfolio_translation_worker: LLM_ENRICHMENT_API_KEY unset — skipping")
@@ -130,9 +135,8 @@ async def run_one_pass(
         logger.warning("portfolio_translation_worker: no portfolio tickers — skipping")
         return {"enabled": True, "skipped": "no_tickers"}
 
-    since_ms = int(
-        (datetime.datetime.now() - datetime.timedelta(hours=window_hours)).timestamp() * 1000
-    )
+    since_dt = datetime.datetime.now() - datetime.timedelta(hours=window_hours)
+    since_ms = int(since_dt.timestamp() * 1000)
 
     uri = (
         getattr(settings, "alphapai_mongo_uri", None)
@@ -154,9 +158,17 @@ async def run_one_pass(
 
     for db_name, coll_name, fields in DEFAULT_TARGETS:
         coll = client[db_name][coll_name]
+        # Window: doc is in scope if EITHER its release_time_ms OR crawled_at
+        # falls within the window. This catches backfilled-historical docs
+        # (old release date but recent ingest, e.g. UCTT 2026-Q1 8-K released
+        # 2026-01-28 but crawled 2026-04-17 — outside a 90d release window
+        # but inside a 90d crawl window).
         q: dict[str, Any] = {
-            "release_time_ms": {"$gte": since_ms},
             "_canonical_tickers": {"$in": list(canon)},
+            "$or": [
+                {"release_time_ms": {"$gte": since_ms}},
+                {"crawled_at": {"$gte": since_dt}},
+            ],
         }
         proj = {f: 1 for f in fields}
         for f in fields:
@@ -273,7 +285,7 @@ async def worker_loop(
     *,
     settings: Settings,
     interval_sec: int = 600,
-    window_hours: int = 48,
+    window_hours: int = 24 * 90,
     initial_delay_sec: int = 90,
 ) -> None:
     """Periodic poller — runs ``run_one_pass`` every ``interval_sec``.

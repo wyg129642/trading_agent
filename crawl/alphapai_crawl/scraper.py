@@ -996,6 +996,42 @@ def _is_thin_clip_item(item: dict, doc: dict) -> bool:
     return True
 
 
+def _is_empty_roadshow(detail: dict, doc: dict) -> bool:
+    """True iff a roadshow's detail RPC succeeded (no _err) but the platform
+    has zero usable text — every summary field empty AND no aiContent fallback.
+
+    Discovery (2026-04-30): some roadshow ids resolve detail with HTTP 200 +
+    code=OK + ``hasPermission=None`` and every payload field blank. They never
+    grow content even on later re-fetch, but with the old logic they got
+    stored as 100-220 char list teasers indistinguishable from real data.
+    Soft-delete tombstone matches the ``thin_clip`` pattern so kb_search /
+    Milvus delete-sweep skip them automatically.
+    """
+    if not isinstance(detail, dict):
+        return False
+    if detail.get("_err"):
+        return False  # transient — caller handles separately
+    has_text = bool(
+        ((detail.get("aiSummary") or {}).get("content") or "").strip()
+        or ((detail.get("mtSummary") or {}).get("content") or "").strip()
+        or ((detail.get("usSummary") or {}).get("content") or "").strip()
+        or (detail.get("aiContent") or "").strip()
+        or (detail.get("content") or "").strip()
+    )
+    if has_text:
+        return False
+    v3 = detail.get("aiSummaryV3") or {}
+    if isinstance(v3, dict) and (
+        v3.get("topicBulletsV2") or v3.get("topicBullets")
+        or v3.get("qaListV2") or v3.get("qaList")
+        or (v3.get("fullTextSummary") or "").strip()
+    ):
+        return False
+    if detail.get("summarySegmentList"):
+        return False
+    return True
+
+
 def _is_empty_foreign_report(item: dict, doc: dict, market_type: Optional[str]) -> bool:
     """Decide whether a 研报 doc should be dropped instead of upserted.
 
@@ -1430,13 +1466,15 @@ def dump_one(session, db, category_key: str, cfg: dict, item: dict,
         # Soft-deleted thin-clip tombstone: do NOT re-fetch detail. Returning
         # here also means cleanup-script soft-deletes survive future watcher
         # passes — same dedup_id stays invisible without re-ingesting noise.
-        if ex and ex.get("deleted") and ex.get("_deleted_reason") == "thin_clip":
+        if ex and ex.get("deleted") and ex.get("_deleted_reason") in (
+                "thin_clip", "empty_roadshow", "quota_stub",
+                "rate_limit_stub"):
             return "skipped", {
                 "content_len": 0,
                 "pdf_size": 0,
                 "pdf_error": "",
                 "pdf_flag": False,
-                "skip_reason": "thin_clip_known",
+                "skip_reason": f"{ex.get('_deleted_reason')}_known",
             }
         if ex:
             # 研报: 已入库但 PDF 下载失败过 → 重试 (除了永久无权限).
@@ -1521,6 +1559,16 @@ def dump_one(session, db, category_key: str, cfg: dict, item: dict,
             return "skipped", {
                 "content_len": 0, "pdf_size": 0, "pdf_error": "",
                 "pdf_flag": False, "skip_reason": "quota_exhausted",
+            }
+        # 500020 "请求频繁" 是平台秒级限流, 不是日配额. 跳过写入 stub —
+        # 下个 watch tick 同 dedup_id 在 list 里再被发现时, dedup 找不到
+        # existing doc 走正常 fetch_detail. 旧逻辑直接落库 180 字 list teaser
+        # 加 content_truncated=False, 永远 dedup-skip 不再补 (2026-04-30 修复,
+        # 历史已堆积 42876 条 stuck doc).
+        if err.get("code") == 500020:
+            return "skipped", {
+                "content_len": 0, "pdf_size": 0, "pdf_error": "",
+                "pdf_flag": False, "skip_reason": "rate_limited",
             }
     title = item.get("title", "")
     time_norm = _normalize_time(item, cfg["time_field"])
@@ -1703,6 +1751,33 @@ def dump_one(session, db, category_key: str, cfg: dict, item: dict,
     # _deleted_reason="thin_clip"), 下次同 dedup_id 进 dump_one 时上面的早退
     # branch 直接返回, 不再发 detail RPC; 同时 sweep_deleted_docs 会在 24h 内
     # 把 Milvus 中已索引的旧 chunks 一并清掉. 见 _is_thin_clip_item.
+    # Roadshow detail 200 OK 但所有摘要字段全空 — 平台本身就没文字内容.
+    # 写 soft-delete tombstone, 同 thin_clip 路径; sweep_deleted_docs 会清掉
+    # Milvus 已索引的旧 chunk, kb_search 自动忽略 (deleted: {$ne: True}).
+    if category_key == "roadshow" and _is_empty_roadshow(detail, doc):
+        col.replace_one(
+            {"_id": dedup_id},
+            {
+                "_id": dedup_id,
+                "category": category_key,
+                "title": title,
+                "publish_time": time_norm,
+                "release_time_ms": release_time_ms,
+                "raw_id": item.get("id"),
+                "deleted": True,
+                "_deleted_at": datetime.now(timezone.utc),
+                "_deleted_reason": "empty_roadshow",
+            },
+            upsert=True,
+        )
+        return "skipped", {
+            "content_len": 0,
+            "pdf_size": 0,
+            "pdf_error": "",
+            "pdf_flag": False,
+            "skip_reason": "empty_roadshow",
+        }
+
     if category_key == "report" and _is_thin_clip_item(item, doc):
         col.replace_one(
             {"_id": dedup_id},
@@ -1921,7 +1996,14 @@ def run_category(session, db, category_key: str, args) -> dict:
         print("[恢复] 未找到 checkpoint, 全量爬")
 
     stop_dt = None
-    if getattr(args, "since_hours", None) is not None:
+    if getattr(args, "strict_today", False):
+        # 严格今日: cutoff = 北京当天 00:00 (NAIVE, Asia/Shanghai wall-clock).
+        # 跨午夜后下一轮 watch tick 重算自动切日.
+        bj_now = datetime.now(timezone(timedelta(hours=8)))
+        stop_dt = bj_now.replace(hour=0, minute=0, second=0, microsecond=0,
+                                  tzinfo=None)
+        print(f"[strict-today] 仅抓 ≥ {stop_dt:%Y-%m-%d %H:%M} 的条目")
+    elif getattr(args, "since_hours", None) is not None:
         # `_parse_time_to_dt` returns NAIVE (Asia/Shanghai wall-clock). Keep
         # stop_dt naive to avoid "offset-naive vs offset-aware" TypeError inside
         # `fetch_list_paginated`'s `dt < stop_before_dt` comparison.
@@ -1968,6 +2050,17 @@ def run_category(session, db, category_key: str, args) -> dict:
             break
         title = (it.get("title") or "")[:60]
         time_str = _normalize_time(it, cfg["time_field"])
+        # 二次时间拦截: AlphaPai list 不保证严格按时间降序 (e.g. "金信基金日刊"
+        # 标明天日期排在今天前面). fetch_list_paginated 的 stop_before_dt 只控
+        # **翻页停止**, 但本页所有 items 都进了 all_items. 这里在 dump_one 前
+        # 再卡一次, 严格今日 / since-hours 时把过期条目挡掉, 不消耗 detail 配额.
+        if stop_dt is not None:
+            it_dt = _parse_time_to_dt(time_str)
+            if it_dt is not None and it_dt < stop_dt:
+                skipped += 1
+                was_skip = True
+                pbar.set_postfix_str(f"+{added} ={skipped} ✗{failed}")
+                continue
         was_skip = False
         try:
             status, info = dump_one(session, db, category_key, cfg, it,
@@ -2217,6 +2310,11 @@ def parse_args():
     p.add_argument("--since-hours", type=float, default=None,
                    help="只抓取过去 N 小时内发布的内容 (按 time_field). "
                         "默认不限制.")
+    p.add_argument("--strict-today", action="store_true",
+                   help="严格只抓今日 (北京时间 ≥ 00:00) 发布的条目. 跨午夜会自动"
+                        "切到新一天 (每轮 watch tick 重算 cutoff). 与 --since-hours "
+                        "互斥, strict-today 优先. 用于把日配额完全留给当日新增, "
+                        "不再扫昨夜 23:xx 残留.")
     p.add_argument("--show-state", action="store_true",
                    help="打印 checkpoint 后退出")
     p.add_argument("--reset-state", action="store_true",

@@ -100,6 +100,27 @@ MEMORY_PID_FILE="$PROJECT_DIR/logs/memory_processor.pid"
 MEMORY_LOG="$PROJECT_DIR/logs/memory_processor.log"
 MEMORY_SCRIPT="run_chat_memory_processor.py"
 
+# StockHub LLM card-summary worker — qwen-plus generates {tldr, bullets,
+# sentiment(看多/看空/中性)} for portfolio-holding docs across every collection
+# StockHub renders (see crawl/local_ai_summary/targets.py — kept in sync with
+# backend/app/api/stock_hub.py:_SOURCE_INDEX). Two roles in one process:
+#
+#   1. Backfill: 90-day window, processed time-desc so the freshest docs
+#      always get the next LLM budget — i.e. the same loop that backfills
+#      history is what catches new doc inserts (typically <5 min after a
+#      scraper writes them, given a 300s interval + 200/cycle budget).
+#   2. Dynamic holding alignment: load_holdings() re-reads
+#      config/portfolio_sources.yaml each cycle, so swapping a holding
+#      flips coverage on the next pass.
+#
+# Runs on BOTH prod and staging (no quote/trade side effects); the dedup
+# gate (local_ai_summary.v) prevents duplicate spend across worktrees.
+SUMMARY_PID_FILE="$PROJECT_DIR/logs/local_ai_summary.pid"
+SUMMARY_LOG="$PROJECT_DIR/logs/local_ai_summary.log"
+SUMMARY_INTERVAL="${LOCAL_AI_SUMMARY_INTERVAL:-60}"
+SUMMARY_SINCE_DAYS="${LOCAL_AI_SUMMARY_SINCE_DAYS:-90}"
+SUMMARY_PER_CYCLE="${LOCAL_AI_SUMMARY_MAX_PER_CYCLE:-1000}"
+
 MONITOR_PID_FILE="$PROJECT_DIR/logs/crawler_monitor.pid"
 MONITOR_LOG="$PROJECT_DIR/logs/crawler_monitor.log"
 MONITOR_PORT="$(_load_env_var MONITOR_PORT 8080)"
@@ -584,6 +605,69 @@ stop_memory_processor() {
     done
 }
 
+# ---- StockHub card-summary worker (local_ai_summary) ----
+# Cross-worktree dedup is enforced at the document level (local_ai_summary.v),
+# so prod + staging running concurrently is safe (each cycle naturally races to
+# claim the next pending doc; whichever loses just sees v>=current and skips).
+
+start_summary_worker() {
+    if [ -f "$SUMMARY_PID_FILE" ]; then
+        old_pid=$(cat "$SUMMARY_PID_FILE")
+        if kill -0 "$old_pid" 2>/dev/null; then
+            info "Stopping old summary worker (PID: $old_pid)..."
+            kill "$old_pid" 2>/dev/null
+            sleep 2
+            kill -9 "$old_pid" 2>/dev/null
+        fi
+    fi
+
+    info "Starting StockHub summary worker (--watch --since-days ${SUMMARY_SINCE_DAYS} --max ${SUMMARY_PER_CYCLE} --interval ${SUMMARY_INTERVAL})..."
+    mkdir -p "$PROJECT_DIR/logs"
+    cd "$PROJECT_DIR"
+    PYTHONPATH="$PROJECT_DIR" nohup python -m crawl.local_ai_summary.runner \
+        --watch \
+        --since-days "$SUMMARY_SINCE_DAYS" \
+        --max "$SUMMARY_PER_CYCLE" \
+        --interval "$SUMMARY_INTERVAL" \
+        >> "$SUMMARY_LOG" 2>&1 &
+    echo $! > "$SUMMARY_PID_FILE"
+    sleep 4
+    if kill -0 "$(cat $SUMMARY_PID_FILE)" 2>/dev/null; then
+        ok "Summary worker: running (PID: $(cat $SUMMARY_PID_FILE))"
+    else
+        err "Summary worker: FAILED to start or exited early. Last lines of $SUMMARY_LOG:"
+        tail -n 5 "$SUMMARY_LOG" 2>/dev/null | sed 's/^/    /'
+        rm -f "$SUMMARY_PID_FILE"
+        return 1
+    fi
+}
+
+stop_summary_worker() {
+    if [ -f "$SUMMARY_PID_FILE" ]; then
+        pid=$(cat "$SUMMARY_PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            info "Stopping summary worker (PID: $pid)..."
+            kill "$pid"
+            for i in {1..8}; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+            done
+            kill -9 "$pid" 2>/dev/null
+            ok "Summary worker stopped"
+        fi
+        rm -f "$SUMMARY_PID_FILE"
+    fi
+    # Cwd-scoped stray cleanup so we never reach across to the other worktree
+    for pid in $(pgrep -f "crawl\.local_ai_summary\.runner" 2>/dev/null); do
+        cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null)
+        [ "$cwd" != "$PROJECT_DIR" ] && continue
+        info "Killing stray summary worker (PID: $pid)..."
+        kill "$pid" 2>/dev/null
+        sleep 1
+        kill -9 "$pid" 2>/dev/null
+    done
+}
+
 status_web() {
     echo "[WEB]"
     if [ -f "$BACKEND_PID_FILE" ] && kill -0 "$(cat $BACKEND_PID_FILE)" 2>/dev/null; then
@@ -635,6 +719,19 @@ status_web() {
         fi
     fi
 
+    if [ -f "$SUMMARY_PID_FILE" ] && kill -0 "$(cat $SUMMARY_PID_FILE)" 2>/dev/null; then
+        sm_pid=$(cat $SUMMARY_PID_FILE)
+        sm_etime=$(ps -o etime= -p $sm_pid 2>/dev/null | tr -d ' ')
+        ok "Summary worker:     running (PID: $sm_pid, uptime: $sm_etime, ${SUMMARY_SINCE_DAYS}d window)"
+    else
+        stray_pid=$(pgrep -f "crawl\.local_ai_summary\.runner" 2>/dev/null | head -1)
+        if [ -n "$stray_pid" ]; then
+            warn "Summary worker:     running but UNMANAGED (PID: $stray_pid — restart to adopt)"
+        else
+            err "Summary worker:     STOPPED"
+        fi
+    fi
+
     if curl -s --noproxy '*' "http://localhost:${APP_PORT}/api/health" 2>/dev/null | grep -q '"ok"'; then
         ok "API health:         OK  (port ${APP_PORT})"
     else
@@ -646,9 +743,11 @@ start_web_group() {
     start_backend
     start_scanner
     start_memory_processor
+    start_summary_worker
 }
 
 stop_web_group() {
+    stop_summary_worker
     stop_memory_processor
     stop_scanner
     stop_backend

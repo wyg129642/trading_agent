@@ -158,7 +158,8 @@ async def _scan_and_translate(
     if sources_filter:
         targets = [t for t in targets if f"{t[0]}.{t[1]}" in sources_filter]
 
-    since_ms = int((datetime.datetime.now() - datetime.timedelta(days=days)).timestamp() * 1000)
+    since_dt = datetime.datetime.now() - datetime.timedelta(days=days)
+    since_ms = int(since_dt.timestamp() * 1000)
 
     # All current crawler DBs share one Mongo. settings.alphapai_mongo_uri is
     # representative; fall back to local default.
@@ -183,9 +184,15 @@ async def _scan_and_translate(
 
     for db_name, coll_name, fields in targets:
         coll = client[db_name][coll_name]
+        # Window: doc qualifies if EITHER its release_time_ms OR crawled_at
+        # falls within the window. Catches backfilled-historical docs (old
+        # release date but recent ingest) that StockHub still surfaces.
         q: dict[str, Any] = {
-            "release_time_ms": {"$gte": since_ms},
             "_canonical_tickers": {"$in": list(canon)},
+            "$or": [
+                {"release_time_ms": {"$gte": since_ms}},
+                {"crawled_at": {"$gte": since_dt}},
+            ],
         }
         proj = {f: 1 for f in fields}
         # Cache check needs the existing translation + its source-text hash.

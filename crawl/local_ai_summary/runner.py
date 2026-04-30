@@ -197,7 +197,9 @@ def call_qwen_plus(*, title: str, source_label: str, body: str,
     if not isinstance(bullets, list):
         bullets = []
     bullets = [str(b).strip() for b in bullets if str(b).strip()]
-    return {"tldr": tldr, "bullets": bullets[:5]}
+    raw_sent = parsed.get("sentiment")
+    sentiment = raw_sent if raw_sent in ("bullish", "bearish", "neutral") else "neutral"
+    return {"tldr": tldr, "bullets": bullets[:5], "sentiment": sentiment}
 
 
 # ─── Mongo passes ─────────────────────────────────────────────────────────
@@ -209,13 +211,27 @@ def _build_query(holdings: set[str], target: Target,
         "_canonical_tickers": {"$in": sorted(holdings)},
     }
     if since_ms is not None:
-        q[target.time_ms_field] = {"$gte": since_ms}
+        # Match docs whose release OR crawl time is within window. Catches
+        # backfilled-historical docs (e.g. quarterly earnings released long
+        # ago but only crawled this week) that StockHub still surfaces in the
+        # "近 3 月" feed. Mongo OR over both fields uses each field's index
+        # individually (index union).
+        since_dt = datetime.fromtimestamp(since_ms / 1000, tz=timezone.utc)
+        q["$and"] = [{"$or": [
+            {target.time_ms_field: {"$gte": since_ms}},
+            {"crawled_at": {"$gte": since_dt}},
+        ]}]
     if not force_resummarize:
-        # Skip docs that already have a current-version summary
-        q["$or"] = [
+        # Skip docs that already have a current-version summary. Use $and
+        # composition so this doesn't collide with the time-window $or.
+        version_or = [
             {"local_ai_summary": {"$exists": False}},
             {"local_ai_summary.v": {"$lt": SUMMARY_SCHEMA_VERSION}},
         ]
+        if "$and" in q:
+            q["$and"].append({"$or": version_or})
+        else:
+            q["$or"] = version_or
     return q
 
 
@@ -268,8 +284,10 @@ def _process_collection(
             continue
 
         body, source_field = _pick_body(doc, target)
-        if not body or len(body) < 60:
-            # Almost-empty body — nothing for the LLM to summarize. Skip.
+        if not body or len(body) < target.min_body_chars:
+            # Body is short enough that the StockHub card preview (clamped at
+            # 320 chars) already shows essentially all of it — re-summarizing
+            # would just paraphrase what the user already reads. Skip.
             stats["skipped_empty"] += 1
             continue
 
@@ -302,6 +320,7 @@ def _process_collection(
         summary = {
             "tldr": out.get("tldr") or "",
             "bullets": out.get("bullets") or [],
+            "sentiment": out.get("sentiment") or "neutral",
             "generated_at": datetime.now(timezone.utc),
             "model": LLM_MODEL,
             "source_field": source_field,
@@ -324,9 +343,9 @@ def _process_collection(
             stats["errors"] += 1
 
         max_calls -= 1
-        # Gentle pacing — qwen-plus QPS limit isn't an issue at our volume,
-        # but spreading calls smooths the overall budget.
-        time.sleep(0.4 + random.uniform(0, 0.3))
+        # Pacing — DashScope qwen-plus default QPS is generous; a tight loop
+        # is fine. The 0.1-0.2s jitter just smooths bursts.
+        time.sleep(0.1 + random.uniform(0, 0.1))
 
     stats["remaining_budget"] = max_calls
     return stats
@@ -372,40 +391,81 @@ def run_once(*, since_days: float, max_calls: int, force_resummarize: bool,
     totals = {"scanned": 0, "skipped_native": 0, "skipped_empty": 0,
               "summarized": 0, "errors": 0}
 
+    # Resolve targets that actually have a live collection on this Mongo.
+    runnable: list[tuple[Target, Collection]] = []
     for target in TARGETS:
-        if _SHUTDOWN:
-            break
         if only and f"{target.db}.{target.collection}" != only:
             continue
-        if max_calls <= 0:
-            logger.info("[budget] exhausted — stopping at %s", target.label)
-            break
         try:
             db = mc[target.db]
             if target.collection not in db.list_collection_names():
                 continue
-            col = db[target.collection]
+            runnable.append((target, db[target.collection]))
         except Exception as e:
             logger.warning("[%s.%s] connect/list fail: %s",
                            target.db, target.collection, e)
             continue
 
+    # Round-robin budget so a backlog-heavy target (e.g. alphapai-full.reports
+    # at 1k+ pending) cannot starve later targets (funda.earnings_reports) of
+    # cycle budget. Per-target cap = max(4, max_calls / n_targets); the second
+    # pass below redistributes any unused budget back to hungry targets.
+    n_targets = max(1, len(runnable))
+    per_target_cap = max(4, max_calls // n_targets)
+    remaining_budget = max_calls
+    hungry: list[tuple[Target, Collection]] = []
+
+    for target, col in runnable:
+        if _SHUTDOWN:
+            break
+        if remaining_budget <= 0:
+            logger.info("[budget] exhausted — stopping at %s", target.label)
+            break
+        target_budget = min(per_target_cap, remaining_budget)
+        if target_budget <= 0:
+            break
+
         s = _process_collection(
             col, target, holdings,
             since_ms=since_ms,
-            max_calls=max_calls,
+            max_calls=target_budget,
             force_resummarize=force_resummarize,
             dry_run=dry_run,
         )
-        spent = max_calls - s["remaining_budget"]
-        max_calls = s["remaining_budget"]
+        spent = target_budget - s["remaining_budget"]
+        remaining_budget -= spent
         for k in totals:
             totals[k] += s.get(k, 0)
         logger.info("[%s] scanned=%d native=%d empty=%d ai=%d err=%d "
                     "spent=%d remain=%d",
                     target.label, s["scanned"], s["skipped_native"],
                     s["skipped_empty"], s["summarized"], s["errors"],
-                    spent, max_calls)
+                    spent, remaining_budget)
+        # Target hit its cap — keep some budget for it on the redistribute pass.
+        if s["remaining_budget"] == 0 and spent >= target_budget:
+            hungry.append((target, col))
+
+    # Second pass: drain any unused budget into targets that hit their cap.
+    # Skipped during dry-run or when nothing was hungry.
+    for target, col in hungry:
+        if _SHUTDOWN:
+            break
+        if remaining_budget <= 0:
+            break
+        s = _process_collection(
+            col, target, holdings,
+            since_ms=since_ms,
+            max_calls=remaining_budget,
+            force_resummarize=force_resummarize,
+            dry_run=dry_run,
+        )
+        spent = remaining_budget - s["remaining_budget"]
+        remaining_budget = s["remaining_budget"]
+        for k in totals:
+            totals[k] += s.get(k, 0)
+        if spent:
+            logger.info("[%s · 2nd] +ai=%d  spent=%d remain=%d",
+                        target.label, s["summarized"], spent, remaining_budget)
 
     logger.info("[cycle done] %s", totals)
     return totals

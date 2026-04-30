@@ -32,12 +32,16 @@ run_one() {
     echo ""
 }
 
-# AlphaPai — report / roadshow / comment (report 用 sweep-today).
+# AlphaPai — 已停用当日 audit + 回填 (2026-04-30):
+#   用户决策"日配额完全留给当日 watcher 新增, 不做任何回填". scraper.py
+#   --strict-today + 500020 skip-write 已就位, watcher 自身就能严格只抓当日,
+#   不再需要 backfill_today_reports 抢配额做缺失补漏 (实测每跑一轮 4h+ 写入
+#   40% 是非当日 publish_time, 浪费配额).
 # wechat 微信社媒爬取已停用 (2026-04-24) — 已入库保留, 不再做当日审计补漏.
-for cat in report roadshow comment; do
-    run_one "alphapai_${cat}" alphapai_crawl backfill_today_reports.py \
-            --category "$cat" --skip-pdf --throttle 0.4
-done
+# for cat in report roadshow comment; do
+#     run_one "alphapai_${cat}" alphapai_crawl backfill_today_reports.py \
+#             --category "$cat" --skip-pdf --throttle 0.4
+# done
 
 # Gangtise — summary / research / chief 全扫
 for type in summary research chief; do

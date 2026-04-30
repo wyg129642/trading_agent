@@ -1081,6 +1081,8 @@ async def _query_spec(
                 # so reuse it for both views — toggling 原文 just shows the
                 # native preview (if a non-zh fallback exists below).
                 preview_zh = preview
+            ai_sent = _pick_nested(doc, "local_ai_summary.sentiment")
+            sentiment = ai_sent if ai_sent in ("bullish", "bearish", "neutral") else None
             if not preview:
                 for path in spec.preview_fields:
                     candidate = _preview(_pick_nested(doc, path))
@@ -1188,6 +1190,7 @@ async def _query_spec(
                     "preview": preview,
                     "preview_zh": preview_zh,
                     "organization": org,
+                    "sentiment": sentiment,
                     "tickers": doc.get("_canonical_tickers") or [],
                 }
             )
@@ -1789,6 +1792,7 @@ async def stock_hub_doc(
     # frontend renders this as a highlighted "AI 摘要" block above the
     # body sections so the takeaway is visible without scrolling.
     ai_summary_obj: LocalAiSummary | None = None
+    sentiment: str | None = None
     ai = doc.get("local_ai_summary")
     if isinstance(ai, dict) and (ai.get("tldr") or ai.get("bullets")):
         gen_at = ai.get("generated_at")
@@ -1798,6 +1802,10 @@ async def stock_hub_doc(
             model=str(ai.get("model") or ""),
             generated_at=gen_at.isoformat() if hasattr(gen_at, "isoformat") else (str(gen_at) if gen_at else None),
         )
+    if isinstance(ai, dict):
+        raw_sent = ai.get("sentiment")
+        if raw_sent in ("bullish", "bearish", "neutral"):
+            sentiment = raw_sent
 
     title_text = str(doc.get(spec.title_field) or "")[:400]
     title_zh: str | None = None
@@ -1829,6 +1837,7 @@ async def stock_hub_doc(
         tickers=doc.get("_canonical_tickers") or [],
         sections=[DocSection(**s) for s in sections],
         local_ai_summary=ai_summary_obj,
+        sentiment=sentiment,
     )
 
 

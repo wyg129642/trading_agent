@@ -36,6 +36,11 @@ MIN_NATIVE_SUMMARY_LEN = 80
 # the lede + opening few paragraphs already contain the key point.
 MAX_INPUT_CHARS = 8000
 
+# Default floor for "is there enough body to summarize". 60 chars rejects
+# almost-empty bodies (e.g. just a title echoed into content_md) but is loose
+# enough that a one-paragraph comment still qualifies.
+DEFAULT_MIN_BODY_CHARS = 60
+
 
 @dataclass(frozen=True)
 class Target:
@@ -52,6 +57,11 @@ class Target:
     time_ms_field: str = "release_time_ms"
     # Human label for log lines.
     label: str = ""
+    # Minimum picked-body length to warrant an LLM call. Bump this above the
+    # default for collections where the body IS already a card-ready summary
+    # (StockHub clamps card preview at 320 chars — bodies shorter than ~400
+    # would just have the LLM paraphrase what the user already sees in full).
+    min_body_chars: int = DEFAULT_MIN_BODY_CHARS
 
 
 TARGETS: list[Target] = [
@@ -108,24 +118,32 @@ TARGETS: list[Target] = [
     ),
 
     # ── Gangtise ───────────────────────────────────────────────────────────
-    # brief_md is a prefix of content_md (not a real summary) — always LLM.
+    # brief_md is a prefix of content_md (not a real summary) — always LLM
+    # when long enough. min_body_chars=400: gangtise's brief / chief description
+    # IS the curated short take. When it's already shorter than ~400 chars the
+    # 320-char card preview shows the whole thing — an LLM tldr just paraphrases
+    # what the user already reads. (Distribution: ~15-21% of researches and ~5-9%
+    # of chief_opinions fall under this floor.)
     Target(
         db="gangtise-full", collection="researches",
         native_summary_fields=(),
         body_fields=("content_md", "brief_md", "pdf_text_md"),
         label="岗底斯 研报",
+        min_body_chars=400,
     ),
     Target(
         db="gangtise-full", collection="summaries",
         native_summary_fields=(),
         body_fields=("content_md", "brief_md"),
         label="岗底斯 纪要",
+        min_body_chars=400,
     ),
     Target(
         db="gangtise-full", collection="chief_opinions",
         native_summary_fields=(),
         body_fields=("description_md", "content_md", "brief_md"),
         label="岗底斯 首席观点",
+        min_body_chars=400,
     ),
 
     # ── Funda ──────────────────────────────────────────────────────────────
@@ -202,26 +220,14 @@ TARGETS: list[Target] = [
         label="Third Bridge 访谈",
     ),
 
-    # ── IR filings (single shape across 7 sources) ─────────────────────────
-    # All ir_filings collections share the unified make_filing_doc shape.
-    # pdf_text_md is the PDF-extracted text; no native summary, always LLM.
-    Target(db="ir_filings", collection="sec_edgar",
-           body_fields=("pdf_text_md",), label="IR · SEC EDGAR"),
-    Target(db="ir_filings", collection="hkex",
-           body_fields=("pdf_text_md",), label="IR · HKEX"),
-    Target(db="ir_filings", collection="asx",
-           body_fields=("pdf_text_md",), label="IR · ASX"),
-    Target(db="ir_filings", collection="edinet",
-           body_fields=("pdf_text_md",), label="IR · EDINET"),
-    Target(db="ir_filings", collection="tdnet",
-           body_fields=("pdf_text_md",), label="IR · TDnet"),
-    Target(db="ir_filings", collection="dart",
-           body_fields=("pdf_text_md",), label="IR · DART"),
-    Target(db="ir_filings", collection="ir_pages",
-           body_fields=("pdf_text_md", "content_md"), label="IR · 公司主页"),
+    # NOTE: ir_filings collections (sec_edgar/hkex/asx/edinet/tdnet/dart/ir_pages)
+    # are intentionally NOT summarized here — StockHub doesn't render them as
+    # cards (they feed the revenue-segment modeling pipeline instead). Adding
+    # them here just burns qwen-plus budget on docs the user can't see.
+    # If StockHub ever adds an "IR filings" tab, re-add the targets here.
 ]
 
 
 # Schema version — bump when the prompt or output shape changes meaningfully
 # so existing ``local_ai_summary`` rows can be re-summarized on next pass.
-SUMMARY_SCHEMA_VERSION = 1
+SUMMARY_SCHEMA_VERSION = 3

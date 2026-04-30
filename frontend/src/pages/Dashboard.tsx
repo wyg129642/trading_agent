@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from 'react'
 import {
+  Button,
   Card, Col, Row, Tag, Typography, Spin, Space,
-  Collapse, Empty, Tooltip, Select,
+  Collapse, Empty, Tooltip, Select, message,
 } from 'antd'
 import {
   ThunderboltOutlined, RiseOutlined, FallOutlined,
@@ -11,6 +12,7 @@ import {
   FundOutlined, SyncOutlined,
   WifiOutlined, DisconnectOutlined, NotificationOutlined,
   LinkOutlined, HistoryOutlined,
+  EyeOutlined,
 } from '@ant-design/icons'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router-dom'
@@ -554,7 +556,7 @@ function NewsDetail({ item, onTickerClick }: { item: BreakingNewsItem; onTickerC
 
 /* ── Build collapse header (the one-line title row) ── */
 
-function newsCollapseLabel(item: BreakingNewsItem) {
+function newsCollapseLabel(item: BreakingNewsItem, onDismiss: (id: string) => void) {
   const matCfg = MATERIALITY_CONFIG[item.news_materiality] || MATERIALITY_CONFIG.none
   const sentCfg = SENTIMENT_CONFIG[item.sentiment] || SENTIMENT_CONFIG.neutral
   const recent = isRecent(item.scan_time, 60)
@@ -577,8 +579,19 @@ function newsCollapseLabel(item: BreakingNewsItem) {
       <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13, color: '#262626' }}>
         {shortSummary}
       </span>
-      {/* Time */}
+      {/* Time + 已阅 */}
       <span style={{ flexShrink: 0, fontSize: 11, color: '#8c8c8c', marginLeft: 8 }}>{timeAgo(item.scan_time)}</span>
+      <Tooltip title="标记为已阅，今后不再显示">
+        <Button
+          size="small"
+          type="text"
+          icon={<EyeOutlined />}
+          onClick={(e) => { e.stopPropagation(); onDismiss(item.id) }}
+          style={{ flexShrink: 0, color: '#8c8c8c', fontSize: 11, padding: '0 6px', height: 22 }}
+        >
+          已阅
+        </Button>
+      </Tooltip>
     </div>
   )
 }
@@ -664,6 +677,23 @@ export default function Dashboard() {
       })
       .catch((err) => console.warn('[funda-sentiment] fetch failed', err))
   }, [role])
+
+  // Mark a breaking-news signal as 已阅 for the current user.
+  // Optimistic: drop from local state immediately; if the backend rejects
+  // the call (404, network), put it back so the user knows it failed.
+  const dismissNews = useCallback((signalId: string) => {
+    setBreakingNews((prev) => {
+      const before = prev
+      const next = prev.filter((it) => it.id !== signalId)
+      api.post(`/portfolio/breaking-news/${encodeURIComponent(signalId)}/dismiss`)
+        .catch((err) => {
+          console.warn('[dismiss] failed', err)
+          message.error('标记已阅失败，已恢复')
+          setBreakingNews(before)
+        })
+      return next
+    })
+  }, [])
 
   const fetchData = useCallback((h: number, silent = false) => {
     if (!silent) setRefreshing(true)
@@ -758,7 +788,7 @@ export default function Dashboard() {
               const matCfg = MATERIALITY_CONFIG[item.news_materiality] || MATERIALITY_CONFIG.none
               return {
                 key: item.id,
-                label: newsCollapseLabel(item),
+                label: newsCollapseLabel(item, dismissNews),
                 style: { borderLeft: `3px solid ${matCfg.color}`, marginBottom: 0 },
                 children: (
                   <NewsDetail

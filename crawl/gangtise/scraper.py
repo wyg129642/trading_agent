@@ -656,10 +656,16 @@ def fetch_summary_text(session, summary_id, msg_text_url: str,
         primary = raw.strip() if isinstance(raw, str) else ""
     except SessionDead as e:
         msg = str(e)
-        # 403 的几种 per-document 限制 (不是 session 失效, 跳过此条就行):
+        # 403 的几种 per-document 限制 (不是 session 失效, 跳过此条就行 — S3 直连
+        # 仍能拿到全文, 见 _fetch_summary_text_via_s3 兜底):
         #   - 白名单限制 (部分券商的专属内容)
-        #   - 903301 当日下载配额用尽 (restrict=60/current=60)
-        per_doc_markers = ("白名单", "903301", "quota", "restrict")
+        #   - 903301  当日下载配额用尽 (restrict=60/current=60)
+        #   - 10011401 帕米尔近 7 天滚动配额耗尽 ("近7天帕米尔纪要查看已达上限,
+        #              继续查看请联系对口销售") — 2026-04-30 出现
+        per_doc_markers = (
+            "白名单", "903301", "quota", "restrict",
+            "10011401", "近7天", "上限", "对口销售",
+        )
         if "403" in msg and any(m in msg for m in per_doc_markers):
             primary = ""
         else:

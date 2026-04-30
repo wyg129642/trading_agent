@@ -76,16 +76,16 @@ _RT_RESEARCH_FAST = (
 
 SPECS: dict[str, CrawlerSpec] = {
     "alphapai":    CrawlerSpec("alphapai", "alphapai_crawl", {
-        "roadshow": _RT + ("--category", "roadshow"),
-        "comment":  _RT + ("--category", "comment"),
-        # report: 切到 --sweep-today 模式 (2026-04-22).
-        # 原 top-pagination + resume 在重峰日 (2000+研报/天) 跟不上, 历史盘点
-        # 漏抓 1500+/天, 最惨 04-18/04-19 全天 0 条. sweep-today 每轮 startDate
-        # =endDate=今天 遍历当日完整 list, 配合 per-item dedup 短路已存在条目;
-        # list/v2 过滤只认 startDate/endDate (其他字段全被静默忽略). 每轮 8 页
-        # × 180s = 480 list 调用/天, 完全在配额内. 跨天自动刷新日期.
-        # 历史补齐用 crawl/alphapai_crawl/perday_backfill.py.
-        "report":   ("--watch", "--resume", "--since-hours", "24",
+        # --strict-today (2026-04-30): 配额完全留给当日 ≥ 北京 00:00 的新增,
+        # 不扫昨夜 23:xx 残留. 跨午夜后 watch tick 重算 cutoff.
+        "roadshow": tuple(a for a in _RT if a not in ("--since-hours", "24")) +
+                    ("--strict-today", "--category", "roadshow"),
+        "comment":  tuple(a for a in _RT if a not in ("--since-hours", "24")) +
+                    ("--strict-today", "--category", "comment"),
+        # report: --sweep-today 已经按 startDate=endDate=今天 在 list/v2 端过滤
+        # (server-side), 严格今日语义已满足; --strict-today 在 sweep-today 路径
+        # 会被 stop_dt=None 短路忽略, 留作 belt-and-suspenders.
+        "report":   ("--watch", "--resume", "--strict-today",
                      "--interval", "180",
                      "--throttle-base", "1.5", "--throttle-jitter", "1.0",
                      "--category", "report", "--sweep-today",
